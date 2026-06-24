@@ -1,0 +1,8 @@
+/opt/matching-test/logs/*.log {
+    daily
+    rotate 14
+    compress
+    missingok
+    notifempty
+    copytruncate
+}
