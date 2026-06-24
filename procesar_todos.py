@@ -27,7 +27,6 @@ import os
 import sys
 from datetime import datetime
 
-import httplib2
 import pytz
 from dotenv import load_dotenv
 from google.oauth2 import service_account
@@ -94,10 +93,8 @@ def _build_services():
     creds  = service_account.Credentials.from_service_account_file(
         os.environ['GOOGLE_SA_JSON'], scopes=SCOPES
     )
-    http   = httplib2.Http(timeout=60)
-    authed = creds.authorize(http)
-    drive  = build('drive',  'v3', http=authed, cache_discovery=False)
-    sheets = build('sheets', 'v4', http=authed, cache_discovery=False)
+    drive  = build('drive',  'v3', credentials=creds, cache_discovery=False)
+    sheets = build('sheets', 'v4', credentials=creds, cache_discovery=False)
     return drive, sheets
 
 
