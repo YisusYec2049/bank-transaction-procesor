@@ -6,16 +6,17 @@ Columnas esperadas:
   Checkout Custom Field 1/2/3 Value, Checkout Line Item Summary,
   Currency, Converted Amount, Converted Currency, Card Name
 
-  [0] identification      ← Card Name (tarjeta habiente)
-  [1] payment_date        ← DD-MM-YYYY
-  [2] transaction_code_1  ← id (charge ID, col 0)
-  [3] transaction_code_2  ← '{Converted Amount} {Converted Currency}'
-  [4] email               ← Customer Email
-  [5] payment_method      ← 'STRIPE_USA'
-  [6] program             ← ''
-  [7] phone               ← ''
-  [8] payment_amount      ← Converted Amount (monto en COP)
-  [9] matching_key        ← {Card Name}_{YYYY-MM-DD}_{valor_js}
+  [0] VAL                 ← ''
+  [1] identification      ← '' (vacío)
+  [2] payment_date        ← DD-MM-YYYY
+  [3] transaction_code_1  ← Card Name
+  [4] transaction_code_2  ← '{Converted Amount} {Converted Currency}'
+  [5] email               ← Customer Email
+  [6] payment_method      ← 'STRIPE_USA'
+  [7] program             ← Card Name
+  [8] phone               ← Checkout Custom Field 3 Value
+  [9] payment_amount      ← Converted Amount (monto en COP)
+  [10] matching_key       ← {Card Name}_{YYYY-MM-DD}_{valor_js}
 """
 
 import csv
@@ -27,6 +28,7 @@ from utils.parser import valor_str
 log = logging.getLogger(__name__)
 
 HEADERS = [
+    'VAL',
     'identification', 'payment_date', 'transaction_code_1', 'transaction_code_2',
     'email', 'payment_method', 'program', 'phone', 'payment_amount', 'matching_key',
 ]
@@ -57,22 +59,25 @@ def parse_file(buf: io.BytesIO, filename: str = '') -> list[dict]:
         if converted <= 0:
             continue
 
-        stripe_id  = r.get('id') or r.get('Id') or ''
-        card_name  = r.get('Card Name') or r.get('card name') or ''
-        email      = r.get('Customer Email') or r.get('customer email') or ''
-        currency   = r.get('Converted Currency') or r.get('converted currency') or ''
+        stripe_id       = r.get('id') or r.get('Id') or ''
+        card_name       = r.get('Card Name') or r.get('card name') or ''
+        email           = r.get('Customer Email') or r.get('customer email') or ''
+        currency        = r.get('Converted Currency') or r.get('converted currency') or ''
+        custom_field3   = (r.get('Checkout Custom Field 3 Value')
+                           or r.get('checkout custom field 3 value') or '')
 
         # matching_key idéntico a n8n: cardName_YYYY-MM-DD_valorJs
         matching_key = f'{card_name}_{fecha_raw}_{valor_str(converted)}'
 
         results.append({
-            'stripe_id':    stripe_id,
-            'payment_date': payment_date,
-            'card_name':    card_name,
-            'email':        email,
-            'converted':    converted,
-            'currency':     currency,
-            'matching_key': matching_key,
+            'stripe_id':     stripe_id,
+            'payment_date':  payment_date,
+            'card_name':     card_name,
+            'email':         email,
+            'converted':     converted,
+            'currency':      currency,
+            'custom_field3': custom_field3,
+            'matching_key':  matching_key,
         })
 
     log.info('Stripe: %d filas parseadas', len(results))
@@ -82,16 +87,17 @@ def parse_file(buf: io.BytesIO, filename: str = '') -> list[dict]:
 def normalize(raw_rows: list[dict]) -> list[list]:
     return [
         [
-            r['card_name'],                              # [0] identification = tarjeta habiente
-            r['payment_date'],                           # [1]
-            r['stripe_id'],                              # [2] transaction_code_1 = charge ID
-            f"{r['converted']} {r['currency']}".strip(), # [3] transaction_code_2
-            r['email'],                                  # [4]
-            'STRIPE_USA',                                # [5]
-            '',                                          # [6]
-            '',                                          # [7]
-            r['converted'],                              # [8]
-            r['matching_key'],                           # [9]
+            '',                                          # [0]  VAL
+            '',                                          # [1]  identification (vacío)
+            r['payment_date'],                           # [2]
+            r['card_name'],                              # [3]  transaction_code_1
+            f"{r['converted']} {r['currency']}".strip(), # [4]  transaction_code_2
+            r['email'],                                  # [5]
+            'STRIPE_USA',                                # [6]
+            r['card_name'],                              # [7]  program
+            r['custom_field3'],                          # [8]  phone
+            r['converted'],                              # [9]
+            r['matching_key'],                           # [10]
         ]
         for r in raw_rows
     ]

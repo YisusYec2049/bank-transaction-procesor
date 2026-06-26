@@ -1,14 +1,14 @@
 """
 Parser para reportes Excel de Placetopay.
 
-Esquema de salida normalizado (10 columnas, índices 0-9):
+Esquema de salida normalizado (11 columnas, índices 0-10):
   [0] identification      ← Documento sin letra inicial
   [1] payment_date        ← DD-MM-YYYY
   [2] transaction_code_1  ← Referencia
   [3] transaction_code_2  ← Código autorización
-  [4] email               ← Email
+  [4] email               ← Cliente
   [5] payment_method      ← franquicia mapeada (ej. 'Placetopay PSE')
-  [6] program             ← Programa (si existe)
+  [6] program             ← Tarjeta (si existe, puede venir vacío)
   [7] phone               ← Telefono (si existe)
   [8] payment_amount      ← float
   [9] matching_key        ← referencia  (único por transacción en Placetopay)
@@ -23,6 +23,7 @@ import openpyxl
 log = logging.getLogger(__name__)
 
 HEADERS = [
+    'VAL',
     'identification', 'payment_date', 'transaction_code_1', 'transaction_code_2',
     'email', 'payment_method', 'program', 'phone', 'payment_amount', 'matching_key',
 ]
@@ -103,15 +104,15 @@ def parse_file(buf: io.BytesIO, filename: str = '') -> list[dict]:
         cod_autorizacion = _get(row, headers, 'autorizaci', 'autorización', 'autorizacion', 'cod')
 
         results.append({
-            'identification':  identification,
-            'payment_date':    payment_date,
-            'referencia':      referencia,
+            'identification':   identification,
+            'payment_date':     payment_date,
+            'referencia':       referencia,
             'cod_autorizacion': cod_autorizacion,
-            'email':           _get(row, headers, 'email', 'correo'),
-            'payment_method':  payment_method,
-            'program':         _get(row, headers, 'programa', 'program') or None,
-            'phone':           _get(row, headers, 'telefono', 'teléfono', 'phone') or None,
-            'monto':           monto,
+            'email':            _get(row, headers, 'cliente'),
+            'payment_method':   payment_method,
+            'program':          _get(row, headers, 'tarjeta') or None,
+            'phone':            _get(row, headers, 'telefono', 'teléfono', 'phone') or None,
+            'monto':            monto,
         })
 
     log.info('Placetopay: %d filas parseadas', len(results))
@@ -121,16 +122,17 @@ def parse_file(buf: io.BytesIO, filename: str = '') -> list[dict]:
 def normalize(raw_rows: list[dict]) -> list[list]:
     return [
         [
-            r['identification'],        # [0]
-            r['payment_date'],          # [1]
-            r['referencia'],            # [2] transaction_code_1
-            r['cod_autorizacion'],      # [3] transaction_code_2 = código autorización
-            r['email'],                 # [4]
-            r['payment_method'],        # [5]
-            r.get('program', ''),       # [6]
-            r.get('phone', ''),         # [7]
-            r['monto'],                 # [8]
-            r['referencia'],            # [9] matching_key = referencia
+            '',                         # [0]  VAL
+            r['identification'],        # [1]
+            r['payment_date'],          # [2]
+            r['referencia'],            # [3]  transaction_code_1
+            r['cod_autorizacion'],      # [4]  transaction_code_2 = código autorización
+            r['email'],                 # [5]
+            r['payment_method'],        # [6]
+            r.get('program', ''),       # [7]
+            r.get('phone', ''),         # [8]
+            r['monto'],                 # [9]
+            r['referencia'],            # [10] matching_key = referencia
         ]
         for r in raw_rows
     ]

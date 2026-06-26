@@ -14,12 +14,12 @@ JOIN: PayU.DOCUMENTO == Moneda.Id
   [0] identification      ← Segundo segmento de SALES [prog_docId_ts] (PayU)
   [1] payment_date        ← DD-MM-YYYY (de FECHA en PayU)
   [2] transaction_code_1  ← DOCUMENTO UUID (PayU)
-  [3] transaction_code_2  ← '{Moneda} {Valor}' (Moneda)
+  [3] transaction_code_2  ← '{Valor procesamiento} {Moneda procesamiento}' (Moneda)
   [4] email               ← Email del comprador (Moneda)
   [5] payment_method      ← 'PAYU'
   [6] program             ← primer segmento de Referencia (ej. 'DSARLAFT')
   [7] phone               ← ''
-  [8] payment_amount      ← CREDITOS (PayU)
+  [8] payment_amount      ← Valor procesamiento (Moneda)
   [9] matching_key        ← DOCUMENTO UUID (PayU)
 """
 
@@ -34,6 +34,7 @@ from utils.parser import parse_valor
 log = logging.getLogger(__name__)
 
 HEADERS = [
+    'VAL',
     'identification', 'payment_date', 'transaction_code_1', 'transaction_code_2',
     'email', 'payment_method', 'program', 'phone', 'payment_amount', 'matching_key',
 ]
@@ -158,11 +159,11 @@ def parse_file(payu_buf: io.BytesIO, moneda_buf: io.BytesIO,
             # intento por índice (columna 3 = Id en el CSV observado)
             uid = row[3].strip() if len(row) > 3 else ''
 
-        ident  = (_get(row, moneda_headers, 'documento del comprador')
-                  or _get(row, moneda_headers, 'tarjeta documento'))
-        email  = _get(row, moneda_headers, 'email del comprador')
-        moneda = _get(row, moneda_headers, 'moneda transacci')    # cubre "moneda transacción"
-        valor  = _get(row, moneda_headers, 'valor transacci')     # cubre "valor transacción"
+        ident       = (_get(row, moneda_headers, 'documento del comprador')
+                       or _get(row, moneda_headers, 'tarjeta documento'))
+        email       = _get(row, moneda_headers, 'email del comprador')
+        valor_proc  = _get(row, moneda_headers, 'valor procesamiento')
+        moneda_proc = _get(row, moneda_headers, 'moneda procesamiento')
 
         if not uid:
             continue
@@ -170,7 +171,8 @@ def parse_file(payu_buf: io.BytesIO, moneda_buf: io.BytesIO,
         moneda_data[uid] = {
             'identification': ident,
             'email':          email,
-            'code2':          f'{moneda} {valor}'.strip(),
+            'code2':          f'{valor_proc} {moneda_proc}'.strip(),
+            'monto':          parse_valor(valor_proc),
         }
 
     log.info('PayU Moneda: %d APPROVED leídos.', len(moneda_data))
@@ -180,13 +182,13 @@ def parse_file(payu_buf: io.BytesIO, moneda_buf: io.BytesIO,
     for uuid, pd in payu_data.items():
         md = moneda_data.get(uuid, {})
         results.append({
-            'identification': pd['identification'],   # extraído de SALES [_docId_]
+            'identification': pd['identification'],
             'payment_date':   pd['fecha'],
             'tx_code_1':      uuid,
             'code2':          md.get('code2', ''),
             'email':          md.get('email', ''),
             'programa':       pd['programa'],
-            'monto':          pd['creditos'],
+            'monto':          md.get('monto') or pd['creditos'],
             'matching_key':   uuid,
         })
 
@@ -197,16 +199,17 @@ def parse_file(payu_buf: io.BytesIO, moneda_buf: io.BytesIO,
 def normalize(raw_rows: list[dict]) -> list[list]:
     return [
         [
-            r['identification'],  # [0]
-            r['payment_date'],    # [1]
-            r['tx_code_1'],       # [2]
-            r['code2'],           # [3]
-            r['email'],           # [4]
-            'PAYU',               # [5]
-            r['programa'],        # [6]
-            '',                   # [7]
-            r['monto'],           # [8]
-            r['matching_key'],    # [9]
+            '',                   # [0]  VAL
+            r['identification'],  # [1]
+            r['payment_date'],    # [2]
+            r['tx_code_1'],       # [3]
+            r['code2'],           # [4]
+            r['email'],           # [5]
+            'PAYU',               # [6]
+            r['programa'],        # [7]
+            '',                   # [8]
+            r['monto'],           # [9]
+            r['matching_key'],    # [10]
         ]
         for r in raw_rows
     ]

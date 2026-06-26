@@ -6,16 +6,17 @@ Columnas esperadas (headers en minúsculas):
   email del pagador, nombre del pagador, telefono del pagador,
   id conciliacion, documento del pagador, tipo de documento, ref. 2
 
-  [0] identification      ← documento del pagador
-  [1] payment_date        ← DD-MM-YYYY
-  [2] transaction_code_1  ← referencia
-  [3] transaction_code_2  ← ref. 2
-  [4] email               ← email del pagador
-  [5] payment_method      ← 'WOMPI {medio de pago}'
-  [6] program             ← ''
-  [7] phone               ← telefono del pagador
-  [8] payment_amount      ← float
-  [9] matching_key        ← id de la transaccion
+  [0] VAL                 ← id de la transaccion
+  [1] identification      ← documento del pagador
+  [2] payment_date        ← DD-MM-YYYY
+  [3] transaction_code_1  ← referencia
+  [4] transaction_code_2  ← id conciliacion
+  [5] email               ← email del pagador
+  [6] payment_method      ← 'WOMPI {medio de pago}'
+  [7] program             ← nombre del pagador
+  [8] phone               ← ref. 2
+  [9] payment_amount      ← float
+  [10] matching_key       ← id de la transaccion
 """
 
 import csv
@@ -25,6 +26,7 @@ import logging
 log = logging.getLogger(__name__)
 
 HEADERS = [
+    'VAL',
     'identification', 'payment_date', 'transaction_code_1', 'transaction_code_2',
     'email', 'payment_method', 'program', 'phone', 'payment_amount', 'matching_key',
 ]
@@ -62,15 +64,16 @@ def parse_file(buf: io.BytesIO, filename: str = '') -> list[dict]:
 
         medio = r.get('medio de pago', '')
         results.append({
-            'id_tx':          id_tx,
-            'payment_date':   payment_date,
-            'referencia':     r.get('referencia', ''),
-            'ref2':           r.get('ref. 2', '') or r.get('ref 2', ''),
-            'email':          r.get('email del pagador', ''),
-            'medio':          medio,
-            'phone':          r.get('telefono del pagador', '') or r.get('teléfono del pagador', ''),
-            'documento':      r.get('documento del pagador', ''),
-            'monto':          monto,
+            'id_tx':           id_tx,
+            'payment_date':    payment_date,
+            'referencia':      r.get('referencia', ''),
+            'id_conciliacion': r.get('id conciliacion', '') or r.get('id conciliación', ''),
+            'email':           r.get('email del pagador', ''),
+            'medio':           medio,
+            'nombre':          r.get('nombre del pagador', ''),
+            'ref2':            r.get('ref. 2', '') or r.get('ref 2', ''),
+            'documento':       r.get('documento del pagador', ''),
+            'monto':           monto,
         })
 
     log.info('WOMPI: %d filas parseadas', len(results))
@@ -80,16 +83,17 @@ def parse_file(buf: io.BytesIO, filename: str = '') -> list[dict]:
 def normalize(raw_rows: list[dict]) -> list[list]:
     return [
         [
-            r['documento'],                    # [0]
-            r['payment_date'],                 # [1]
-            r['referencia'],                   # [2]
-            r['ref2'],                         # [3]
-            r['email'],                        # [4]
-            f"WOMPI {r['medio']}".strip(),     # [5]
-            '',                                # [6]
-            r['phone'],                        # [7]
-            r['monto'],                        # [8]
-            r['id_tx'],                        # [9] matching_key
+            r['id_tx'],                        # [0]  VAL
+            r['documento'],                    # [1]  identification
+            r['payment_date'],                 # [2]
+            r['referencia'],                   # [3]  transaction_code_1
+            r['id_conciliacion'],              # [4]  transaction_code_2
+            r['email'],                        # [5]
+            f"WOMPI {r['medio']}".strip(),     # [6]  payment_method
+            r['nombre'],                       # [7]  program
+            r['ref2'],                         # [8]  phone
+            r['monto'],                        # [9]  payment_amount
+            r['id_tx'],                        # [10] matching_key
         ]
         for r in raw_rows
     ]

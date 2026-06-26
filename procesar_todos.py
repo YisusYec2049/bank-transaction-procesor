@@ -7,7 +7,7 @@ Bancos cubiertos: BC2576, BC2833, Placetopay, WOMPI, Stripe, Colpatria, Davivien
 Para cada banco:
   1. Lista archivos nuevos en la carpeta Drive INBOX
   2. Descarga y parsea con el módulo fuentes/<banco>.py
-  3. Normaliza al esquema estándar (10 columnas)
+  3. Normaliza al esquema estándar (11 columnas)
   4. Escribe al tab del día en CONSOLIDADO (Google Sheets) — siempre
   5. Cheques → gestiona en sheet CHEQUES_PENDIENTES
   6. Upsert en Supabase consolidated_transactions (si SKIP_SUPABASE != true)
@@ -144,7 +144,7 @@ def _procesar_banco(drive, sheets, banco: str, cfg: dict,
             # Dedup contra llaves de ayer
             seen, filtradas = set(), []
             for row in candidatos:
-                key = row[9]
+                key = row[10]
                 if key in yesterday_keys or key in seen:
                     log.debug('[%s] Duplicado omitido: %s', banco, key)
                     continue
@@ -239,7 +239,7 @@ def _procesar_bancolombia(drive, sheets, banco: str, cfg: dict,
 
             seen, filtradas = set(), []
             for row in candidatos:
-                key = row[9]
+                key = row[10]
                 if key in yesterday_keys or key in seen:
                     log.debug('[%s] Duplicado omitido: %s', banco, key)
                     continue
@@ -321,7 +321,7 @@ def _procesar_payu(drive, sheets, today_tab: str, consolidado_id: str,
 
                 seen, filtradas = set(), []
                 for row in normalized:
-                    key = row[9]
+                    key = row[10]
                     if key in yesterday_keys or key in seen:
                         continue
                     seen.add(key)

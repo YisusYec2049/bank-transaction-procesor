@@ -33,6 +33,7 @@ log = logging.getLogger(__name__)
 NIT_UNIVERSIDAD = '901032802'
 
 HEADERS = [
+    'VAL',
     'identification', 'payment_date', 'transaction_code_1', 'transaction_code_2',
     'email', 'payment_method', 'program', 'phone', 'payment_amount', 'matching_key',
 ]
@@ -132,16 +133,17 @@ def _parse_fecha(s: str) -> str | None:
 def normalize(raw_rows: list[dict]) -> list[list]:
     return [
         [
-            r['identification'],  # [0]
-            r['payment_date'],    # [1]
-            r['descripcion'],      # [2] transaction_code_1 = Descripción motivo
-            '',                   # [3]
+            '',                   # [0]  VAL
+            r['identification'],  # [1]
+            r['payment_date'],    # [2]
+            r['descripcion'],     # [3]  transaction_code_1 = Descripción motivo
             '',                   # [4]
-            'COLPATRIA',          # [5]
-            '',                   # [6]
+            '',                   # [5]
+            'COLPATRIA',          # [6]
             '',                   # [7]
-            r['valor'],           # [8]
-            r['matching_key'],    # [9]
+            '',                   # [8]
+            r['valor'],           # [9]
+            r['matching_key'],    # [10]
         ]
         for r in raw_rows
     ]

@@ -1,7 +1,7 @@
 """
 Parser y normalizador para extractos PDF de Bancolombia cuenta 2576.
 
-Esquema de salida normalizado (10 columnas, índices 0-9):
+Esquema de salida normalizado (11 columnas, índices 0-10):
   [0] identification      ← ref1 sin ceros iniciales
   [1] payment_date        ← DD-MM-YYYY
   [2] transaction_code_1  ← descripcion del movimiento
@@ -31,7 +31,7 @@ DESCRIPCIONES_ELIMINAR = frozenset([
     'ABONO', 'COMISION', 'RTE FUENTE', 'RTE ICA', 'IMPTO GOBIERNO',
     'VALOR IVA', 'IVA BOTON', 'IVA COMISION', 'RETENCION EN LA FUENTE',
     'TRASL ENTRE FONDOS', 'COMIS TRASLADO', 'PAGO DE PROV BANCOLOMBIA SA',
-    'PAGO VIRTUAL PSE', 'BOTON',
+    'PAGO VIRTUAL PSE', 'BOTON', 'TRANSF BOTON',
 ])
 
 _FIJAS = [
@@ -54,7 +54,7 @@ _FIJAS = [
 
 _ABIERTAS = [
     'PAGO DE TERC', 'PAGO DE PROV', 'PAGO INTERBANC',
-    'PAGO LLAVE', 'PAGO QR', 'PAGO PSE',
+    'PAGO LLAVE', 'PAGO QR', 'PAGO PSE', 'TRANSF DE',
 ]
 
 _ABIERTAS_SET     = frozenset(_ABIERTAS)
@@ -70,6 +70,7 @@ _RE_REF        = re.compile(r'\b\d{6,}\b')
 # ── Cabeceras de hojas ────────────────────────────────────────────────────────
 
 HEADERS = [
+    'VAL',
     'identification', 'payment_date', 'transaction_code_1', 'transaction_code_2',
     'email', 'payment_method', 'program', 'phone', 'payment_amount',
     'matching_key',
@@ -247,22 +248,25 @@ def normalize(raw_rows: list[dict]) -> list[list]:
     result = []
     for row in raw_rows:
         ref1         = str(row['ref1'] or '').strip().lstrip('0')
+        ref2         = str(row['ref2'] or '').strip().lstrip('0')
+        ident        = ref2 if ref2 else ref1
         fecha        = row['fecha']
         v            = row['valor']
-        matching_key = f'{fecha}_{ref1}_{valor_str(v)}'
+        matching_key = f'{fecha}_{ident}_{valor_str(v)}'
         payment_date = fecha.replace('/', '-')
 
         result.append([
-            ref1,               # [0] identification
-            payment_date,       # [1] payment_date  (DD-MM-YYYY)
-            row['descripcion'], # [2] transaction_code_1
-            row['sucursal'],    # [3] transaction_code_2
-            ref1,               # [4] email
-            'BANCOLOMBIA',      # [5] payment_method
-            '',                 # [6] program
-            '',                 # [7] phone
-            v,                  # [8] payment_amount
-            matching_key,       # [9] matching_key
+            '',                 # [0]  VAL
+            ident,              # [1]  identification
+            payment_date,       # [2]  payment_date  (DD-MM-YYYY)
+            row['descripcion'], # [3]  transaction_code_1
+            row['sucursal'],    # [4]  transaction_code_2
+            ident,              # [5]  email
+            'BANCOLOMBIA',      # [6]  payment_method
+            '',                 # [7]  program
+            '',                 # [8]  phone
+            v,                  # [9]  payment_amount
+            matching_key,       # [10] matching_key
         ])
     return result
 
