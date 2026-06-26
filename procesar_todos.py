@@ -156,7 +156,7 @@ def _procesar_banco(drive, sheets, banco: str, cfg: dict,
 
             if dry_run:
                 for s in filtradas[:3]:
-                    log.info('[DRY RUN] matching_key=%s | amount=%s', s[9], s[8])
+                    log.info('[DRY RUN] matching_key=%s | amount=%s', s[10], s[9])
                 continue
 
             if not filtradas:
@@ -252,7 +252,7 @@ def _procesar_bancolombia(drive, sheets, banco: str, cfg: dict,
 
             if dry_run:
                 for s in filtradas[:3]:
-                    log.info('[DRY RUN] matching_key=%s | amount=%s', s[9], s[8])
+                    log.info('[DRY RUN] matching_key=%s | amount=%s', s[10], s[9])
                 if pendientes_nuevos:
                     log.info('[DRY RUN] %d cheques nuevos PENDIENTE (no se escriben)', len(pendientes_nuevos))
                 continue
