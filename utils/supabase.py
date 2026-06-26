@@ -22,19 +22,19 @@ def upsert(supabase_url: str, service_role_key: str, rows: list[list]) -> None:
 
     payload = []
     for r in rows:
-        dd, mm, yyyy = str(r[1]).split('-')
+        dd, mm, yyyy = str(r[2]).split('-')
         payload.append({
             'registration_date':  today_iso,
-            'identification':     r[0],
+            'identification':     r[1],
             'payment_date':       f'{yyyy}-{mm}-{dd}',
-            'transaction_code_1': r[2],
-            'transaction_code_2': r[3],
-            'email':              r[4],
-            'payment_method':     r[5],
-            'program':            r[6],
-            'phone':              r[7],
-            'payment_amount':     r[8],
-            'matching_key':       r[9],
+            'transaction_code_1': r[3],
+            'transaction_code_2': r[4],
+            'email':              r[5],
+            'payment_method':     r[6],
+            'program':            r[7],
+            'phone':              r[8],
+            'payment_amount':     r[9],
+            'matching_key':       r[10],
         })
 
     hdrs = {
@@ -58,17 +58,17 @@ def upsert_cheque(supabase_url: str, service_role_key: str, banco: str, row: lis
     Inserta un cheque en cheques_pendientes si no existe ya uno PENDIENTE igual.
     row: fila normalizada [identification, payment_date(DD-MM-YYYY), ..., payment_amount, matching_key]
     """
-    dd, mm, yyyy = str(row[1]).split('-')
+    dd, mm, yyyy = str(row[2]).split('-')
     payload = {
         'banco':          banco,
-        'identification': row[0],
-        'payment_amount': row[8],
+        'identification': row[1],
+        'payment_amount': row[9],
         'payment_date':   f'{yyyy}-{mm}-{dd}',
         'raw_row':        {
-            'transaction_code_1': row[2],
-            'transaction_code_2': row[3],
-            'payment_method':     row[5],
-            'matching_key':       row[9],
+            'transaction_code_1': row[3],
+            'transaction_code_2': row[4],
+            'payment_method':     row[6],
+            'matching_key':       row[10],
         },
         'estado': 'PENDIENTE',
     }
