@@ -331,7 +331,7 @@ def _procesar_payu(drive, sheets, today_tab: str, consolidado_id: str,
 
                 if dry_run:
                     for s in filtradas[:3]:
-                        log.info('[DRY RUN] matching_key=%s | amount=%s', s[9], s[8])
+                        log.info('[DRY RUN] matching_key=%s | amount=%s', s[10], s[9])
                 elif filtradas:
                     append_rows(sheets, consolidado_id, today_tab, filtradas)
                     if not skip_supa:

@@ -53,6 +53,82 @@ def upsert(supabase_url: str, service_role_key: str, rows: list[list]) -> None:
     log.info('Upsert Supabase OK: %d registros, HTTP %s.', len(payload), resp.status_code)
 
 
+def _headers(service_role_key: str, prefer: str | None = None) -> dict:
+    hdrs = {
+        'apikey':        service_role_key,
+        'Authorization': f'Bearer {service_role_key}',
+        'Content-Type':  'application/json',
+    }
+    if prefer:
+        hdrs['Prefer'] = prefer
+    return hdrs
+
+
+def select_all(supabase_url: str, service_role_key: str, table: str,
+                select: str = '*', page_size: int = 1000) -> list[dict]:
+    """Trae todas las filas de `table` paginando de a `page_size`."""
+    rows: list[dict] = []
+    offset = 0
+    while True:
+        hdrs = _headers(service_role_key)
+        hdrs['Range-Unit'] = 'items'
+        hdrs['Range'] = f'{offset}-{offset + page_size - 1}'
+        resp = http.get(
+            f'{supabase_url}/rest/v1/{table}',
+            params={'select': select},
+            headers=hdrs,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        page = resp.json()
+        rows.extend(page)
+        if len(page) < page_size:
+            break
+        offset += page_size
+    return rows
+
+
+def replace_table(supabase_url: str, service_role_key: str, table: str,
+                   rows: list[dict], batch_size: int = 500) -> None:
+    """Borra todo el contenido de `table` y lo reemplaza con `rows`."""
+    hdrs = _headers(service_role_key, prefer='return=minimal')
+    resp = http.delete(
+        f'{supabase_url}/rest/v1/{table}',
+        params={'id': 'gte.0'},
+        headers=hdrs,
+        timeout=30,
+    )
+    resp.raise_for_status()
+
+    for i in range(0, len(rows), batch_size):
+        batch = rows[i:i + batch_size]
+        resp = http.post(
+            f'{supabase_url}/rest/v1/{table}',
+            json=batch,
+            headers=hdrs,
+            timeout=30,
+        )
+        resp.raise_for_status()
+
+    log.info('Tabla "%s" reemplazada: %d filas.', table, len(rows))
+
+
+def upsert_cruce(supabase_url: str, service_role_key: str, rows: list[dict]) -> None:
+    """Upsert de filas ya armadas (dicts con las 21 columnas de cruce_cartera)."""
+    hdrs = _headers(
+        service_role_key,
+        prefer='return=minimal,resolution=merge-duplicates',
+    )
+    resp = http.post(
+        f'{supabase_url}/rest/v1/cruce_cartera?on_conflict=matching_key',
+        json=rows,
+        headers=hdrs,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    log.info('Upsert cruce_cartera OK: %d registros, HTTP %s.', len(rows), resp.status_code)
+
+
 def upsert_cheque(supabase_url: str, service_role_key: str, banco: str, row: list) -> None:
     """
     Inserta un cheque en cheques_pendientes si no existe ya uno PENDIENTE igual.
