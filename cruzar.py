@@ -18,6 +18,9 @@ solas aquí):
   - cruce_ambiguo:  la llave de búsqueda (identification o email) aparece en la
                     hoja de referencia con más de un valor distinto (ej. una
                     pareja que paga dos inscripciones con el mismo correo).
+                    Excepción: si los valores distintos solo difieren por el
+                    sufijo "PN" (mismo número, ej. "3300"/"3300PN") no cuenta
+                    como ambigüedad — se normaliza al valor con "PN".
 
 Filas ya resueltas (estado_cruce = 'cruzado' o 'no_identificable') no se vuelven
 a tocar en corridas futuras, así una corrección manual o un "no identificable"
@@ -41,6 +44,13 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
+def _normalizar_pn(valor: str) -> str:
+    """Quita el sufijo "PN" (si lo tiene) para comparar el número base."""
+    if valor.upper().endswith('PN'):
+        return valor[:-2]
+    return valor
+
+
 def _build_lookup(rows: list[dict], key_field: str, value_field: str,
                    lower: bool = False) -> tuple[dict, set]:
     """Primera coincidencia gana (replica BUSCARV de Excel).
@@ -49,6 +59,10 @@ def _build_lookup(rows: list[dict], key_field: str, value_field: str,
     referencia trae 2+ valores distintos no vacíos para la misma llave (ej. un
     correo con dos números de inscripción diferentes). Esas NO se resuelven
     aquí, solo se señalan para revisión humana.
+
+    Excepción confirmada por el usuario: si los valores de una llave solo
+    difieren por el sufijo "PN" (mismo número, ej. "3300" y "3300PN"), no es
+    una ambigüedad real — se normaliza al valor con "PN" y no se marca excepción.
     """
     lookup: dict = {}
     valores_no_vacios: dict[str, set] = {}
@@ -63,7 +77,17 @@ def _build_lookup(rows: list[dict], key_field: str, value_field: str,
             lookup[key] = value
         if value:
             valores_no_vacios.setdefault(key, set()).add(value)
-    ambiguos = {k for k, vs in valores_no_vacios.items() if len(vs) > 1}
+
+    ambiguos = set()
+    for key, valores in valores_no_vacios.items():
+        if len(valores) <= 1:
+            continue
+        bases = {_normalizar_pn(v) for v in valores}
+        if len(bases) == 1:
+            lookup[key] = next(iter(bases)) + 'PN'
+        else:
+            ambiguos.add(key)
+
     return lookup, ambiguos
 
 
