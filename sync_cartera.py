@@ -1,4 +1,4 @@
-#!/home/y1sus/Documents/Dev/matching-test/venv/bin/python3
+#!/opt/matching-test/venv/bin/python3
 """
 sync_cartera.py — sincroniza los Excel de referencia del cruce de cartera a Supabase.
 
