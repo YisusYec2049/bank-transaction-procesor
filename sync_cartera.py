@@ -2,8 +2,9 @@
 """
 sync_cartera.py — sincroniza los Excel de referencia del cruce de cartera a Supabase.
 
-Lee de rutas locales (PAYU_UC_XLSX_PATH, INGRESOS_PSE_PAYU_XLSX_PATH) y reemplaza
-por completo el contenido de las tablas mirror en Supabase:
+Lee los archivos desde la carpeta de Google Drive CARTERA_DRIVE_FOLDER_ID (por
+nombre, no por ID fijo — así una actualización del Excel en Drive no requiere
+tocar el .env) y reemplaza por completo el contenido de las tablas mirror:
   - cartera_inscrip                    ← Payu UC.xlsx > Inscrip
   - cartera_ingresos_bancolombia_2576  ← Ingresos PSE y PAYU.xlsx > BANCOLOMBIA 2576
   - cartera_ingresos_wompi             ← Ingresos PSE y PAYU.xlsx > WOMPI
@@ -12,12 +13,14 @@ por completo el contenido de las tablas mirror en Supabase:
 Se corre manualmente cada vez que el equipo actualiza los Excel (o antes de cruzar.py).
 """
 
+import io
 import logging
 import os
 import sys
 
 from dotenv import load_dotenv
 
+from utils.drive import build_drive_service, find_file_id, download_pdf as download_file
 from utils.excel_cartera import (
     read_inscrip, read_bancolombia_2576, read_wompi, read_stripe_usa,
 )
@@ -31,19 +34,22 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+PAYU_UC_FILENAME  = 'Payu UC.xlsx'
+INGRESOS_FILENAME = 'Ingresos PSE y PAYU.xlsx'
+
 
 def main():
     load_dotenv()
 
-    payu_uc_path  = os.environ.get('PAYU_UC_XLSX_PATH', '')
-    ingresos_path = os.environ.get('INGRESOS_PSE_PAYU_XLSX_PATH', '')
-    supabase_url  = os.environ.get('SUPABASE_URL', '')
-    srk           = os.environ.get('SUPABASE_SERVICE_ROLE_KEY', '')
+    folder_id    = os.environ.get('CARTERA_DRIVE_FOLDER_ID', '')
+    sa_json      = os.environ.get('GOOGLE_SA_JSON', '')
+    supabase_url = os.environ.get('SUPABASE_URL', '')
+    srk          = os.environ.get('SUPABASE_SERVICE_ROLE_KEY', '')
 
     faltantes = [
         n for n, v in [
-            ('PAYU_UC_XLSX_PATH', payu_uc_path),
-            ('INGRESOS_PSE_PAYU_XLSX_PATH', ingresos_path),
+            ('CARTERA_DRIVE_FOLDER_ID', folder_id),
+            ('GOOGLE_SA_JSON', sa_json),
             ('SUPABASE_URL', supabase_url),
             ('SUPABASE_SERVICE_ROLE_KEY', srk),
         ] if not v
@@ -52,20 +58,28 @@ def main():
         log.error('Variables faltantes en .env: %s', ', '.join(faltantes))
         sys.exit(1)
 
-    if not os.path.isfile(payu_uc_path):
-        log.error('No existe el archivo: %s', payu_uc_path)
-        sys.exit(1)
-    if not os.path.isfile(ingresos_path):
-        log.error('No existe el archivo: %s', ingresos_path)
+    drive = build_drive_service(sa_json)
+
+    payu_uc_id  = find_file_id(drive, folder_id, PAYU_UC_FILENAME)
+    ingresos_id = find_file_id(drive, folder_id, INGRESOS_FILENAME)
+
+    faltantes_drive = [
+        n for n, v in [(PAYU_UC_FILENAME, payu_uc_id), (INGRESOS_FILENAME, ingresos_id)]
+        if not v
+    ]
+    if faltantes_drive:
+        log.error('No se encontraron en la carpeta de Drive (%s): %s',
+                   folder_id, ', '.join(faltantes_drive))
         sys.exit(1)
 
-    log.info('Leyendo %s ...', payu_uc_path)
-    inscrip_rows = read_inscrip(payu_uc_path)
+    log.info('Descargando %s ...', PAYU_UC_FILENAME)
+    inscrip_rows = read_inscrip(download_file(drive, payu_uc_id))
 
-    log.info('Leyendo %s ...', ingresos_path)
-    bc2576_rows = read_bancolombia_2576(ingresos_path)
-    wompi_rows  = read_wompi(ingresos_path)
-    stripe_rows = read_stripe_usa(ingresos_path)
+    log.info('Descargando %s ...', INGRESOS_FILENAME)
+    ingresos_bytes = download_file(drive, ingresos_id).read()
+    bc2576_rows = read_bancolombia_2576(io.BytesIO(ingresos_bytes))
+    wompi_rows  = read_wompi(io.BytesIO(ingresos_bytes))
+    stripe_rows = read_stripe_usa(io.BytesIO(ingresos_bytes))
 
     replace_table(supabase_url, srk, 'cartera_inscrip', inscrip_rows)
     replace_table(supabase_url, srk, 'cartera_ingresos_bancolombia_2576', bc2576_rows)

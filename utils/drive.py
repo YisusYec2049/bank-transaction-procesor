@@ -3,9 +3,27 @@
 import io
 import logging
 
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
 log = logging.getLogger(__name__)
+
+SCOPES = ['https://www.googleapis.com/auth/drive']
+
+
+def build_drive_service(sa_json_path: str):
+    creds = service_account.Credentials.from_service_account_file(sa_json_path, scopes=SCOPES)
+    return build('drive', 'v3', credentials=creds, cache_discovery=False)
+
+
+def find_file_id(drive, folder_id: str, name: str) -> str | None:
+    """Busca en la carpeta un archivo con ese nombre exacto (case-insensitive)."""
+    wanted = name.strip().lower()
+    for f in list_files(drive, folder_id):
+        if f['name'].strip().lower() == wanted:
+            return f['id']
+    return None
 
 
 def list_files(drive, folder_id: str) -> list[dict]:

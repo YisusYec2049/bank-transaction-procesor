@@ -11,6 +11,17 @@ Implementado hasta ahora (columnas 10-11 del diseño de 20 columnas):
 Las columnas 12-19 (CRUCE, NOMBRE, ...) todavía no están definidas y quedan NULL.
 Requiere haber corrido sync_cartera.py antes (o el mismo día) para que las tablas
 mirror estén al día.
+
+Excepciones (requieren revisión humana en financial-platform, no se resuelven
+solas aquí):
+  - sin_cruce:      ni INCP ni CORREO(2) encontraron resultado.
+  - cruce_ambiguo:  la llave de búsqueda (identification o email) aparece en la
+                    hoja de referencia con más de un valor distinto (ej. una
+                    pareja que paga dos inscripciones con el mismo correo).
+
+Filas ya resueltas (estado_cruce = 'cruzado' o 'no_identificable') no se vuelven
+a tocar en corridas futuras, así una corrección manual o un "no identificable"
+marcado en financial-platform queda protegido.
 """
 
 import logging
@@ -30,17 +41,30 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-def _build_lookup(rows: list[dict], key_field: str, value_field: str, lower: bool = False) -> dict:
-    """Primera coincidencia gana (replica BUSCARV de Excel)."""
-    lookup = {}
+def _build_lookup(rows: list[dict], key_field: str, value_field: str,
+                   lower: bool = False) -> tuple[dict, set]:
+    """Primera coincidencia gana (replica BUSCARV de Excel).
+
+    Devuelve además el conjunto de llaves ambiguas: aquellas donde la hoja de
+    referencia trae 2+ valores distintos no vacíos para la misma llave (ej. un
+    correo con dos números de inscripción diferentes). Esas NO se resuelven
+    aquí, solo se señalan para revisión humana.
+    """
+    lookup: dict = {}
+    valores_no_vacios: dict[str, set] = {}
     for row in rows:
         key = str(row.get(key_field) or '').strip()
         if lower:
             key = key.lower()
-        if not key or key in lookup:
+        if not key:
             continue
-        lookup[key] = row.get(value_field) or ''
-    return lookup
+        value = str(row.get(value_field) or '').strip()
+        if key not in lookup:
+            lookup[key] = value
+        if value:
+            valores_no_vacios.setdefault(key, set()).add(value)
+    ambiguos = {k for k, vs in valores_no_vacios.items() if len(vs) > 1}
+    return lookup, ambiguos
 
 
 def main():
@@ -62,13 +86,21 @@ def main():
     stripe_rows  = select_all(supabase_url, srk, 'cartera_ingresos_stripe_usa',
                                select='email_cliente,incp')
 
-    lookup_inscrip = _build_lookup(inscrip_rows, 'numero_id', 'id_inscripcion')
-    lookup_bc2576  = _build_lookup(bc2576_rows, 'referencia_1', 'incp')
-    lookup_wompi   = _build_lookup(wompi_rows, 'email', 'inscrip', lower=True)
-    lookup_stripe  = _build_lookup(stripe_rows, 'email_cliente', 'incp', lower=True)
+    lookup_inscrip, ambiguos_inscrip = _build_lookup(inscrip_rows, 'numero_id', 'id_inscripcion')
+    lookup_bc2576, ambiguos_bc2576   = _build_lookup(bc2576_rows, 'referencia_1', 'incp')
+    lookup_wompi, ambiguos_wompi     = _build_lookup(wompi_rows, 'email', 'inscrip', lower=True)
+    lookup_stripe, ambiguos_stripe   = _build_lookup(stripe_rows, 'email_cliente', 'incp', lower=True)
 
     log.info('Referencias cargadas: inscrip=%d, bc2576=%d, wompi=%d, stripe=%d',
               len(lookup_inscrip), len(lookup_bc2576), len(lookup_wompi), len(lookup_stripe))
+
+    log.info('Cargando estado_cruce existente...')
+    existentes = select_all(supabase_url, srk, 'cruce_cartera', select='matching_key,estado_cruce')
+    llaves_terminadas = {
+        r['matching_key'] for r in existentes
+        if r.get('estado_cruce') in ('cruzado', 'no_identificable')
+    }
+    log.info('%d filas ya resueltas (cruzado/no_identificable), se saltan.', len(llaves_terminadas))
 
     log.info('Cargando consolidated_transactions...')
     transacciones = select_all(
@@ -76,23 +108,37 @@ def main():
         select='identification,payment_date,transaction_code_1,transaction_code_2,'
                'email,payment_method,program,phone,payment_amount,matching_key',
     )
+    transacciones = [t for t in transacciones if t.get('matching_key') not in llaves_terminadas]
     log.info('%d transacciones a cruzar.', len(transacciones))
 
     resultado = []
     for t in transacciones:
         identification = str(t.get('identification') or '').strip()
         email          = str(t.get('email') or '').strip()
+        email_lower    = email.lower()
         payment_method = str(t.get('payment_method') or '').upper()
 
-        incp = lookup_inscrip.get(identification, '')
+        incp         = lookup_inscrip.get(identification, '')
+        incp_ambiguo = identification in ambiguos_inscrip
 
-        correo_2 = ''
+        correo_2         = ''
+        correo_2_ambiguo = False
         if payment_method == 'BANCOLOMBIA':
-            correo_2 = lookup_bc2576.get(email, '')
+            correo_2         = lookup_bc2576.get(email, '')
+            correo_2_ambiguo = email in ambiguos_bc2576
         elif payment_method.startswith('WOMPI'):
-            correo_2 = lookup_wompi.get(email.lower(), '')
+            correo_2         = lookup_wompi.get(email_lower, '')
+            correo_2_ambiguo = email_lower in ambiguos_wompi
         elif payment_method == 'STRIPE_USA':
-            correo_2 = lookup_stripe.get(email.lower(), '')
+            correo_2         = lookup_stripe.get(email_lower, '')
+            correo_2_ambiguo = email_lower in ambiguos_stripe
+
+        if incp_ambiguo or correo_2_ambiguo:
+            excepcion_motivo, estado_cruce = 'cruce_ambiguo', 'pendiente'
+        elif not incp and not correo_2:
+            excepcion_motivo, estado_cruce = 'sin_cruce', 'pendiente'
+        else:
+            excepcion_motivo, estado_cruce = None, 'cruzado'
 
         resultado.append({
             'matching_key':       t.get('matching_key'),
@@ -107,6 +153,8 @@ def main():
             'payment_amount':     t.get('payment_amount'),
             'incp':               incp or None,
             'correo_2':           correo_2 or None,
+            'excepcion_motivo':   excepcion_motivo,
+            'estado_cruce':       estado_cruce,
         })
 
     if not resultado:
@@ -117,10 +165,11 @@ def main():
     for i in range(0, len(resultado), batch_size):
         upsert_cruce(supabase_url, srk, resultado[i:i + batch_size])
 
-    con_incp    = sum(1 for r in resultado if r['incp'])
-    con_correo2 = sum(1 for r in resultado if r['correo_2'])
-    log.info('cruzar.py completado: %d filas | INCP=%d | CORREO(2)=%d',
-              len(resultado), con_incp, con_correo2)
+    cruzados    = sum(1 for r in resultado if r['estado_cruce'] == 'cruzado')
+    sin_cruce   = sum(1 for r in resultado if r['excepcion_motivo'] == 'sin_cruce')
+    ambiguos    = sum(1 for r in resultado if r['excepcion_motivo'] == 'cruce_ambiguo')
+    log.info('cruzar.py completado: %d filas | cruzadas=%d | sin_cruce=%d | cruce_ambiguo=%d',
+              len(resultado), cruzados, sin_cruce, ambiguos)
 
 
 if __name__ == '__main__':

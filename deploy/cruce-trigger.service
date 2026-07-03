@@ -1,0 +1,14 @@
+[Unit]
+Description=Cruce de Cartera - trigger HTTP (sync_cartera.py + cruzar.py)
+After=network.target
+
+[Service]
+Type=simple
+User=matching
+WorkingDirectory=/opt/matching-test
+ExecStart=/opt/matching-test/venv/bin/gunicorn --workers 1 --bind 127.0.0.1:8787 --timeout 120 trigger_server:app
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

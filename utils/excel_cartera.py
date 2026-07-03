@@ -1,7 +1,8 @@
 """Lectura de los Excel de referencia para el cruce de cartera
-(Payu UC.xlsx / Ingresos PSE y PAYU.xlsx)."""
+(Payu UC.xlsx / Ingresos PSE y PAYU.xlsx), descargados de Google Drive."""
 
 import logging
+from typing import BinaryIO
 
 import openpyxl
 
@@ -48,7 +49,7 @@ def _find_header_row(ws, expected: list[str], max_scan: int = 5):
     return best_row, best_map
 
 
-def read_inscrip(path: str) -> list[dict]:
+def read_inscrip(path: str | BinaryIO) -> list[dict]:
     """Payu UC.xlsx → hoja Inscrip. [{numero_id, id_inscripcion}, ...]."""
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
     try:
@@ -70,7 +71,7 @@ def read_inscrip(path: str) -> list[dict]:
         wb.close()
 
 
-def read_bancolombia_2576(path: str) -> list[dict]:
+def read_bancolombia_2576(path: str | BinaryIO) -> list[dict]:
     """Ingresos PSE y PAYU.xlsx → hoja BANCOLOMBIA 2576. [{referencia_1, incp}, ...]."""
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
     try:
@@ -92,7 +93,7 @@ def read_bancolombia_2576(path: str) -> list[dict]:
         wb.close()
 
 
-def read_wompi(path: str) -> list[dict]:
+def read_wompi(path: str | BinaryIO) -> list[dict]:
     """Ingresos PSE y PAYU.xlsx → hoja WOMPI. [{email, inscrip}, ...]."""
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
     try:
@@ -114,7 +115,7 @@ def read_wompi(path: str) -> list[dict]:
         wb.close()
 
 
-def read_stripe_usa(path: str) -> list[dict]:
+def read_stripe_usa(path: str | BinaryIO) -> list[dict]:
     """Ingresos PSE y PAYU.xlsx → hoja STRIPE_USA. [{email_cliente, incp}, ...]."""
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
     try:
