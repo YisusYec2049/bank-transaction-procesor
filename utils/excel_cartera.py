@@ -1,6 +1,7 @@
 """Lectura de los Excel de referencia para el cruce de cartera
 (Payu UC.xlsx / Ingresos PSE y PAYU.xlsx), descargados de Google Drive."""
 
+import datetime
 import logging
 from typing import BinaryIO
 
@@ -19,6 +20,25 @@ def _cell_str(v) -> str:
     if isinstance(v, int):
         return str(v)
     return str(v).strip()
+
+
+def _cell_date(v) -> str | None:
+    """Normaliza una celda de fecha a ISO (YYYY-MM-DD), o None si no es fecha."""
+    if v is None:
+        return None
+    if isinstance(v, datetime.datetime):
+        return v.date().isoformat()
+    if isinstance(v, datetime.date):
+        return v.isoformat()
+    s = str(v).strip()
+    if not s:
+        return None
+    for fmt in ('%Y-%m-%d', '%d/%m/%Y', '%d-%m-%Y'):
+        try:
+            return datetime.datetime.strptime(s, fmt).date().isoformat()
+        except ValueError:
+            continue
+    return None
 
 
 def _find_header_row(ws, expected: list[str], max_scan: int = 5):
@@ -72,11 +92,15 @@ def read_inscrip(path: str | BinaryIO) -> list[dict]:
 
 
 def read_bancolombia_2576(path: str | BinaryIO) -> list[dict]:
-    """Ingresos PSE y PAYU.xlsx → hoja BANCOLOMBIA 2576. [{referencia_1, incp}, ...]."""
+    """Ingresos PSE y PAYU.xlsx → hoja BANCOLOMBIA 2576. [{referencia_1, incp, fecha}, ...].
+
+    `fecha` (columna FECHA) se usa en cruzar.py para sugerir, en llaves
+    ambiguas, cuál INCP corresponde a un pago nuevo por cadencia mensual
+    (ver _sugerir_por_cadencia)."""
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
     try:
         ws = wb['BANCOLOMBIA 2576']
-        header_row, cols = _find_header_row(ws, ['REFERENCIA 1', 'incp'])
+        header_row, cols = _find_header_row(ws, ['REFERENCIA 1', 'incp', 'FECHA'])
 
         rows = []
         for row in ws.iter_rows(min_row=header_row + 1, values_only=True):
@@ -86,6 +110,7 @@ def read_bancolombia_2576(path: str | BinaryIO) -> list[dict]:
             rows.append({
                 'referencia_1': ref1,
                 'incp':         _cell_str(row[cols['incp']]),
+                'fecha':        _cell_date(row[cols['fecha']]),
             })
         log.info('BANCOLOMBIA 2576 (Ingresos): %d filas leídas.', len(rows))
         return rows
@@ -94,11 +119,11 @@ def read_bancolombia_2576(path: str | BinaryIO) -> list[dict]:
 
 
 def read_wompi(path: str | BinaryIO) -> list[dict]:
-    """Ingresos PSE y PAYU.xlsx → hoja WOMPI. [{email, inscrip}, ...]."""
+    """Ingresos PSE y PAYU.xlsx → hoja WOMPI. [{email, inscrip, fecha}, ...]."""
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
     try:
         ws = wb['WOMPI']
-        header_row, cols = _find_header_row(ws, ['email', 'INSCRIP'])
+        header_row, cols = _find_header_row(ws, ['email', 'INSCRIP', 'Fecha'])
 
         rows = []
         for row in ws.iter_rows(min_row=header_row + 1, values_only=True):
@@ -108,6 +133,7 @@ def read_wompi(path: str | BinaryIO) -> list[dict]:
             rows.append({
                 'email':   email,
                 'inscrip': _cell_str(row[cols['inscrip']]),
+                'fecha':   _cell_date(row[cols['fecha']]),
             })
         log.info('WOMPI (Ingresos): %d filas leídas.', len(rows))
         return rows
@@ -116,7 +142,11 @@ def read_wompi(path: str | BinaryIO) -> list[dict]:
 
 
 def read_stripe_usa(path: str | BinaryIO) -> list[dict]:
-    """Ingresos PSE y PAYU.xlsx → hoja STRIPE_USA. [{email_cliente, incp}, ...]."""
+    """Ingresos PSE y PAYU.xlsx → hoja STRIPE_USA. [{email_cliente, incp, fecha}, ...].
+
+    La primera columna de esta hoja no trae un encabezado utilizable (celda A1
+    es texto suelto, no un nombre de columna), pero sus datos son siempre la
+    fecha/hora del pago — se captura por posición (índice 0), no por nombre."""
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
     try:
         ws = wb['STRIPE_USA']
@@ -130,6 +160,7 @@ def read_stripe_usa(path: str | BinaryIO) -> list[dict]:
             rows.append({
                 'email_cliente': email,
                 'incp':          _cell_str(row[cols['incp']]),
+                'fecha':         _cell_date(row[0]),
             })
         log.info('STRIPE_USA (Ingresos): %d filas leídas.', len(rows))
         return rows
