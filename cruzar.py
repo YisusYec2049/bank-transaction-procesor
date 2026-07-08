@@ -19,9 +19,9 @@ solas aquí):
                       la hoja de referencia con más de un valor distinto (ej.
                       una pareja que paga dos inscripciones con el mismo
                       correo). Excepción: si los valores distintos solo
-                      difieren por el sufijo "PN" (mismo número, ej.
-                      "3300"/"3300PN") no cuenta como ambigüedad — se
-                      normaliza al valor con "PN".
+                      difieren por un sufijo ignorable ("PN" o "PJ", mismo
+                      número, ej. "3300"/"3300PN") no cuenta como ambigüedad
+                      — se normaliza al valor con el sufijo.
   - cruce_discrepante: INCP y CORREO(2) encontraron resultado cada uno (sin
                       ambigüedad en ninguno), pero apuntan a inscripciones
                       distintas (ej. un correo familiar compartido donde el
@@ -85,10 +85,15 @@ CADENCIA_DIAS_MAX = 60
 COINCIDENCIA_DIAS = 3
 
 
-def _normalizar_pn(valor: str) -> str:
-    """Quita el sufijo "PN" (si lo tiene) para comparar el número base."""
-    if valor.upper().endswith('PN'):
-        return valor[:-2]
+SUFIJOS_IGNORABLES = ('PN', 'PJ')
+
+
+def _normalizar_sufijo(valor: str) -> str:
+    """Quita el sufijo (PN o PJ, si lo tiene) para comparar el número base."""
+    upper = valor.upper()
+    for suf in SUFIJOS_IGNORABLES:
+        if upper.endswith(suf):
+            return valor[:-len(suf)]
     return valor
 
 
@@ -156,8 +161,12 @@ def _build_lookup(rows: list[dict], key_field: str, value_field: str,
     aquí, solo se señalan para revisión humana.
 
     Excepción confirmada por el usuario: si los valores de una llave solo
-    difieren por el sufijo "PN" (mismo número, ej. "3300" y "3300PN"), no es
-    una ambigüedad real — se normaliza al valor con "PN" y no se marca excepción.
+    difieren por un sufijo ignorable ("PN" o "PJ", mismo número, ej. "3300"
+    y "3300PN"), no es una ambigüedad real — se normaliza al valor con el
+    sufijo y no se marca excepción. Si la misma llave trae más de un sufijo
+    distinto para el mismo número base (ej. "3300PN" y "3300PJ"), se deja
+    como ambigüedad real — no hay confirmación de que los sufijos sean
+    intercambiables entre sí.
 
     Si se pasa `fecha_field`, arma además un historial {key: {valor: [fechas]}}
     con las fechas de pago registradas por valor, usado por
@@ -185,10 +194,19 @@ def _build_lookup(rows: list[dict], key_field: str, value_field: str,
     for key, valores in valores_no_vacios.items():
         if len(valores) <= 1:
             continue
-        bases = {_normalizar_pn(v) for v in valores}
-        if len(bases) == 1:
-            lookup[key] = next(iter(bases)) + 'PN'
+        bases = {_normalizar_sufijo(v) for v in valores}
+        if len(bases) != 1:
+            ambiguos.add(key)
+            continue
+        base = next(iter(bases))
+        sufijos = {v[len(base):] for v in valores if v != base}
+        if len(sufijos) <= 1:
+            sufijo = next(iter(sufijos), '')
+            lookup[key] = base + sufijo
         else:
+            # mismo número base pero con más de un sufijo distinto
+            # (ej. "3300PN" y "3300PJ") — no sabemos si son intercambiables,
+            # se deja como ambigüedad real para revisión manual.
             ambiguos.add(key)
 
     return lookup, ambiguos, historial
@@ -274,7 +292,7 @@ def main():
 
         if incp_ambiguo or correo_2_ambiguo:
             excepcion_motivo, estado_cruce = 'cruce_ambiguo', 'pendiente'
-        elif incp and correo_2 and _normalizar_pn(incp) != _normalizar_pn(correo_2):
+        elif incp and correo_2 and _normalizar_sufijo(incp) != _normalizar_sufijo(correo_2):
             excepcion_motivo, estado_cruce = 'cruce_discrepante', 'pendiente'
         elif not incp and not correo_2:
             excepcion_motivo, estado_cruce = 'sin_cruce', 'pendiente'
