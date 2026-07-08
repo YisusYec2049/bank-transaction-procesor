@@ -14,13 +14,22 @@ mirror estén al día.
 
 Excepciones (requieren revisión humana en financial-platform, no se resuelven
 solas aquí):
-  - sin_cruce:      ni INCP ni CORREO(2) encontraron resultado.
-  - cruce_ambiguo:  la llave de búsqueda (identification o email) aparece en la
-                    hoja de referencia con más de un valor distinto (ej. una
-                    pareja que paga dos inscripciones con el mismo correo).
-                    Excepción: si los valores distintos solo difieren por el
-                    sufijo "PN" (mismo número, ej. "3300"/"3300PN") no cuenta
-                    como ambigüedad — se normaliza al valor con "PN".
+  - sin_cruce:        ni INCP ni CORREO(2) encontraron resultado.
+  - cruce_ambiguo:    la llave de búsqueda (identification o email) aparece en
+                      la hoja de referencia con más de un valor distinto (ej.
+                      una pareja que paga dos inscripciones con el mismo
+                      correo). Excepción: si los valores distintos solo
+                      difieren por el sufijo "PN" (mismo número, ej.
+                      "3300"/"3300PN") no cuenta como ambigüedad — se
+                      normaliza al valor con "PN".
+  - cruce_discrepante: INCP y CORREO(2) encontraron resultado cada uno (sin
+                      ambigüedad en ninguno), pero apuntan a inscripciones
+                      distintas (ej. un correo familiar compartido donde el
+                      documento del pagador cruza a su propia inscripción,
+                      pero ese mismo correo en la hoja de Ingresos quedó
+                      asociado a la inscripción de otro familiar). Antes esto
+                      se guardaba en silencio como 'cruzado', usando ambos
+                      valores tal cual sin ninguna señal de la discrepancia.
 
 Sugerencia por fecha (CORREO(2) de BC2576/WOMPI/STRIPE_USA, las únicas hojas
 con fecha por fila): cuando una llave sigue ambigua tras la normalización PN,
@@ -265,6 +274,8 @@ def main():
 
         if incp_ambiguo or correo_2_ambiguo:
             excepcion_motivo, estado_cruce = 'cruce_ambiguo', 'pendiente'
+        elif incp and correo_2 and _normalizar_pn(incp) != _normalizar_pn(correo_2):
+            excepcion_motivo, estado_cruce = 'cruce_discrepante', 'pendiente'
         elif not incp and not correo_2:
             excepcion_motivo, estado_cruce = 'sin_cruce', 'pendiente'
         else:
