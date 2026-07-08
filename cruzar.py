@@ -3,7 +3,11 @@
 cruzar.py — calcula el cruce de cartera sobre consolidated_transactions.
 
 Implementado hasta ahora (columnas 10-11 del diseño de 20 columnas):
-  - INCP:      identification vs cartera_inscrip.numero_id → id_inscripcion
+  - INCP:      identification vs cartera_inscrip.numero_id → id_inscripcion.
+               numero_id se normaliza quitando el dígito de verificación de
+               NIT (ej. "860004922-4" -> "860004922") antes de indexar, ya
+               que identification nunca lo trae — sin esto ningún pago hecho
+               por una empresa (Persona Jurídica) cruzaba (ver _normalizar_nit).
   - CORREO(2): email vs la hoja "Ingresos PSE y PAYU" correspondiente al banco
                (BANCOLOMBIA 2576 / WOMPI / STRIPE_USA), primera coincidencia
                (replica BUSCARV de Excel: la primera fila que matchea gana).
@@ -65,6 +69,7 @@ marcado en financial-platform queda protegido.
 
 import logging
 import os
+import re
 import sys
 from datetime import date, datetime as dt
 
@@ -95,6 +100,20 @@ def _normalizar_sufijo(valor: str) -> str:
         if upper.endswith(suf):
             return valor[:-len(suf)]
     return valor
+
+
+_RE_DV_NIT = re.compile(r'-\d$')
+
+
+def _normalizar_nit(valor: str) -> str:
+    """Quita el dígito de verificación de un NIT (ej. "860004922-4" ->
+    "860004922"), si lo tiene. Los NIT de empresas (Persona Jurídica) en la
+    hoja Inscrip a veces vienen con DV y las transacciones que llegan de los
+    bancos/pasarelas nunca lo traen — sin esto, ningún pago hecho por una
+    empresa cruza por INCP. No toca formatos con guion que no sean
+    exactamente "-<un dígito>" al final (ej. prefijos de documento de
+    extranjería como "ID-", "CI-", "DNI-"), esos quedan igual."""
+    return _RE_DV_NIT.sub('', valor)
 
 
 def _parse_fecha(valor) -> date | None:
@@ -224,6 +243,8 @@ def main():
     log.info('Cargando tablas de referencia...')
     inscrip_rows = select_all(supabase_url, srk, 'cartera_inscrip',
                                select='numero_id,id_inscripcion')
+    for row in inscrip_rows:
+        row['numero_id'] = _normalizar_nit(str(row.get('numero_id') or ''))
     bc2576_rows  = select_all(supabase_url, srk, 'cartera_ingresos_bancolombia_2576',
                                select='referencia_1,incp,fecha')
     wompi_rows   = select_all(supabase_url, srk, 'cartera_ingresos_wompi',
