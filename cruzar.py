@@ -104,12 +104,14 @@ SUFIJOS_IGNORABLES = ('PN', 'PJ')
 
 
 def _normalizar_sufijo(valor: str) -> str:
-    """Quita el sufijo (PN o PJ, si lo tiene) para comparar el número base."""
-    upper = valor.upper()
+    """Quita el sufijo (PN o PJ, si lo tiene, con o sin espacio antes, ej.
+    "411 PJ" o "411PJ") para comparar el número base."""
+    v = valor.strip()
+    upper = v.upper()
     for suf in SUFIJOS_IGNORABLES:
         if upper.endswith(suf):
-            return valor[:-len(suf)]
-    return valor
+            return v[:-len(suf)].strip()
+    return v
 
 
 # NIT de terceros/entidades que reciben pagos de cesantías por cuenta de
@@ -119,6 +121,18 @@ def _normalizar_sufijo(valor: str) -> str:
 # real. Confirmado por el usuario el 8 de julio para "800138188".
 NITS_CESANTIAS = {'800138188'}
 CESANTIAS_LABEL = 'Cesantías'
+
+def _es_valor_relleno(valor: str) -> bool:
+    """True si el valor es basura de captura del Excel de referencia, no un
+    cruce real: un punto solo (".") o un sufijo (PN/PJ) sin ningún dígito
+    debajo (ej. "PN" a secas). Confirmado por el usuario el 8 de julio."""
+    v = valor.strip()
+    if not v:
+        return False
+    if v == '.':
+        return True
+    return _normalizar_sufijo(v) == ''
+
 
 _RE_DV_NIT = re.compile(r'-\d$')
 
@@ -205,6 +219,10 @@ def _build_lookup(rows: list[dict], key_field: str, value_field: str,
     como ambigüedad real — no hay confirmación de que los sufijos sean
     intercambiables entre sí.
 
+    Filas de relleno (ver _es_valor_relleno: un punto solo o un sufijo sin
+    dígitos) se ignoran por completo, como si esa fila no existiera — así una
+    fila real con un valor real para la misma llave puede seguir ganando.
+
     Si se pasa `fecha_field`, arma además un historial {key: {valor: [fechas]}}
     con las fechas de pago registradas por valor, usado por
     _sugerir_por_cadencia para las llaves que sigan ambiguas.
@@ -219,6 +237,8 @@ def _build_lookup(rows: list[dict], key_field: str, value_field: str,
         if not key:
             continue
         value = str(row.get(value_field) or '').strip()
+        if _es_valor_relleno(value):
+            continue
         if key not in lookup:
             lookup[key] = value
         if value:
