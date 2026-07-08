@@ -100,12 +100,17 @@ CADENCIA_DIAS_MAX = 60
 COINCIDENCIA_DIAS = 3
 
 
-SUFIJOS_IGNORABLES = ('PN', 'PJ')
+SUFIJOS_IGNORABLES = ('PN', 'PJ', 'P')
 
 
 def _normalizar_sufijo(valor: str) -> str:
-    """Quita el sufijo (PN o PJ, si lo tiene, con o sin espacio antes, ej.
-    "411 PJ" o "411PJ") para comparar el número base."""
+    """Quita el sufijo (PN, PJ, o un "P" truncado, con o sin espacio antes,
+    ej. "411 PJ" o "4844P") para comparar el número base.
+
+    Un "P" suelto es ambiguo por sí mismo (puede ser "PN" o "PJ" truncado) —
+    esta función solo calcula el número base, no decide a cuál corresponde.
+    Esa resolución depende del resto de valores de la misma llave y se hace
+    en _build_lookup, no aquí."""
     v = valor.strip()
     upper = v.upper()
     for suf in SUFIJOS_IGNORABLES:
@@ -214,10 +219,13 @@ def _build_lookup(rows: list[dict], key_field: str, value_field: str,
     Excepción confirmada por el usuario: si los valores de una llave solo
     difieren por un sufijo ignorable ("PN" o "PJ", mismo número, ej. "3300"
     y "3300PN"), no es una ambigüedad real — se normaliza al valor con el
-    sufijo y no se marca excepción. Si la misma llave trae más de un sufijo
-    distinto para el mismo número base (ej. "3300PN" y "3300PJ"), se deja
-    como ambigüedad real — no hay confirmación de que los sufijos sean
-    intercambiables entre sí.
+    sufijo y no se marca excepción. Un "P" suelto (sin la segunda letra) se
+    trata como "PN"/"PJ" truncado, pero solo se resuelve cuando otro valor de
+    la misma llave confirma cuál de los dos es (ej. "179PJ" + "179P" ->
+    "179PJ"); si no hay ningún sufijo real que lo confirme, o si la misma
+    llave trae más de un sufijo distinto para el mismo número base (ej.
+    "3300PN" y "3300PJ"), se deja como ambigüedad real — no hay confirmación
+    de que los sufijos sean intercambiables entre sí.
 
     Filas de relleno (ver _es_valor_relleno: un punto solo o un sufijo sin
     dígitos) se ignoran por completo, como si esa fila no existiera — así una
@@ -257,13 +265,17 @@ def _build_lookup(rows: list[dict], key_field: str, value_field: str,
             continue
         base = next(iter(bases))
         sufijos = {v[len(base):] for v in valores if v != base}
-        if len(sufijos) <= 1:
-            sufijo = next(iter(sufijos), '')
-            lookup[key] = base + sufijo
+        sufijos_reales = {s for s in sufijos if s.upper() in ('PN', 'PJ')}
+        if len(sufijos_reales) == 1:
+            # un "P" suelto en el grupo se resuelve al sufijo real presente
+            # (ej. "179PJ" + "179P" -> "179PJ"): "P" = PN o PJ únicamente
+            # cuando hay otro valor exactamente igual salvo la letra que le
+            # falta — nunca se asume uno de los dos sin esa confirmación.
+            lookup[key] = base + next(iter(sufijos_reales))
         else:
-            # mismo número base pero con más de un sufijo distinto
-            # (ej. "3300PN" y "3300PJ") — no sabemos si son intercambiables,
-            # se deja como ambigüedad real para revisión manual.
+            # sufijos reales distintos a la vez (PN y PJ), o un "P" suelto
+            # sin ningún sufijo real que lo desambigüe — no sabemos a cuál
+            # corresponde, se deja como ambigüedad real para revisión manual.
             ambiguos.add(key)
 
     return lookup, ambiguos, historial
