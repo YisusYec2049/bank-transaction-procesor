@@ -35,6 +35,16 @@ solas aquí):
                       se guardaba en silencio como 'cruzado', usando ambos
                       valores tal cual sin ninguna señal de la discrepancia.
 
+Regla "cesantías" (BANCOLOMBIA): NITS_CESANTIAS son referencia_1 de terceros
+que reciben pagos por cuenta de muchos estudiantes distintos (ej. NIT de
+"PROTECCIÓN SA", que en la hoja BANCOLOMBIA 2576 aparece repetido con 190+
+incp distintos — no identifica a una persona, así que buscar por esa llave
+siempre "ambiguaría" en falso). Si el email/identification de la transacción
+es uno de estos NIT, CORREO(2) se fija directo en "Cesantías" (no se hace
+lookup), no cuenta como cruce_ambiguo, y se excluye también de la
+comparación de cruce_discrepante contra INCP — la fila puede quedar
+'cruzado' con INCP resuelto normalmente por su lado.
+
 Sugerencia por fecha (CORREO(2) de BC2576/WOMPI/STRIPE_USA, las únicas hojas
 con fecha por fila): cuando una llave sigue ambigua tras la normalización PN,
 puede deberse a que la persona terminó un programa y se reinscribió a otro
@@ -101,6 +111,14 @@ def _normalizar_sufijo(valor: str) -> str:
             return valor[:-len(suf)]
     return valor
 
+
+# NIT de terceros/entidades que reciben pagos de cesantías por cuenta de
+# muchos estudiantes distintos (ej. "PROTECCIÓN SA"). En la hoja BANCOLOMBIA
+# 2576 aparecen como referencia_1 repetida con decenas de incp distintos —
+# no identifican a una persona, así que nunca deben tratarse como ambigüedad
+# real. Confirmado por el usuario el 8 de julio para "800138188".
+NITS_CESANTIAS = {'800138188'}
+CESANTIAS_LABEL = 'Cesantías'
 
 _RE_DV_NIT = re.compile(r'-\d$')
 
@@ -294,9 +312,14 @@ def main():
         correo_2_ambiguo    = False
         correo_2_historial  = {}
         if payment_method == 'BANCOLOMBIA':
-            correo_2           = lookup_bc2576.get(email, '')
-            correo_2_ambiguo   = email in ambiguos_bc2576
-            correo_2_historial = historial_bc2576.get(email, {})
+            if email in NITS_CESANTIAS:
+                correo_2           = CESANTIAS_LABEL
+                correo_2_ambiguo   = False
+                correo_2_historial = {}
+            else:
+                correo_2           = lookup_bc2576.get(email, '')
+                correo_2_ambiguo   = email in ambiguos_bc2576
+                correo_2_historial = historial_bc2576.get(email, {})
         elif payment_method.startswith('WOMPI'):
             correo_2           = lookup_wompi.get(email_lower, '')
             correo_2_ambiguo   = email_lower in ambiguos_wompi
@@ -313,7 +336,8 @@ def main():
 
         if incp_ambiguo or correo_2_ambiguo:
             excepcion_motivo, estado_cruce = 'cruce_ambiguo', 'pendiente'
-        elif incp and correo_2 and _normalizar_sufijo(incp) != _normalizar_sufijo(correo_2):
+        elif (incp and correo_2 and correo_2 != CESANTIAS_LABEL
+              and _normalizar_sufijo(incp) != _normalizar_sufijo(correo_2)):
             excepcion_motivo, estado_cruce = 'cruce_discrepante', 'pendiente'
         elif not incp and not correo_2:
             excepcion_motivo, estado_cruce = 'sin_cruce', 'pendiente'
