@@ -1,0 +1,15 @@
+[Unit]
+Description=Cruce de Cartera - trigger HTTP (bajo demanda)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/matching-test
+EnvironmentFile=/opt/matching-test/.env
+ExecStart=/opt/matching-test/venv/bin/gunicorn --workers 1 --bind 127.0.0.1:5001 --timeout 600 trigger_server:app
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
