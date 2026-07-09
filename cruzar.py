@@ -25,18 +25,7 @@ solas aquí):
                       correo). Excepción: si los valores distintos solo
                       difieren por un sufijo ignorable ("PN" o "PJ", mismo
                       número, ej. "3300"/"3300PN") no cuenta como ambigüedad
-                      — se normaliza al valor con el sufijo. Para INCP
-                      además: si los números base son genuinamente distintos
-                      pero exactamente uno de los valores lleva sufijo
-                      financiero (PN/PJ) y el resto no lleva ninguno (ej.
-                      pregrado antiguo en Access + diplomado nuevo ya en el
-                      sistema financiero), se toma el que tiene sufijo (ver
-                      `preferir_sufijo_financiero` en _build_lookup). Si
-                      sigue ambiguo (2+ con sufijo), se puede resolver
-                      permanentemente desde financial-platform descartando
-                      un id_inscripcion para ese documento — ver tabla
-                      `cruce_incp_exclusiones` (sql/004), que este script lee
-                      y filtra antes de construir el lookup de INCP.
+                      — se normaliza al valor con el sufijo.
   - cruce_discrepante: INCP y CORREO(2) encontraron resultado cada uno (sin
                       ambigüedad en ninguno), pero apuntan a inscripciones
                       distintas (ej. un correo familiar compartido donde el
@@ -217,17 +206,8 @@ def _sugerir_por_cadencia(historial_valor: dict[str, list], fecha_pago: date | N
     return candidatos[0] if len(candidatos) == 1 else None
 
 
-def _tiene_sufijo_financiero(valor: str) -> bool:
-    """True si el valor termina en un sufijo real del sistema financiero (PN
-    o PJ, con o sin espacio antes). A diferencia de _normalizar_sufijo, NO
-    cuenta un "P" truncado como sufijo real aquí — para esta distinción
-    (financiero vs. Access) solo interesa un sufijo confirmado."""
-    return valor.strip().upper().endswith(('PN', 'PJ'))
-
-
 def _build_lookup(rows: list[dict], key_field: str, value_field: str,
                    lower: bool = False, fecha_field: str | None = None,
-                   preferir_sufijo_financiero: bool = False,
                    ) -> tuple[dict, set, dict]:
     """Primera coincidencia gana (replica BUSCARV de Excel).
 
@@ -246,20 +226,6 @@ def _build_lookup(rows: list[dict], key_field: str, value_field: str,
     llave trae más de un sufijo distinto para el mismo número base (ej.
     "3300PN" y "3300PJ"), se deja como ambigüedad real — no hay confirmación
     de que los sufijos sean intercambiables entre sí.
-
-    Si `preferir_sufijo_financiero=True` (solo usado hoy para INCP/
-    cartera_inscrip): cuando los valores de una llave tienen números base
-    genuinamente distintos (ej. "40908" vs "4260PN" — no es el mismo número
-    con/sin sufijo, son dos inscripciones reales distintas, típicamente un
-    pregrado antiguo registrado en Access y un diplomado nuevo ya en el
-    sistema financiero), si EXACTAMENTE uno de los valores lleva sufijo
-    financiero (PN/PJ) y el/los otro(s) no llevan ninguno, se toma el que
-    tiene sufijo — este pipeline solo cruza pagos del sistema financiero, así
-    que es la mejor señal disponible. No es una certeza absoluta: alguien
-    pudo haber borrado el sufijo de un registro por error, así que un valor
-    sin sufijo no se descarta de cartera_inscrip, solo se ignora para este
-    cruce puntual. Si hay 2+ valores con sufijo financiero, sigue siendo
-    ambigüedad real (ver `cruce_incp_exclusiones` para resolverla a mano).
 
     Filas de relleno (ver _es_valor_relleno: un punto solo o un sufijo sin
     dígitos) se ignoran por completo, como si esa fila no existiera — así una
@@ -295,12 +261,6 @@ def _build_lookup(rows: list[dict], key_field: str, value_field: str,
             continue
         bases = {_normalizar_sufijo(v) for v in valores}
         if len(bases) != 1:
-            if preferir_sufijo_financiero:
-                con_sufijo = {v for v in valores if _tiene_sufijo_financiero(v)}
-                sin_sufijo = valores - con_sufijo
-                if len(con_sufijo) == 1 and sin_sufijo:
-                    lookup[key] = next(iter(con_sufijo))
-                    continue
             ambiguos.add(key)
             continue
         base = next(iter(bases))
@@ -335,18 +295,6 @@ def main():
                                select='numero_id,id_inscripcion')
     for row in inscrip_rows:
         row['numero_id'] = _normalizar_nit(str(row.get('numero_id') or ''))
-
-    exclusiones_rows = select_all(supabase_url, srk, 'cruce_incp_exclusiones',
-                                   select='identification,id_inscripcion_excluido')
-    exclusiones = {(r['identification'], r['id_inscripcion_excluido']) for r in exclusiones_rows}
-    if exclusiones:
-        antes = len(inscrip_rows)
-        inscrip_rows = [
-            r for r in inscrip_rows
-            if (r['numero_id'], str(r.get('id_inscripcion') or '').strip()) not in exclusiones
-        ]
-        log.info('%d filas de cartera_inscrip descartadas por exclusión manual.', antes - len(inscrip_rows))
-
     bc2576_rows  = select_all(supabase_url, srk, 'cartera_ingresos_bancolombia_2576',
                                select='referencia_1,incp,fecha')
     wompi_rows   = select_all(supabase_url, srk, 'cartera_ingresos_wompi',
@@ -354,8 +302,7 @@ def main():
     stripe_rows  = select_all(supabase_url, srk, 'cartera_ingresos_stripe_usa',
                                select='email_cliente,incp,fecha')
 
-    lookup_inscrip, ambiguos_inscrip, _                   = _build_lookup(
-        inscrip_rows, 'numero_id', 'id_inscripcion', preferir_sufijo_financiero=True)
+    lookup_inscrip, ambiguos_inscrip, _                   = _build_lookup(inscrip_rows, 'numero_id', 'id_inscripcion')
     lookup_bc2576, ambiguos_bc2576, historial_bc2576      = _build_lookup(
         bc2576_rows, 'referencia_1', 'incp', fecha_field='fecha')
     lookup_wompi, ambiguos_wompi, historial_wompi         = _build_lookup(
