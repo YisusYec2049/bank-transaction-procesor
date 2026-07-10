@@ -132,9 +132,7 @@ def _procesar_banco(drive, sheets, banco: str, cfg: dict,
             buf        = download_file(drive, fid)
             raw_rows   = mod.parse_file(buf, fname)
             if not raw_rows:
-                log.warning('[%s] Sin filas válidas: %s', banco, fname)
-                if hist and not dry_run:
-                    move_file(drive, fid, hist)
+                log.warning('[%s] Sin filas válidas, se deja en Inbox para revisión: %s', banco, fname)
                 continue
 
             normalized = mod.normalize(raw_rows)
@@ -225,9 +223,7 @@ def _procesar_bancolombia(drive, sheets, banco: str, cfg: dict,
             buf        = download_file(drive, fid)
             raw_rows   = mod.parse_pdf(buf)
             if not raw_rows:
-                log.warning('[%s] Sin filas válidas: %s', banco, fname)
-                if hist and not dry_run:
-                    move_file(drive, fid, hist)
+                log.warning('[%s] Sin filas válidas, se deja en Inbox para revisión: %s', banco, fname)
                 continue
 
             normalized = mod.normalize(raw_rows)
@@ -315,35 +311,38 @@ def _procesar_payu(drive, sheets, today_tab: str, consolidado_id: str,
                                              payu_filename=pf['name'],
                                              moneda_filename=mf['name'])
             if not raw_rows:
-                log.warning('[PAYU] Sin filas tras JOIN.')
-            else:
-                normalized = mod_payu.normalize(raw_rows)
+                log.warning('[PAYU] Sin filas tras JOIN, se dejan en Inbox para revisión: %s + %s',
+                            pf['name'], mf['name'])
+                continue
 
-                seen, filtradas = set(), []
-                for row in normalized:
-                    key = row[10]
-                    if key in yesterday_keys or key in seen:
-                        continue
-                    seen.add(key)
-                    filtradas.append(row)
+            normalized = mod_payu.normalize(raw_rows)
 
-                log.info('[PAYU] %d filas → %d tras dedup.', len(normalized), len(filtradas))
+            seen, filtradas = set(), []
+            for row in normalized:
+                key = row[10]
+                if key in yesterday_keys or key in seen:
+                    continue
+                seen.add(key)
+                filtradas.append(row)
 
-                if dry_run:
-                    for s in filtradas[:3]:
-                        log.info('[DRY RUN] matching_key=%s | amount=%s', s[10], s[9])
-                elif filtradas:
-                    append_rows(sheets, consolidado_id, today_tab, filtradas)
-                    if not skip_supa:
-                        upsert(supabase_url, srk, filtradas)
-                    else:
-                        log.info('[PAYU] SKIP_SUPABASE=true — solo Sheets.')
+            log.info('[PAYU] %d filas → %d tras dedup.', len(normalized), len(filtradas))
 
-            if not dry_run:
-                if payu_hist:
-                    move_file(drive, pf['id'], payu_hist)
-                if moneda_hist:
-                    move_file(drive, mf['id'], moneda_hist)
+            if dry_run:
+                for s in filtradas[:3]:
+                    log.info('[DRY RUN] matching_key=%s | amount=%s', s[10], s[9])
+                continue
+
+            if filtradas:
+                append_rows(sheets, consolidado_id, today_tab, filtradas)
+                if not skip_supa:
+                    upsert(supabase_url, srk, filtradas)
+                else:
+                    log.info('[PAYU] SKIP_SUPABASE=true — solo Sheets.')
+
+            if payu_hist:
+                move_file(drive, pf['id'], payu_hist)
+            if moneda_hist:
+                move_file(drive, mf['id'], moneda_hist)
 
         except Exception:
             log.exception('[PAYU] Error procesando par %s / %s', pf['name'], mf['name'])
