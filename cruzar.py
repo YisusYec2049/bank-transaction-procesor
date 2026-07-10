@@ -378,7 +378,8 @@ def main():
     transacciones = select_all(
         supabase_url, srk, 'consolidated_transactions',
         select='identification,payment_date,transaction_code_1,transaction_code_2,'
-               'email,payment_method,program,phone,payment_amount,matching_key',
+               'email,payment_method,program,phone,payment_amount,matching_key,'
+               'registration_date',
     )
     transacciones = [t for t in transacciones if t.get('matching_key') not in llaves_terminadas]
     log.info('%d transacciones a cruzar.', len(transacciones))
@@ -432,6 +433,7 @@ def main():
         resultado.append({
             'matching_key':       t.get('matching_key'),
             'identification':     t.get('identification'),
+            'registration_date':  t.get('registration_date'),
             'payment_date':       t.get('payment_date'),
             'transaction_code_1': t.get('transaction_code_1'),
             'transaction_code_2': t.get('transaction_code_2'),
