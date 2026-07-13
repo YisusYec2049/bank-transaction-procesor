@@ -129,6 +129,22 @@ def upsert_cruce(supabase_url: str, service_role_key: str, rows: list[dict]) -> 
     log.info('Upsert cruce_cartera OK: %d registros, HTTP %s.', len(rows), resp.status_code)
 
 
+def upsert_cartera_preventiva(supabase_url: str, service_role_key: str, rows: list[dict]) -> None:
+    """Upsert parcial por id: cada dict solo trae `id` + las columnas de
+    resultado del cruce (fecha_pago, medio_pago, valor_pago, códigos,
+    correo_elec, diferencia) — el resto de la fila (llave, cliente, etc.,
+    puestas ahí por el sync del Excel) no se toca."""
+    hdrs = _headers(service_role_key, prefer='return=minimal,resolution=merge-duplicates')
+    resp = http.post(
+        f'{supabase_url}/rest/v1/cartera_preventiva?on_conflict=id',
+        json=rows,
+        headers=hdrs,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    log.info('Upsert cartera_preventiva OK: %d registros, HTTP %s.', len(rows), resp.status_code)
+
+
 def upsert_cheque(supabase_url: str, service_role_key: str, banco: str, row: list) -> None:
     """
     Inserta un cheque en cheques_pendientes si no existe ya uno PENDIENTE igual.

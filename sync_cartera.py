@@ -9,8 +9,11 @@ tocar el .env) y reemplaza por completo el contenido de las tablas mirror:
   - cartera_ingresos_bancolombia_2576  ← Ingresos PSE y PAYU.xlsx > BANCOLOMBIA 2576
   - cartera_ingresos_wompi             ← Ingresos PSE y PAYU.xlsx > WOMPI
   - cartera_ingresos_stripe_usa        ← Ingresos PSE y PAYU.xlsx > STRIPE_USA
+  - cartera_preventiva                 ← CARTERA PREVENTIVA*.xlsx (nombre variable,
+                                          buscado por patrón — ver find_latest_file)
 
-Se corre manualmente cada vez que el equipo actualiza los Excel (o antes de cruzar.py).
+Se corre manualmente cada vez que el equipo actualiza los Excel (o antes de cruzar.py /
+cruzar_cartera_preventiva.py).
 """
 
 import io
@@ -20,9 +23,10 @@ import sys
 
 from dotenv import load_dotenv
 
-from utils.drive import build_drive_service, find_file_id, download_pdf as download_file
+from utils.drive import build_drive_service, find_file_id, find_latest_file, download_pdf as download_file
 from utils.excel_cartera import (
     read_inscrip, read_bancolombia_2576, read_wompi, read_stripe_usa,
+    read_cartera_preventiva,
 )
 from utils.supabase import replace_table
 
@@ -34,8 +38,9 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-PAYU_UC_FILENAME  = 'Payu UC.xlsx'
-INGRESOS_FILENAME = 'Ingresos PSE y PAYU.xlsx'
+PAYU_UC_FILENAME     = 'Payu UC.xlsx'
+INGRESOS_FILENAME    = 'Ingresos PSE y PAYU.xlsx'
+CARTERA_PREV_PATTERN = 'CARTERA PREVENTIVA'
 
 
 def main():
@@ -85,6 +90,18 @@ def main():
     replace_table(supabase_url, srk, 'cartera_ingresos_bancolombia_2576', bc2576_rows)
     replace_table(supabase_url, srk, 'cartera_ingresos_wompi', wompi_rows)
     replace_table(supabase_url, srk, 'cartera_ingresos_stripe_usa', stripe_rows)
+
+    # CARTERA PREVENTIVA cambia de nombre en cada entrega (trae fecha/versión) y
+    # solo se actualiza ~cada 20 días — si no está en la carpeta todavía, no se
+    # bloquea el resto del sync, solo se salta con una advertencia.
+    cartera_prev_id = find_latest_file(drive, folder_id, CARTERA_PREV_PATTERN)
+    if cartera_prev_id:
+        log.info('Descargando CARTERA PREVENTIVA (%s) ...', CARTERA_PREV_PATTERN)
+        cartera_prev_rows = read_cartera_preventiva(download_file(drive, cartera_prev_id))
+        replace_table(supabase_url, srk, 'cartera_preventiva', cartera_prev_rows)
+    else:
+        log.warning('No se encontró ningún archivo "%s*" en la carpeta de Drive (%s), se omite.',
+                    CARTERA_PREV_PATTERN, folder_id)
 
     log.info('sync_cartera.py completado.')
 

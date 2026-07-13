@@ -90,12 +90,12 @@ marcado en financial-platform queda protegido.
 
 import logging
 import os
-import re
 import sys
 from datetime import date, datetime as dt
 
 from dotenv import load_dotenv
 
+from utils.parser import normalizar_nit as _normalizar_nit
 from utils.supabase import select_all, upsert_cruce
 
 logging.basicConfig(
@@ -148,20 +148,6 @@ def _es_valor_relleno(valor: str) -> bool:
     if v == '.':
         return True
     return _normalizar_sufijo(v) == ''
-
-
-_RE_DV_NIT = re.compile(r'-\d$')
-
-
-def _normalizar_nit(valor: str) -> str:
-    """Quita el dígito de verificación de un NIT (ej. "860004922-4" ->
-    "860004922"), si lo tiene. Los NIT de empresas (Persona Jurídica) en la
-    hoja Inscrip a veces vienen con DV y las transacciones que llegan de los
-    bancos/pasarelas nunca lo traen — sin esto, ningún pago hecho por una
-    empresa cruza por INCP. No toca formatos con guion que no sean
-    exactamente "-<un dígito>" al final (ej. prefijos de documento de
-    extranjería como "ID-", "CI-", "DNI-"), esos quedan igual."""
-    return _RE_DV_NIT.sub('', valor)
 
 
 def _parse_fecha(valor) -> date | None:

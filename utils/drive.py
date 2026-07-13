@@ -26,6 +26,17 @@ def find_file_id(drive, folder_id: str, name: str) -> str | None:
     return None
 
 
+def find_latest_file(drive, folder_id: str, contains: str) -> str | None:
+    """Busca en la carpeta el archivo más reciente (por createdTime) cuyo
+    nombre contiene `contains` (case-insensitive) — para archivos cuyo nombre
+    varía en cada entrega (ej. trae fecha/versión, como "1. CARTERA
+    PREVENTIVA DIPLOMADO ESPECIALIZACIONES_JULIO 1.xlsx"), a diferencia de
+    find_file_id que requiere nombre exacto."""
+    wanted = contains.strip().lower()
+    matches = [f for f in list_files(drive, folder_id) if wanted in f['name'].strip().lower()]
+    return matches[-1]['id'] if matches else None
+
+
 def list_files(drive, folder_id: str) -> list[dict]:
     """Lista todos los archivos (no carpetas, no nativos de Google) en la carpeta."""
     result = drive.files().list(

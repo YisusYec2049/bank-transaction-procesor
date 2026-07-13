@@ -7,7 +7,7 @@ from typing import BinaryIO
 
 import openpyxl
 
-from utils.parser import valor_str
+from utils.parser import parse_valor, valor_str
 
 log = logging.getLogger(__name__)
 
@@ -20,6 +20,26 @@ def _cell_str(v) -> str:
     if isinstance(v, int):
         return str(v)
     return str(v).strip()
+
+
+def _cell_float(v) -> float | None:
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    return parse_valor(str(v))
+
+
+def _cell_int(v) -> int | None:
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return int(v)
+    s = str(v).strip()
+    try:
+        return int(s)
+    except ValueError:
+        return None
 
 
 def _cell_date(v) -> str | None:
@@ -44,7 +64,12 @@ def _cell_date(v) -> str | None:
 def _find_header_row(ws, expected: list[str], max_scan: int = 5):
     """Busca, entre las primeras `max_scan` filas, la que contiene todas las
     columnas de `expected` (comparación case-insensitive). Devuelve
-    (fila_1based, {header_normalizado: col_idx_0based})."""
+    (fila_1based, {header_normalizado: col_idx_0based}).
+
+    Si un encabezado aparece repetido en la misma fila (ej. "convocatoria" o
+    "PAGO" duplicados en CARTERA PREVENTIVA), se queda con la PRIMERA
+    aparición — las columnas duplicadas de ese archivo son residuales/vacías,
+    la real siempre es la más a la izquierda."""
     wanted = {h.strip().lower() for h in expected}
     best_row, best_map, best_hits = None, {}, -1
 
@@ -57,7 +82,7 @@ def _find_header_row(ws, expected: list[str], max_scan: int = 5):
                 continue
             key = str(cell).strip().lower()
             if key:
-                col_map[key] = col_idx
+                col_map.setdefault(key, col_idx)
         hits = len(wanted & col_map.keys())
         if hits > best_hits:
             best_row, best_map, best_hits = row_idx, col_map, hits
@@ -163,6 +188,56 @@ def read_stripe_usa(path: str | BinaryIO) -> list[dict]:
                 'fecha':         _cell_date(row[0]),
             })
         log.info('STRIPE_USA (Ingresos): %d filas leídas.', len(rows))
+        return rows
+    finally:
+        wb.close()
+
+
+def read_cartera_preventiva(path: str | BinaryIO) -> list[dict]:
+    """CARTERA PREVENTIVA *.xlsx (hoja Hoja1) → cuotas pendientes por
+    inscripción, una fila por cuota. El nombre del archivo trae fecha/versión
+    y cambia en cada entrega (se busca por patrón en Drive, ver
+    find_latest_file en utils/drive.py).
+
+    Solo se leen las columnas necesarias para el cruce contra
+    consolidated_transactions (ver cruzar_cartera_preventiva.py); las demás
+    columnas del Excel (DECISIÓN FINAL CARTERA, OBSERVACION, MORA 1, etc.)
+    quedan sin usar por ahora, igual que las otras tablas espejo de este
+    proyecto solo guardan lo que el cruce necesita.
+
+    `cruce_access` (columna CRUCEACCES) es el documento del deudor — a veces
+    trae el NIT con dígito de verificación (ej. "900497967-4"); se guarda tal
+    cual, la normalización se hace en el cruce (normalizar_nit)."""
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    try:
+        ws = wb['Hoja1']
+        header_row, cols = _find_header_row(ws, [
+            'llave', 'convocatoria', 'tipo programa', 'INSCRIP', 'Cliente',
+            'correo', 'F. Vencimiento', 'DIAS EN CARTERA', 'Valor cuota',
+            'Valor a cobrar', 'Programa', 'CRUCEACCES', 'ASESOR',
+        ])
+
+        rows = []
+        for row in ws.iter_rows(min_row=header_row + 1, values_only=True):
+            llave = _cell_str(row[cols['llave']])
+            if not llave:
+                continue
+            rows.append({
+                'llave':             llave,
+                'convocatoria':      _cell_str(row[cols['convocatoria']]),
+                'tipo_programa':     _cell_str(row[cols['tipo programa']]),
+                'inscrip':           _cell_str(row[cols['inscrip']]),
+                'cliente':           _cell_str(row[cols['cliente']]),
+                'correo':            _cell_str(row[cols['correo']]).lower(),
+                'fecha_vencimiento': _cell_date(row[cols['f. vencimiento']]),
+                'dias_en_cartera':   _cell_int(row[cols['dias en cartera']]),
+                'valor_cuota':       _cell_float(row[cols['valor cuota']]),
+                'valor_a_cobrar':    _cell_float(row[cols['valor a cobrar']]),
+                'programa':          _cell_str(row[cols['programa']]),
+                'cruce_access':      _cell_str(row[cols['cruceacces']]),
+                'asesor':            _cell_str(row[cols['asesor']]),
+            })
+        log.info('CARTERA PREVENTIVA: %d filas leídas.', len(rows))
         return rows
     finally:
         wb.close()

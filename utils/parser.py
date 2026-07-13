@@ -1,5 +1,19 @@
 """Utilidades numéricas compartidas entre todos los parsers."""
 
+import re
+
+_RE_DV_NIT = re.compile(r'-\d$')
+
+
+def normalizar_nit(valor: str) -> str:
+    """Quita el dígito de verificación de un NIT (ej. "860004922-4" ->
+    "860004922"), si lo tiene. Los NIT de empresas (Persona Jurídica) en las
+    hojas de referencia de cartera a veces vienen con DV y las transacciones
+    que llegan de los bancos/pasarelas nunca lo traen. No toca formatos con
+    guion que no sean exactamente "-<un dígito>" al final (ej. prefijos de
+    documento de extranjería como "ID-", "CI-", "DNI-")."""
+    return _RE_DV_NIT.sub('', valor)
+
 
 def parse_valor(s: str) -> float | None:
     """
