@@ -487,11 +487,17 @@ def main():
             if sugerido:
                 correo_2 = sugerido
 
-        # NOMBRE / MÉTODO DE PAGO / CI — solo WOMPI automático con `program` vacío.
+        # NOMBRE / MÉTODO DE PAGO / CI — todas las transacciones WOMPI.
+        # (No se filtra por `program`: ese campo siempre trae el nombre del
+        # pagador para Wompi desde el 26 de junio, nunca está vacío, así que
+        # no sirve para distinguir "automático" de "manual" como asumía el
+        # diseño original del 13 de julio. El propio cruce contra el reporte
+        # ya hace esa distinción: si el documento aparece reportado, era
+        # automático; si no, puede ser manual o simplemente no reportado
+        # todavía — en ambos casos queda pendiente para revisión.)
         nombre, metodo_de_pago, ci = None, None, None
         wompi_sin_identificar = False
-        programa = str(t.get('program') or '').strip()
-        if wompi_reporte_disponible and payment_method.startswith('WOMPI') and not programa:
+        if wompi_reporte_disponible and payment_method.startswith('WOMPI'):
             doc = _normalizar_documento_wompi(identification) if identification else ''
             match = lookup_wompi_reporte.get(doc) if doc else None
             if match:
