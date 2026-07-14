@@ -87,6 +87,7 @@ def _asignar_pagos(cuotas: list[dict], pagos: list[dict]) -> list[dict]:
     acumulado:  dict = {}  # id de cuota -> monto aplicado
     ultimo_pago: dict = {}  # id de cuota -> último pago que la tocó
     idx = 0
+    excedente = 0.0  # plata que sobra tras cubrir TODAS las cuotas conocidas del documento
     for pago in pagos_ordenados:
         restante = float(pago.get('payment_amount') or 0)
         if restante <= 0:
@@ -106,8 +107,11 @@ def _asignar_pagos(cuotas: list[dict], pagos: list[dict]) -> list[dict]:
             restante -= aplicar
             if acumulado[cuota_id] >= valor_cuota:
                 idx += 1
-        # si restante > 0 tras recorrer todas las cuotas pendientes conocidas,
-        # el excedente no se asigna a nada (no hay más deuda registrada).
+        if restante > 0:
+            # no quedan cuotas conocidas para este documento — en vez de
+            # perder este monto en silencio, se acumula y se deja señalado
+            # en correo_elec de la última cuota cubierta (ver más abajo).
+            excedente += restante
 
     resultado = []
     cuotas_por_id = {c['id']: c for c in cuotas_ordenadas}
@@ -124,6 +128,16 @@ def _asignar_pagos(cuotas: list[dict], pagos: list[dict]) -> list[dict]:
             'correo_elec':          pago.get('email'),
             'diferencia':           round(monto - valor_cuota, 2),
         })
+
+    if excedente > 0 and resultado:
+        # La última cuota en `resultado` es, por construcción del bucle FIFO
+        # de arriba, la última que se alcanzó a cubrir antes de quedarse sin
+        # cuotas — el lugar natural para señalar el sobrante de ese documento.
+        monto_fmt = f'{excedente:,.0f}'.replace(',', '.')
+        ultima = resultado[-1]
+        correo_original = ultima['correo_elec'] or ''
+        ultima['correo_elec'] = f'{correo_original} | SOBRANTE ${monto_fmt} sin cuota registrada'.strip(' |')
+
     return resultado
 
 

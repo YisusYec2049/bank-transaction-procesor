@@ -45,6 +45,13 @@ solas aquí):
                       asociado a la inscripción de otro familiar). Antes esto
                       se guardaba en silencio como 'cruzado', usando ambos
                       valores tal cual sin ninguna señal de la discrepancia.
+  - cruce_unico:      CORREO(2) encontró resultado (sin ambigüedad) pero INCP
+                      no encontró nada (regla del 14 de julio). INCP (número
+                      de documento vs cartera_inscrip) es una señal fuerte y
+                      solo con eso ya cierra 'cruzado' sin problema; CORREO(2)
+                      (VLOOKUP por email) es más débil — un correo por sí solo,
+                      sin que el documento lo confirme, no cierra la fila,
+                      queda pendiente para revisión manual.
 
 Regla "cesantías" (BANCOLOMBIA): NITS_CESANTIAS son referencia_1 de terceros
 que reciben pagos por cuenta de muchos estudiantes distintos (ej. NIT de
@@ -87,27 +94,32 @@ Filas ya resueltas (estado_cruce = 'cruzado' o 'no_identificable') no se vuelven
 a tocar en corridas futuras, así una corrección manual o un "no identificable"
 marcado en financial-platform queda protegido.
 
-NOMBRE / MÉTODO DE PAGO / CI — WOMPI automático (13-14 de julio):
-Solo para transacciones payment_method WOMPI* con `program` vacío. Se lee
-ReportePagosWompi_*.xlsx directo de Drive en cada corrida (subcarpeta "wompi"
-dentro de Archivos Cruce, WOMPI_REPORTE_DRIVE_FOLDER_ID) — NO se sincroniza a
-ninguna tabla mirror, se arma el lookup en memoria y se descarta al terminar
-la corrida (decisión explícita del usuario: es un reporte de pagos del día
-para cruzar en el momento, no un dato de referencia que haga falta guardar).
+NOMBRE / MÉTODO DE PAGO / CI — WOMPI, todas las transacciones (13-14 de
+julio, corregido el 14): se lee ReportePagosWompi_*.xlsx directo de Drive en
+cada corrida (subcarpeta "wompi" dentro de Archivos Cruce,
+WOMPI_REPORTE_DRIVE_FOLDER_ID) — NO se sincroniza a ninguna tabla mirror, se
+arma el lookup en memoria y se descarta al terminar la corrida (decisión
+explícita del usuario: es un reporte de pagos del día para cruzar en el
+momento, no un dato de referencia que haga falta guardar).
 
 Llave: `Documento` del reporte (prefijo "CC-"/"CEDULA_DE_EXTRANJERIA-" quitado)
 vs `identification`. Si hay match: NOMBRE ← Pagador, MÉTODO DE PAGO ← Método
-Pago (literal), CI ← Comprobante. Si no hay match (pago manual, sin reportar
-en el automático): MÉTODO DE PAGO = "PAGOS MANUALES" (literal), NOMBRE/CI
-quedan vacíos y la fila NO puede cerrar como 'cruzado' aunque INCP/CORREO(2)
-hayan resuelto limpio — queda 'pendiente' con excepcion_motivo
-'sin_identificar_pagador' (nombre provisional, sin confirmar con el usuario).
+Pago (literal), CI ← Comprobante. Si no hay match: MÉTODO DE PAGO = "PAGOS
+MANUALES" (literal), NOMBRE/CI quedan vacíos.
+
+**Puramente informativo — NO afecta estado_cruce/excepcion_motivo** (corregido
+14 de julio: el diseño original del 13 de julio decía que esto debía tener
+prioridad sobre INCP/CORREO(2) y bloquear el cierre; el usuario aclaró que no,
+que una fila solo sale de excepciones por INCP/CORREO(2), "PAGOS MANUALES" es
+solo un dato descriptivo). El excepcion_motivo 'sin_identificar_pagador' que
+se había agregado a la migración del CHECK constraint queda sin uso.
+
 Si el reporte no se pudo cargar en absoluto esta corrida (archivo no
 encontrado en Drive, o WOMPI_REPORTE_DRIVE_FOLDER_ID sin configurar), se
-omite esta regla por completo en vez de marcar todas las transacciones WOMPI
-como sin identificar — evita falsos positivos masivos si el archivo del día
-todavía no se ha subido. WOMPI con `program` lleno y el resto de bancos/
-pasarelas quedan fuera de alcance (diseño sin cerrar todavía).
+omite esta regla por completo — NOMBRE/MÉTODO DE PAGO/CI quedan NULL para
+todas las transacciones WOMPI de esa corrida, sin afectar estado_cruce de
+ninguna forma (ya era informativo de por sí). El resto de bancos/pasarelas
+quedan fuera de alcance (diseño sin cerrar todavía).
 """
 
 import logging
@@ -487,6 +499,19 @@ def main():
             if sugerido:
                 correo_2 = sugerido
 
+        # Unificar presentación de sufijo cuando INCP y CORREO(2) son el mismo
+        # número base pero cada uno vino de una hoja distinta con su propio
+        # formato (ej. INCP="2570PN" desde Payu UC.xlsx, CORREO(2)="2570"
+        # desde Ingresos PSE y PAYU.xlsx — misma inscripción, dos hojas). Ya
+        # NO se marcan como cruce_discrepante entre sí (misma base), pero sin
+        # esto se guardaban/mostraban distinto pese a ser el mismo número.
+        if (incp and correo_2 and correo_2 != CESANTIAS_LABEL
+                and incp != correo_2 and _normalizar_sufijo(incp) == _normalizar_sufijo(correo_2)):
+            if _tiene_sufijo_financiero(incp) and not _tiene_sufijo_financiero(correo_2):
+                correo_2 = incp
+            elif _tiene_sufijo_financiero(correo_2) and not _tiene_sufijo_financiero(incp):
+                incp = correo_2
+
         # NOMBRE / MÉTODO DE PAGO / CI — todas las transacciones WOMPI.
         # (No se filtra por `program`: ese campo siempre trae el nombre del
         # pagador para Wompi desde el 26 de junio, nunca está vacío, así que
@@ -495,8 +520,11 @@ def main():
         # ya hace esa distinción: si el documento aparece reportado, era
         # automático; si no, puede ser manual o simplemente no reportado
         # todavía — en ambos casos queda pendiente para revisión.)
+        # Puramente informativo (corregido 14 de julio): NOMBRE/MÉTODO DE
+        # PAGO/CI nunca bloquean el cruce. Una fila sale de excepciones
+        # únicamente por INCP/CORREO(2) — "PAGOS MANUALES" es solo un dato
+        # descriptivo, no una excepción.
         nombre, metodo_de_pago, ci = None, None, None
-        wompi_sin_identificar = False
         if wompi_reporte_disponible and payment_method.startswith('WOMPI'):
             doc = _normalizar_documento_wompi(identification) if identification else ''
             match = lookup_wompi_reporte.get(doc) if doc else None
@@ -506,7 +534,6 @@ def main():
                 ci             = match.get('comprobante') or None
             else:
                 metodo_de_pago = PAGOS_MANUALES_LABEL
-                wompi_sin_identificar = True
 
         if incp_ambiguo or correo_2_ambiguo:
             excepcion_motivo, estado_cruce = 'cruce_ambiguo', 'pendiente'
@@ -515,11 +542,11 @@ def main():
             excepcion_motivo, estado_cruce = 'cruce_discrepante', 'pendiente'
         elif not incp and not correo_2:
             excepcion_motivo, estado_cruce = 'sin_cruce', 'pendiente'
-        elif wompi_sin_identificar:
-            # Tiene prioridad sobre INCP/CORREO(2): aunque esos dos hayan
-            # resuelto limpio, la fila no puede cerrar como 'cruzado' si no
-            # se pudo identificar NOMBRE/CI del pagador (diseño 13 julio).
-            excepcion_motivo, estado_cruce = 'sin_identificar_pagador', 'pendiente'
+        elif not incp and correo_2:
+            # Solo CORREO(2) identificó, sin confirmación de INCP — señal más
+            # débil (regla del 14 de julio: INCP solo SÍ cierra 'cruzado' sin
+            # problema, CORREO(2) solo NO, queda para revisión manual).
+            excepcion_motivo, estado_cruce = 'cruce_unico', 'pendiente'
         else:
             excepcion_motivo, estado_cruce = None, 'cruzado'
 
