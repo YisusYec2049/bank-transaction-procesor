@@ -193,6 +193,56 @@ def read_stripe_usa(path: str | BinaryIO) -> list[dict]:
         wb.close()
 
 
+def read_pagos_wompi_reporte(path: str | BinaryIO) -> list[dict]:
+    """ReportePagosWompi_*.xlsx (hoja "Pagos Wompi") → pagos automáticos WOMPI
+    ("Genera Link") reportados por el Sistema Financiero (Azure). El nombre
+    del archivo trae un rango de fechas variable y cambia en cada entrega (se
+    busca por patrón en Drive, ver find_latest_file en utils/drive.py).
+
+    Mismo patrón que las demás tablas mirror de "Ingresos PSE y PAYU.xlsx"
+    (BANCOLOMBIA 2576 / WOMPI / STRIPE_USA): se reemplaza por completo en
+    cada sync (replace_table), no upsert incremental — el archivo de origen
+    ya trae acumulado todo lo de entregas anteriores más lo nuevo (confirmado
+    con 2 archivos reales del mismo período), así que reemplazar con lo
+    último que trae conserva el historial completo igual.
+
+    Algunas entregas traen una segunda hoja ("Hoja1") con un extracto parcial
+    de columnas — se ignora a propósito, la fuente real siempre es "Pagos
+    Wompi". La fila de encabezado tampoco está siempre en la misma posición
+    (algunas entregas traen 2-3 filas de título/período antes), por eso se
+    usa _find_header_row con un rango de escaneo más amplio.
+
+    Solo se leen las columnas que ya tiene cerrado el diseño de NOMBRE/CI/
+    MÉTODO DE PAGO (columnas 12-19 de cruce_cartera, 13 de julio, sin
+    implementar todavía en cruzar.py): `comprobante` es la llave única del
+    reporte, `documento` es la llave de cruce contra `identification` (trae
+    prefijo tipo "CC-"/"CEDULA_DE_EXTRANJERIA-", sin normalizar aquí)."""
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    try:
+        ws = wb['Pagos Wompi']
+        header_row, cols = _find_header_row(
+            ws, ['Comprobante', 'Documento', 'Pagador', 'Método Pago', 'Fecha Pago'],
+            max_scan=10,
+        )
+
+        rows = []
+        for row in ws.iter_rows(min_row=header_row + 1, values_only=True):
+            comprobante = _cell_str(row[cols['comprobante']])
+            if not comprobante:
+                continue
+            rows.append({
+                'comprobante': comprobante,
+                'documento':   _cell_str(row[cols['documento']]),
+                'pagador':     _cell_str(row[cols['pagador']]),
+                'metodo_pago': _cell_str(row[cols['método pago']]),
+                'fecha_pago':  _cell_date(row[cols['fecha pago']]),
+            })
+        log.info('ReportePagosWompi (Pagos Wompi): %d filas leídas.', len(rows))
+        return rows
+    finally:
+        wb.close()
+
+
 def read_cartera_preventiva(path: str | BinaryIO) -> list[dict]:
     """CARTERA PREVENTIVA *.xlsx (hoja Hoja1) → cuotas pendientes por
     inscripción, una fila por cuota. El nombre del archivo trae fecha/versión

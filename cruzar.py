@@ -86,6 +86,28 @@ la revisión manual en financial-platform sigue siendo quien decide.
 Filas ya resueltas (estado_cruce = 'cruzado' o 'no_identificable') no se vuelven
 a tocar en corridas futuras, así una corrección manual o un "no identificable"
 marcado en financial-platform queda protegido.
+
+NOMBRE / MÉTODO DE PAGO / CI — WOMPI automático (13-14 de julio):
+Solo para transacciones payment_method WOMPI* con `program` vacío. Se lee
+ReportePagosWompi_*.xlsx directo de Drive en cada corrida (subcarpeta "wompi"
+dentro de Archivos Cruce, WOMPI_REPORTE_DRIVE_FOLDER_ID) — NO se sincroniza a
+ninguna tabla mirror, se arma el lookup en memoria y se descarta al terminar
+la corrida (decisión explícita del usuario: es un reporte de pagos del día
+para cruzar en el momento, no un dato de referencia que haga falta guardar).
+
+Llave: `Documento` del reporte (prefijo "CC-"/"CEDULA_DE_EXTRANJERIA-" quitado)
+vs `identification`. Si hay match: NOMBRE ← Pagador, MÉTODO DE PAGO ← Método
+Pago (literal), CI ← Comprobante. Si no hay match (pago manual, sin reportar
+en el automático): MÉTODO DE PAGO = "PAGOS MANUALES" (literal), NOMBRE/CI
+quedan vacíos y la fila NO puede cerrar como 'cruzado' aunque INCP/CORREO(2)
+hayan resuelto limpio — queda 'pendiente' con excepcion_motivo
+'sin_identificar_pagador' (nombre provisional, sin confirmar con el usuario).
+Si el reporte no se pudo cargar en absoluto esta corrida (archivo no
+encontrado en Drive, o WOMPI_REPORTE_DRIVE_FOLDER_ID sin configurar), se
+omite esta regla por completo en vez de marcar todas las transacciones WOMPI
+como sin identificar — evita falsos positivos masivos si el archivo del día
+todavía no se ha subido. WOMPI con `program` lleno y el resto de bancos/
+pasarelas quedan fuera de alcance (diseño sin cerrar todavía).
 """
 
 import logging
@@ -95,6 +117,8 @@ from datetime import date, datetime as dt
 
 from dotenv import load_dotenv
 
+from utils.drive import build_drive_service, find_latest_file, download_pdf as download_file
+from utils.excel_cartera import read_pagos_wompi_reporte
 from utils.parser import normalizar_nit as _normalizar_nit
 from utils.supabase import select_all, upsert_cruce
 
@@ -209,6 +233,58 @@ def _tiene_sufijo_financiero(valor: str) -> bool:
     cuenta un "P" truncado como sufijo real aquí — para esta distinción
     (financiero vs. Access) solo interesa un sufijo confirmado."""
     return valor.strip().upper().endswith(('PN', 'PJ'))
+
+
+WOMPI_REPORTE_PATTERN = 'ReportePagosWompi'
+PAGOS_MANUALES_LABEL  = 'PAGOS MANUALES'
+_PREFIJOS_DOCUMENTO_WOMPI = ('CC-', 'CEDULA_DE_EXTRANJERIA-')
+
+
+def _normalizar_documento_wompi(valor: str) -> str:
+    """Quita el prefijo de tipo de documento que trae la columna `Documento`
+    de ReportePagosWompi (ej. "CC-1143335891" -> "1143335891"), para poder
+    comparar contra `identification` (que nunca trae este prefijo). También
+    limpia espacios sueltos alrededor del número (vistos en datos reales,
+    ej. "CC- 35412765 ")."""
+    v = valor.strip().upper()
+    for pref in _PREFIJOS_DOCUMENTO_WOMPI:
+        if v.startswith(pref):
+            return v[len(pref):].strip()
+    return v
+
+
+def _cargar_lookup_wompi_reporte(sa_json: str, folder_id: str) -> tuple[dict[str, dict], bool]:
+    """Lee el ReportePagosWompi_*.xlsx más reciente directo de Drive y arma
+    {documento_normalizado: {pagador, metodo_pago, comprobante}} en memoria —
+    no se guarda en ninguna tabla, se descarta al terminar la corrida.
+    Primera coincidencia gana (mismo criterio BUSCARV que el resto del script).
+
+    Devuelve (lookup, disponible). `disponible=False` significa que esta
+    corrida no pudo cargar el reporte en absoluto (config faltante o archivo
+    no encontrado) — el llamador debe omitir la regla por completo en ese
+    caso, no tratarlo como "ningún documento identificado" (que marcaría de
+    golpe todas las transacciones WOMPI del día como sin identificar)."""
+    if not sa_json or not folder_id:
+        log.warning('GOOGLE_SA_JSON / WOMPI_REPORTE_DRIVE_FOLDER_ID no configurados, '
+                    'se omite el cruce NOMBRE/CI/MÉTODO DE PAGO de WOMPI.')
+        return {}, False
+
+    drive = build_drive_service(sa_json)
+    file_id = find_latest_file(drive, folder_id, WOMPI_REPORTE_PATTERN)
+    if not file_id:
+        log.warning('No se encontró ningún archivo "%s*" en la carpeta de Drive (%s), '
+                    'se omite el cruce NOMBRE/CI/MÉTODO DE PAGO de WOMPI esta corrida.',
+                    WOMPI_REPORTE_PATTERN, folder_id)
+        return {}, False
+
+    filas = read_pagos_wompi_reporte(download_file(drive, file_id))
+    lookup = {}
+    for fila in filas:
+        doc = _normalizar_documento_wompi(fila.get('documento') or '')
+        if doc and doc not in lookup:
+            lookup[doc] = fila
+    log.info('ReportePagosWompi: %d documentos indexados (de %d filas).', len(lookup), len(filas))
+    return lookup, True
 
 
 def _build_lookup(rows: list[dict], key_field: str, value_field: str,
@@ -352,6 +428,11 @@ def main():
     log.info('Referencias cargadas: inscrip=%d, bc2576=%d, wompi=%d, stripe=%d',
               len(lookup_inscrip), len(lookup_bc2576), len(lookup_wompi), len(lookup_stripe))
 
+    sa_json = os.environ.get('GOOGLE_SA_JSON', '')
+    wompi_reporte_folder_id = os.environ.get('WOMPI_REPORTE_DRIVE_FOLDER_ID', '')
+    lookup_wompi_reporte, wompi_reporte_disponible = _cargar_lookup_wompi_reporte(
+        sa_json, wompi_reporte_folder_id)
+
     log.info('Cargando estado_cruce existente...')
     existentes = select_all(supabase_url, srk, 'cruce_cartera', select='matching_key,estado_cruce')
     llaves_terminadas = {
@@ -406,6 +487,21 @@ def main():
             if sugerido:
                 correo_2 = sugerido
 
+        # NOMBRE / MÉTODO DE PAGO / CI — solo WOMPI automático con `program` vacío.
+        nombre, metodo_de_pago, ci = None, None, None
+        wompi_sin_identificar = False
+        programa = str(t.get('program') or '').strip()
+        if wompi_reporte_disponible and payment_method.startswith('WOMPI') and not programa:
+            doc = _normalizar_documento_wompi(identification) if identification else ''
+            match = lookup_wompi_reporte.get(doc) if doc else None
+            if match:
+                nombre         = match.get('pagador') or None
+                metodo_de_pago = match.get('metodo_pago') or None
+                ci             = match.get('comprobante') or None
+            else:
+                metodo_de_pago = PAGOS_MANUALES_LABEL
+                wompi_sin_identificar = True
+
         if incp_ambiguo or correo_2_ambiguo:
             excepcion_motivo, estado_cruce = 'cruce_ambiguo', 'pendiente'
         elif (incp and correo_2 and correo_2 != CESANTIAS_LABEL
@@ -413,6 +509,11 @@ def main():
             excepcion_motivo, estado_cruce = 'cruce_discrepante', 'pendiente'
         elif not incp and not correo_2:
             excepcion_motivo, estado_cruce = 'sin_cruce', 'pendiente'
+        elif wompi_sin_identificar:
+            # Tiene prioridad sobre INCP/CORREO(2): aunque esos dos hayan
+            # resuelto limpio, la fila no puede cerrar como 'cruzado' si no
+            # se pudo identificar NOMBRE/CI del pagador (diseño 13 julio).
+            excepcion_motivo, estado_cruce = 'sin_identificar_pagador', 'pendiente'
         else:
             excepcion_motivo, estado_cruce = None, 'cruzado'
 
@@ -430,6 +531,9 @@ def main():
             'payment_amount':     t.get('payment_amount'),
             'incp':               incp or None,
             'correo_2':           correo_2 or None,
+            'nombre':             nombre,
+            'metodo_de_pago':     metodo_de_pago,
+            'ci':                 ci,
             'excepcion_motivo':   excepcion_motivo,
             'estado_cruce':       estado_cruce,
         })
