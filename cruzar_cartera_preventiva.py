@@ -1,17 +1,33 @@
 #!/opt/matching-test/venv/bin/python3
 """
 cruzar_cartera_preventiva.py — cruza cartera_preventiva (cuotas pendientes)
-contra consolidated_transactions (pagos).
+contra los pagos ya resueltos de cruce_cartera.
 
-Reporte independiente de cruce_cartera / cruzar.py — no lo alimenta ni lo
-lee. Recalcula TODO desde cero en cada corrida (no incremental): no protege
+Es el ÚLTIMO paso de la cadena (confirmado por el usuario el 14 de julio):
+1. consolidated_transactions (pagos crudos de los bancos)
+2. cruce_cartera: INCP + CORREO(2)                         ← cruzar.py
+3. cruce_cartera: NOMBRE + MÉTODO DE PAGO + CI (WOMPI)      ← cruzar.py
+4. cartera_preventiva, usando SOLO los pagos que en el paso ← este script
+   anterior quedaron con estado_cruce='cruzado' (superaron
+   todas las validaciones de identidad de arriba)
+
+Antes (hasta el 13 de julio) leía directo de consolidated_transactions, sin
+pasar por ninguna validación de identidad — un pago con identification
+coincidente por casualidad (ej. un NIT de intermediario, o una extracción
+incorrecta) podía generar un cruce falso en cartera_preventiva. Ahora solo se
+consideran pagos que cruzar.py ya confirmó como identificados correctamente.
+Depende de que cruzar.py haya corrido antes en el mismo ciclo — el cron del
+VPS ya lo garantiza (cruzar_cartera_preventiva.py corre 1 minuto después de
+sync_cartera.py && cruzar.py, ver cron del 14 de julio).
+
+Recalcula TODO desde cero en cada corrida (no incremental): no protege
 ediciones manuales porque todavía no hay ninguna sobre este reporte.
 
 Lógica (confirmada por el usuario el 13 de julio):
   - Llave de búsqueda: cartera_preventiva.cruce_access (documento del deudor,
     normalizado con normalizar_nit para quitar el dígito de verificación de
     NIT, ej. "900497967-4" -> "900497967") contra
-    consolidated_transactions.identification (nunca trae el DV).
+    cruce_cartera.identification (nunca trae el DV).
   - Para cada documento, las cuotas pendientes se ordenan por
     fecha_vencimiento ascendente y los pagos por payment_date ascendente.
     Cada pago se aplica en cascada FIFO: primero a la cuota más antigua no
@@ -124,12 +140,13 @@ def main():
     cuotas_rows = select_all(supabase_url, srk, 'cartera_preventiva',
                               select='id,cruce_access,fecha_vencimiento,valor_cuota')
 
-    log.info('Cargando consolidated_transactions...')
+    log.info('Cargando cruce_cartera (solo estado_cruce=cruzado)...')
     pagos_rows = select_all(
-        supabase_url, srk, 'consolidated_transactions',
+        supabase_url, srk, 'cruce_cartera',
         select='identification,payment_date,transaction_code_1,transaction_code_2,'
-               'email,payment_method,payment_amount',
+               'email,payment_method,payment_amount,estado_cruce',
     )
+    pagos_rows = [p for p in pagos_rows if p.get('estado_cruce') == 'cruzado']
 
     cuotas_por_doc: dict[str, list[dict]] = {}
     for c in cuotas_rows:
