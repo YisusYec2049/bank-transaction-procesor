@@ -145,6 +145,27 @@ def upsert_cartera_preventiva(supabase_url: str, service_role_key: str, rows: li
     log.info('Upsert cartera_preventiva OK: %d registros, HTTP %s.', len(rows), resp.status_code)
 
 
+def update_cruce_valores(supabase_url: str, service_role_key: str, updates: list[dict]) -> None:
+    """PATCH individual por matching_key: cada dict trae matching_key + los
+    campos a actualizar (ej. {'matching_key': ..., 'cruce': 'Juan Perez'}).
+    No usa upsert/POST porque cruce_cartera tiene columnas que podrían no
+    aceptar NULL en un insert parcial — un PATCH real solo toca las columnas
+    dadas, sin reconstruir la fila."""
+    hdrs = _headers(service_role_key, prefer='return=minimal')
+    for u in updates:
+        mk = u['matching_key']
+        body = {k: v for k, v in u.items() if k != 'matching_key'}
+        resp = http.patch(
+            f'{supabase_url}/rest/v1/cruce_cartera',
+            params={'matching_key': f'eq.{mk}'},
+            json=body,
+            headers=hdrs,
+            timeout=30,
+        )
+        resp.raise_for_status()
+    log.info('Update cruce_cartera (cruce inverso) OK: %d filas.', len(updates))
+
+
 def upsert_cheque(supabase_url: str, service_role_key: str, banco: str, row: list) -> None:
     """
     Inserta un cheque en cheques_pendientes si no existe ya uno PENDIENTE igual.

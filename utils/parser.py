@@ -15,6 +15,25 @@ def normalizar_nit(valor: str) -> str:
     return _RE_DV_NIT.sub('', valor)
 
 
+SUFIJOS_IGNORABLES = ('PN', 'PJ', 'P')
+
+
+def normalizar_sufijo(valor: str) -> str:
+    """Quita el sufijo (PN, PJ, o un "P" truncado, con o sin espacio antes,
+    ej. "411 PJ" o "4844P") para comparar el número base.
+
+    Un "P" suelto es ambiguo por sí mismo (puede ser "PN" o "PJ" truncado) —
+    esta función solo calcula el número base, no decide a cuál corresponde.
+    Esa resolución depende del resto de valores de la misma llave y se hace
+    en cada lookup, no aquí."""
+    v = valor.strip()
+    upper = v.upper()
+    for suf in SUFIJOS_IGNORABLES:
+        if upper.endswith(suf):
+            return v[:-len(suf)].strip()
+    return v
+
+
 def parse_valor(s: str) -> float | None:
     """
     Detecta formato europeo (1.435.500,00) vs americano (300,000.00).

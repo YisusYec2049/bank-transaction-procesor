@@ -132,6 +132,7 @@ from dotenv import load_dotenv
 from utils.drive import build_drive_service, find_latest_file, download_pdf as download_file
 from utils.excel_cartera import read_pagos_wompi_reporte
 from utils.parser import normalizar_nit as _normalizar_nit
+from utils.parser import normalizar_sufijo as _normalizar_sufijo
 from utils.supabase import select_all, upsert_cruce
 
 logging.basicConfig(
@@ -145,25 +146,6 @@ log = logging.getLogger(__name__)
 CADENCIA_DIAS_MIN = 15
 CADENCIA_DIAS_MAX = 60
 COINCIDENCIA_DIAS = 3
-
-
-SUFIJOS_IGNORABLES = ('PN', 'PJ', 'P')
-
-
-def _normalizar_sufijo(valor: str) -> str:
-    """Quita el sufijo (PN, PJ, o un "P" truncado, con o sin espacio antes,
-    ej. "411 PJ" o "4844P") para comparar el número base.
-
-    Un "P" suelto es ambiguo por sí mismo (puede ser "PN" o "PJ" truncado) —
-    esta función solo calcula el número base, no decide a cuál corresponde.
-    Esa resolución depende del resto de valores de la misma llave y se hace
-    en _build_lookup, no aquí."""
-    v = valor.strip()
-    upper = v.upper()
-    for suf in SUFIJOS_IGNORABLES:
-        if upper.endswith(suf):
-            return v[:-len(suf)].strip()
-    return v
 
 
 # NIT de terceros/entidades que reciben pagos de cesantías por cuenta de

@@ -51,6 +51,22 @@ Pendiente, explícitamente diferido por el usuario: qué hacer cuando un pago
 cierra TODAS las cuotas pendientes de una inscripción de una sola vez (más
 allá de la cascada aritmética ya implementada) — no se agrega nada especial
 todavía.
+
+CRUCE (columna cruce_cartera.cruce, 14 de julio) — "cruce a la inversa":
+además de la cascada de arriba (que resuelve cartera_preventiva), este script
+también rellena cruce_cartera.cruce para TODAS las filas 'cruzado' (no
+distingue todavía pago manual/automático — pendiente que el usuario explique
+esa distinción, se agregará después). Busca el `incp` de cada fila (ya
+normalizado por sufijo por cruzar.py) contra `cartera_preventiva.inscrip`
+(normalizando sufijo PN/PJ también de este lado — confirmado por el usuario
+que debe contar como match aunque el sufijo no coincida). Si encuentra la
+inscripción, `cruce` = `cliente` de esa fila. Si no encuentra nada, `cruce`
+queda NULL — es un campo puramente informativo (no crea ni modifica
+`estado_cruce`/`excepcion_motivo` de cruce_cartera, esa excepción es de un
+proceso anterior). Detectar los casos "sin cruce" es responsabilidad de un
+filtro en financial-platform (cruzado + incp presente + cruce vacío), no de
+una clasificación nueva aquí — mismo criterio que el filtro de correo_2="0"
+del 8 de julio.
 """
 
 import logging
@@ -59,8 +75,8 @@ import sys
 
 from dotenv import load_dotenv
 
-from utils.parser import normalizar_nit
-from utils.supabase import select_all, upsert_cartera_preventiva
+from utils.parser import normalizar_nit, normalizar_sufijo
+from utils.supabase import select_all, update_cruce_valores, upsert_cartera_preventiva
 
 logging.basicConfig(
     level=logging.INFO,
@@ -141,6 +157,36 @@ def _asignar_pagos(cuotas: list[dict], pagos: list[dict]) -> list[dict]:
     return resultado
 
 
+def _build_lookup_inscrip(cuotas_rows: list[dict]) -> dict[str, str]:
+    """{inscrip normalizado (sin sufijo PN/PJ) -> cliente}, primera coincidencia
+    gana (mismo criterio VLOOKUP que el resto del cruce)."""
+    lookup: dict[str, str] = {}
+    for c in cuotas_rows:
+        inscrip = str(c.get('inscrip') or '').strip()
+        if not inscrip:
+            continue
+        base = normalizar_sufijo(inscrip)
+        if base and base not in lookup:
+            lookup[base] = c.get('cliente')
+    return lookup
+
+
+def _calcular_cruce_inverso(pagos_rows: list[dict], cuotas_rows: list[dict]) -> list[dict]:
+    """Cruce a la inversa: para cada pago ya 'cruzado', busca su `incp` dentro
+    de cartera_preventiva.inscrip y devuelve el `cliente` encontrado. Devuelve
+    una lista de {matching_key, cruce} lista para actualizar en cruce_cartera
+    (cruce=None cuando no hay match, para limpiar corridas anteriores)."""
+    lookup = _build_lookup_inscrip(cuotas_rows)
+    updates = []
+    for p in pagos_rows:
+        incp = str(p.get('incp') or '').strip()
+        if not incp:
+            continue
+        cruce = lookup.get(normalizar_sufijo(incp))
+        updates.append({'matching_key': p['matching_key'], 'cruce': cruce})
+    return updates
+
+
 def main():
     load_dotenv()
 
@@ -152,15 +198,23 @@ def main():
 
     log.info('Cargando cartera_preventiva...')
     cuotas_rows = select_all(supabase_url, srk, 'cartera_preventiva',
-                              select='id,cruce_access,fecha_vencimiento,valor_cuota')
+                              select='id,cruce_access,fecha_vencimiento,valor_cuota,inscrip,cliente')
 
     log.info('Cargando cruce_cartera (solo estado_cruce=cruzado)...')
     pagos_rows = select_all(
         supabase_url, srk, 'cruce_cartera',
-        select='identification,payment_date,transaction_code_1,transaction_code_2,'
-               'email,payment_method,payment_amount,estado_cruce',
+        select='matching_key,identification,payment_date,transaction_code_1,transaction_code_2,'
+               'email,payment_method,payment_amount,estado_cruce,incp',
     )
     pagos_rows = [p for p in pagos_rows if p.get('estado_cruce') == 'cruzado']
+
+    log.info('Calculando cruce a la inversa (INCP vs cartera_preventiva.inscrip)...')
+    cruce_updates = _calcular_cruce_inverso(pagos_rows, cuotas_rows)
+    if cruce_updates:
+        con_match = sum(1 for u in cruce_updates if u.get('cruce'))
+        update_cruce_valores(supabase_url, srk, cruce_updates)
+        log.info('Cruce inverso: %d filas actualizadas (%d con match, %d sin match).',
+                  len(cruce_updates), con_match, len(cruce_updates) - con_match)
 
     cuotas_por_doc: dict[str, list[dict]] = {}
     for c in cuotas_rows:
