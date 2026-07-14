@@ -249,22 +249,27 @@ def read_cartera_preventiva(path: str | BinaryIO) -> list[dict]:
     y cambia en cada entrega (se busca por patrón en Drive, ver
     find_latest_file en utils/drive.py).
 
-    Solo se leen las columnas necesarias para el cruce contra
-    consolidated_transactions (ver cruzar_cartera_preventiva.py); las demás
-    columnas del Excel (DECISIÓN FINAL CARTERA, OBSERVACION, MORA 1, etc.)
-    quedan sin usar por ahora, igual que las otras tablas espejo de este
-    proyecto solo guardan lo que el cruce necesita.
+    Set de columnas confirmado por el usuario el 14 de julio (reemplaza el
+    set original del 13 de julio, que incluía convocatoria/tipo
+    programa/asesor — se sacaron a propósito, ya no se capturan). El resto de
+    columnas del Excel real (DECISIÓN FINAL CARTERA, OBSERVACION, MORA 1,
+    ABONO, RETIRO*, REFINANCIACION, etc.) siguen sin usarse.
 
     `cruce_access` (columna CRUCEACCES) es el documento del deudor — a veces
     trae el NIT con dígito de verificación (ej. "900497967-4"); se guarda tal
-    cual, la normalización se hace en el cruce (normalizar_nit)."""
+    cual, la normalización se hace en el cruce (normalizar_nit).
+
+    `pago` (columna PAGO, aparece duplicada en el Excel real — se toma la
+    primera aparición, ver _find_header_row) es un campo de marca/estado del
+    proceso manual, se guarda tal cual sin interpretarla."""
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
     try:
         ws = wb['Hoja1']
         header_row, cols = _find_header_row(ws, [
-            'llave', 'convocatoria', 'tipo programa', 'INSCRIP', 'Cliente',
-            'correo', 'F. Vencimiento', 'DIAS EN CARTERA', 'Valor cuota',
-            'Valor a cobrar', 'Programa', 'CRUCEACCES', 'ASESOR',
+            'llave', 'SITEMA FINANCIERO', 'INSCRIP', 'Cliente', 'MONEDA',
+            'correo', 'telefono 1', 'telefono 2', 'F. Vencimiento',
+            'DIAS EN CARTERA', 'Valor cuota', 'PAGO', 'Valor a cobrar',
+            'Programa', 'CRUCEACCES',
         ])
 
         rows = []
@@ -273,19 +278,21 @@ def read_cartera_preventiva(path: str | BinaryIO) -> list[dict]:
             if not llave:
                 continue
             rows.append({
-                'llave':             llave,
-                'convocatoria':      _cell_str(row[cols['convocatoria']]),
-                'tipo_programa':     _cell_str(row[cols['tipo programa']]),
-                'inscrip':           _cell_str(row[cols['inscrip']]),
-                'cliente':           _cell_str(row[cols['cliente']]),
-                'correo':            _cell_str(row[cols['correo']]).lower(),
-                'fecha_vencimiento': _cell_date(row[cols['f. vencimiento']]),
-                'dias_en_cartera':   _cell_int(row[cols['dias en cartera']]),
-                'valor_cuota':       _cell_float(row[cols['valor cuota']]),
-                'valor_a_cobrar':    _cell_float(row[cols['valor a cobrar']]),
-                'programa':          _cell_str(row[cols['programa']]),
-                'cruce_access':      _cell_str(row[cols['cruceacces']]),
-                'asesor':            _cell_str(row[cols['asesor']]),
+                'llave':              llave,
+                'sistema_financiero': _cell_str(row[cols['sitema financiero']]),
+                'inscrip':            _cell_str(row[cols['inscrip']]),
+                'cliente':            _cell_str(row[cols['cliente']]),
+                'moneda':             _cell_str(row[cols['moneda']]),
+                'correo':             _cell_str(row[cols['correo']]).lower(),
+                'telefono_1':         _cell_str(row[cols['telefono 1']]),
+                'telefono_2':         _cell_str(row[cols['telefono 2']]),
+                'fecha_vencimiento':  _cell_date(row[cols['f. vencimiento']]),
+                'dias_en_cartera':    _cell_int(row[cols['dias en cartera']]),
+                'valor_cuota':        _cell_float(row[cols['valor cuota']]),
+                'pago':               _cell_str(row[cols['pago']]),
+                'valor_a_cobrar':     _cell_float(row[cols['valor a cobrar']]),
+                'programa':           _cell_str(row[cols['programa']]),
+                'cruce_access':       _cell_str(row[cols['cruceacces']]),
             })
         log.info('CARTERA PREVENTIVA: %d filas leídas.', len(rows))
         return rows
