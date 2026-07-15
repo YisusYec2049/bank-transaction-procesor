@@ -138,6 +138,11 @@ def sync_cartera_preventiva(supabase_url: str, service_role_key: str, rows: list
         vistas.add(llave)
         deduped.append(r)
 
+    if not deduped:
+        log.warning('cartera_preventiva: 0 filas leídas del Excel, se omite la sincronización '
+                     '(no se borra ni se toca la tabla existente).')
+        return
+
     hdrs_upsert = _headers(service_role_key, prefer='return=minimal,resolution=merge-duplicates')
     for i in range(0, len(deduped), batch_size):
         batch = deduped[i:i + batch_size]
