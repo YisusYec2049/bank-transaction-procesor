@@ -14,6 +14,12 @@ tocar el .env) y reemplaza por completo el contenido de las tablas mirror:
 
 Se corre manualmente cada vez que el equipo actualiza los Excel (o antes de cruzar.py /
 cruzar_cartera_preventiva.py).
+
+cartera_preventiva es la única de las 5 que NO se reemplaza por completo: se
+sincroniza por 'llave' (sync_cartera_preventiva, upsert + borrado selectivo)
+para no pisar las columnas de resultado del cruce (fecha_pago, diferencia,
+etc.) que llena cruzar_cartera_preventiva.py aparte — un DELETE+INSERT
+completo las dejaba en NULL durante el minuto entre un script y el otro.
 """
 
 import io
@@ -28,7 +34,7 @@ from utils.excel_cartera import (
     read_inscrip, read_bancolombia_2576, read_wompi, read_stripe_usa,
     read_cartera_preventiva,
 )
-from utils.supabase import replace_table
+from utils.supabase import replace_table, sync_cartera_preventiva
 
 logging.basicConfig(
     level=logging.INFO,
@@ -98,7 +104,7 @@ def main():
     if cartera_prev_id:
         log.info('Descargando CARTERA PREVENTIVA (%s) ...', CARTERA_PREV_PATTERN)
         cartera_prev_rows = read_cartera_preventiva(download_file(drive, cartera_prev_id))
-        replace_table(supabase_url, srk, 'cartera_preventiva', cartera_prev_rows)
+        sync_cartera_preventiva(supabase_url, srk, cartera_prev_rows)
     else:
         log.warning('No se encontró ningún archivo "%s*" en la carpeta de Drive (%s), se omite.',
                     CARTERA_PREV_PATTERN, folder_id)

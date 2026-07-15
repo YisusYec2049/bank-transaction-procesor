@@ -113,6 +113,63 @@ def replace_table(supabase_url: str, service_role_key: str, table: str,
     log.info('Tabla "%s" reemplazada: %d filas.', table, len(rows))
 
 
+def sync_cartera_preventiva(supabase_url: str, service_role_key: str, rows: list[dict],
+                             batch_size: int = 500) -> None:
+    """Sincroniza cartera_preventiva por 'llave', sin borrar la tabla completa.
+
+    A diferencia de replace_table (DELETE + INSERT), esto hace upsert por
+    'llave' — solo toca las columnas que vienen del Excel. No pisa
+    fecha_pago/medio_pago/valor_pago/codigo_transaccion_1/2/correo_elec/
+    diferencia, que llena aparte cruzar_cartera_preventiva.py: antes, cada
+    replace_table las dejaba en NULL hasta que ese script volvía a correr
+    (~1 min después), dejando la vista de "resueltas" vacía en cada ciclo de
+    sync_cartera.py. Requiere índice único en cartera_preventiva.llave
+    (sql/007_cartera_preventiva_llave_unique.sql).
+
+    Las llaves que ya no aparecen en el Excel nuevo (cuota que salió de
+    cartera pendiente) se borran aparte, al final.
+    """
+    vistas: set[str] = set()
+    deduped = []
+    for r in rows:
+        llave = r.get('llave')
+        if not llave or llave in vistas:
+            continue
+        vistas.add(llave)
+        deduped.append(r)
+
+    hdrs_upsert = _headers(service_role_key, prefer='return=minimal,resolution=merge-duplicates')
+    for i in range(0, len(deduped), batch_size):
+        batch = deduped[i:i + batch_size]
+        resp = http.post(
+            f'{supabase_url}/rest/v1/cartera_preventiva?on_conflict=llave',
+            json=batch,
+            headers=hdrs_upsert,
+            timeout=30,
+        )
+        resp.raise_for_status()
+
+    existentes = select_all(supabase_url, service_role_key, 'cartera_preventiva', select='llave')
+    llaves_actuales = {r['llave'] for r in existentes if r.get('llave')}
+    llaves_a_borrar = list(llaves_actuales - vistas)
+
+    if llaves_a_borrar:
+        hdrs_delete = _headers(service_role_key, prefer='return=minimal')
+        for i in range(0, len(llaves_a_borrar), batch_size):
+            batch = llaves_a_borrar[i:i + batch_size]
+            valores = ','.join(f'"{v}"' for v in batch)
+            resp = http.delete(
+                f'{supabase_url}/rest/v1/cartera_preventiva',
+                params={'llave': f'in.({valores})'},
+                headers=hdrs_delete,
+                timeout=30,
+            )
+            resp.raise_for_status()
+
+    log.info('cartera_preventiva sincronizada: %d filas actualizadas/insertadas, %d borradas (ya no están en el Excel).',
+              len(deduped), len(llaves_a_borrar))
+
+
 def upsert_cruce(supabase_url: str, service_role_key: str, rows: list[dict]) -> None:
     """Upsert de filas ya armadas (dicts con las 21 columnas de cruce_cartera)."""
     hdrs = _headers(
