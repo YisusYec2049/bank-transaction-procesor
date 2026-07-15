@@ -52,21 +52,30 @@ cierra TODAS las cuotas pendientes de una inscripción de una sola vez (más
 allá de la cascada aritmética ya implementada) — no se agrega nada especial
 todavía.
 
-CRUCE (columna cruce_cartera.cruce, 14 de julio) — "cruce a la inversa":
+CRUCE (columna cruce_cartera.cruce) — "cruce a la inversa":
 además de la cascada de arriba (que resuelve cartera_preventiva), este script
-también rellena cruce_cartera.cruce para TODAS las filas 'cruzado' (no
-distingue todavía pago manual/automático — pendiente que el usuario explique
-esa distinción, se agregará después). Busca el `incp` de cada fila (ya
-normalizado por sufijo por cruzar.py) contra `cartera_preventiva.inscrip`
-(normalizando sufijo PN/PJ también de este lado — confirmado por el usuario
-que debe contar como match aunque el sufijo no coincida). Si encuentra la
-inscripción, `cruce` = `cliente` de esa fila. Si no encuentra nada, `cruce`
-queda NULL — es un campo puramente informativo (no crea ni modifica
-`estado_cruce`/`excepcion_motivo` de cruce_cartera, esa excepción es de un
-proceso anterior). Detectar los casos "sin cruce" es responsabilidad de un
-filtro en financial-platform (cruzado + incp presente + cruce vacío), no de
-una clasificación nueva aquí — mismo criterio que el filtro de correo_2="0"
-del 8 de julio.
+rellena cruce_cartera.cruce para las filas 'cruzado'.
+
+CORREGIDO (15 de julio): antes esto se calculaba ANTES de la cascada y solo
+miraba si el `incp` del pago existía en algún lado de cartera_preventiva.inscrip
+— sin importar si ese pago específico se había aplicado realmente a una cuota.
+Eso hacía que un pago que quedó como puro excedente ("SOBRANTE", ver
+_asignar_pagos) igual saliera con `cruce` lleno, solo porque su documento
+tenía OTRAS cuotas en Cartera Preventiva. El usuario aclaró el orden correcto:
+primero se corre la cascada contra Cartera Preventiva, y solo con ese
+resultado (qué pago se aplicó de verdad a qué cuota, identificado vs no
+identificado) se calcula `cruce`. Un pago que no se aplicó a ninguna cuota
+(excedente, o documento sin cuotas en Cartera Preventiva) queda con `cruce`
+NULL, aunque su documento sí tenga otras cuotas ahí.
+
+`cruce` sigue sin distinguir pago manual/automático (pendiente que el usuario
+explique esa distinción) y sigue siendo puramente informativo (no crea ni
+modifica `estado_cruce`/`excepcion_motivo` de cruce_cartera). Detectar los
+casos "no identificado" es responsabilidad de un filtro en financial-platform
+(cruzado + incp presente + cruce vacío) — con este fix, ese filtro pasa a ser
+el panel real de "excepciones de cruce con Cartera Preventiva": pagos que sí
+se identificaron en cruce_cartera pero no se pudieron aplicar a ninguna cuota
+real.
 """
 
 import logging
@@ -75,7 +84,7 @@ import sys
 
 from dotenv import load_dotenv
 
-from utils.parser import normalizar_nit, normalizar_sufijo
+from utils.parser import normalizar_nit
 from utils.supabase import select_all, update_cruce_valores, upsert_cartera_preventiva
 
 logging.basicConfig(
@@ -93,21 +102,29 @@ def _normalizar_documento(valor) -> str:
     return normalizar_nit(str(valor or '').strip())
 
 
-def _asignar_pagos(cuotas: list[dict], pagos: list[dict]) -> list[dict]:
+def _asignar_pagos(cuotas: list[dict], pagos: list[dict]) -> tuple[list[dict], dict[str, float]]:
     """FIFO: cuotas por fecha_vencimiento asc, pagos por payment_date asc.
-    Devuelve una fila de resultado por cada cuota que recibió al menos un
-    pago (ver docstring del módulo para el caso de múltiples pagos)."""
+    Devuelve (resultado, aplicado_por_pago):
+      - resultado: una fila por cada cuota que recibió al menos un pago (ver
+        docstring del módulo para el caso de múltiples pagos).
+      - aplicado_por_pago: {matching_key del pago -> monto que se alcanzó a
+        aplicar a alguna cuota}. Un pago que cae completo en excedente (no
+        queda ninguna cuota a la cual aplicarlo) no aparece aquí — sirve para
+        que _calcular_cruce_inverso sepa qué pagos quedaron "identificados"
+        contra Cartera Preventiva de verdad, no solo por existir el documento."""
     cuotas_ordenadas = sorted(cuotas, key=lambda c: c.get('fecha_vencimiento') or _FECHA_MAX)
     pagos_ordenados   = sorted(pagos, key=lambda p: p.get('payment_date') or _FECHA_MAX)
 
     acumulado:  dict = {}  # id de cuota -> monto aplicado
     ultimo_pago: dict = {}  # id de cuota -> último pago que la tocó
+    aplicado_por_pago: dict[str, float] = {}  # matching_key del pago -> monto aplicado a alguna cuota
     idx = 0
     excedente = 0.0  # plata que sobra tras cubrir TODAS las cuotas conocidas del documento
     for pago in pagos_ordenados:
         restante = float(pago.get('payment_amount') or 0)
         if restante <= 0:
             continue
+        matching_key = pago['matching_key']
         while restante > 0 and idx < len(cuotas_ordenadas):
             cuota = cuotas_ordenadas[idx]
             cuota_id = cuota['id']
@@ -120,6 +137,7 @@ def _asignar_pagos(cuotas: list[dict], pagos: list[dict]) -> list[dict]:
             aplicar = min(restante, saldo)
             acumulado[cuota_id] = ya_aplicado + aplicar
             ultimo_pago[cuota_id] = pago
+            aplicado_por_pago[matching_key] = aplicado_por_pago.get(matching_key, 0.0) + aplicar
             restante -= aplicar
             if acumulado[cuota_id] >= valor_cuota:
                 idx += 1
@@ -154,36 +172,24 @@ def _asignar_pagos(cuotas: list[dict], pagos: list[dict]) -> list[dict]:
         correo_original = ultima['correo_elec'] or ''
         ultima['correo_elec'] = f'{correo_original} | SOBRANTE ${monto_fmt} sin cuota registrada'.strip(' |')
 
-    return resultado
+    return resultado, aplicado_por_pago
 
 
-def _build_lookup_inscrip(cuotas_rows: list[dict]) -> dict[str, str]:
-    """{inscrip normalizado (sin sufijo PN/PJ) -> cliente}, primera coincidencia
-    gana (mismo criterio VLOOKUP que el resto del cruce)."""
-    lookup: dict[str, str] = {}
-    for c in cuotas_rows:
-        inscrip = str(c.get('inscrip') or '').strip()
-        if not inscrip:
-            continue
-        base = normalizar_sufijo(inscrip)
-        if base and base not in lookup:
-            lookup[base] = c.get('cliente')
-    return lookup
-
-
-def _calcular_cruce_inverso(pagos_rows: list[dict], cuotas_rows: list[dict]) -> list[dict]:
-    """Cruce a la inversa: para cada pago ya 'cruzado', busca su `incp` dentro
-    de cartera_preventiva.inscrip y devuelve el `cliente` encontrado. Devuelve
-    una lista de {matching_key, cruce} lista para actualizar en cruce_cartera
-    (cruce=None cuando no hay match, para limpiar corridas anteriores)."""
-    lookup = _build_lookup_inscrip(cuotas_rows)
+def _calcular_cruce_inverso(pagos_rows: list[dict], cuotas_por_doc: dict[str, list[dict]],
+                             aplicado_por_pago: dict[str, float]) -> list[dict]:
+    """Cruce a la inversa: para cada pago ya 'cruzado', confirma si REALMENTE
+    se aplicó a alguna cuota de Cartera Preventiva durante la cascada FIFO
+    (no si su documento simplemente tiene cuotas ahí). Devuelve una lista de
+    {matching_key, cruce} lista para actualizar en cruce_cartera (cruce=None
+    cuando no se aplicó nada, para limpiar corridas anteriores) — para TODOS
+    los pagos 'cruzado', se hayan aplicado o no."""
     updates = []
     for p in pagos_rows:
-        incp = str(p.get('incp') or '').strip()
-        if not incp:
-            continue
-        cruce = lookup.get(normalizar_sufijo(incp))
-        updates.append({'matching_key': p['matching_key'], 'cruce': cruce})
+        matching_key = p['matching_key']
+        doc = str(p.get('identification') or '').strip()
+        cuotas = cuotas_por_doc.get(doc)
+        cruce = cuotas[0].get('cliente') if cuotas and aplicado_por_pago.get(matching_key, 0.0) > 0 else None
+        updates.append({'matching_key': matching_key, 'cruce': cruce})
     return updates
 
 
@@ -208,14 +214,6 @@ def main():
     )
     pagos_rows = [p for p in pagos_rows if p.get('estado_cruce') == 'cruzado']
 
-    log.info('Calculando cruce a la inversa (INCP vs cartera_preventiva.inscrip)...')
-    cruce_updates = _calcular_cruce_inverso(pagos_rows, cuotas_rows)
-    if cruce_updates:
-        con_match = sum(1 for u in cruce_updates if u.get('cruce'))
-        update_cruce_valores(supabase_url, srk, cruce_updates)
-        log.info('Cruce inverso: %d filas actualizadas (%d con match, %d sin match).',
-                  len(cruce_updates), con_match, len(cruce_updates) - con_match)
-
     cuotas_por_doc: dict[str, list[dict]] = {}
     for c in cuotas_rows:
         doc = _normalizar_documento(c.get('cruce_access'))
@@ -233,22 +231,32 @@ def main():
     log.info('%d documentos con cuotas pendientes, %d documentos con pagos.',
               len(cuotas_por_doc), len(pagos_por_doc))
 
+    log.info('Calculando cruce contra Cartera Preventiva (cascada FIFO)...')
     resultado = []
+    aplicado_por_pago: dict[str, float] = {}
     for doc, cuotas in cuotas_por_doc.items():
         pagos = pagos_por_doc.get(doc)
         if not pagos:
             continue
-        resultado.extend(_asignar_pagos(cuotas, pagos))
+        cuotas_resultado, aplicado = _asignar_pagos(cuotas, pagos)
+        resultado.extend(cuotas_resultado)
+        aplicado_por_pago.update(aplicado)
 
-    if not resultado:
+    if resultado:
+        batch_size = 500
+        for i in range(0, len(resultado), batch_size):
+            upsert_cartera_preventiva(supabase_url, srk, resultado[i:i + batch_size])
+        log.info('cruzar_cartera_preventiva.py: %d cuotas actualizadas.', len(resultado))
+    else:
         log.info('Sin cuotas para actualizar.')
-        return
 
-    batch_size = 500
-    for i in range(0, len(resultado), batch_size):
-        upsert_cartera_preventiva(supabase_url, srk, resultado[i:i + batch_size])
-
-    log.info('cruzar_cartera_preventiva.py completado: %d cuotas actualizadas.', len(resultado))
+    log.info('Calculando cruce a la inversa (con base en lo que realmente se aplicó arriba)...')
+    cruce_updates = _calcular_cruce_inverso(pagos_rows, cuotas_por_doc, aplicado_por_pago)
+    if cruce_updates:
+        con_match = sum(1 for u in cruce_updates if u.get('cruce'))
+        update_cruce_valores(supabase_url, srk, cruce_updates)
+        log.info('Cruce inverso: %d filas actualizadas (%d identificados, %d sin identificar).',
+                  len(cruce_updates), con_match, len(cruce_updates) - con_match)
 
 
 if __name__ == '__main__':
