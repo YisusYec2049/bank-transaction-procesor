@@ -8,8 +8,9 @@ Para cada banco:
   1. Lista archivos nuevos en la carpeta Drive INBOX
   2. Descarga y parsea con el módulo fuentes/<banco>.py
   3. Normaliza al esquema estándar (11 columnas)
-  4. Escribe al tab del día en CONSOLIDADO (Google Sheets) — siempre
-  5. Cheques → gestiona en sheet CHEQUES_PENDIENTES
+  4. Cheques → se apartan del proceso (tabla pagos_apartados, tipo='cheque');
+     nunca entran al CONSOLIDADO ni a Supabase consolidated_transactions
+  5. Escribe al tab del día en CONSOLIDADO (Google Sheets) — siempre
   6. Upsert en Supabase consolidated_transactions (si SKIP_SUPABASE != true)
   7. Mueve el archivo a la carpeta HISTORICO
 
@@ -42,10 +43,8 @@ import fuentes.davivienda as mod_davivienda
 import fuentes.payu       as mod_payu
 
 from utils.drive    import list_files, download_pdf as download_file, move_file
-from utils.sheets   import (ensure_tab, append_rows, get_yesterday_keys,
-                             read_cheques, write_pendientes, mark_conciliado,
-                             ensure_cheques_header)
-from utils.supabase import upsert, upsert_cheque
+from utils.sheets   import ensure_tab, append_rows, get_yesterday_keys
+from utils.supabase import upsert, existing_matching_keys, upsert_pagos_apartados, select_all
 
 logging.basicConfig(
     level=logging.INFO,
@@ -61,11 +60,14 @@ SCOPES = [
 ]
 
 BANCOS = {
-    'placetopay': {'mod': mod_placetopay, 'prefix': 'PLACETOPAY', 'cheques': False},
-    'wompi':      {'mod': mod_wompi,      'prefix': 'WOMPI',      'cheques': False},
-    'stripe':     {'mod': mod_stripe,     'prefix': 'STRIPE',     'cheques': False},
-    'colpatria':  {'mod': mod_colpatria,  'prefix': 'COLPATRIA',  'cheques': True},
-    'davivienda': {'mod': mod_davivienda, 'prefix': 'DAVIVIENDA', 'cheques': True},
+    # dedup_sufijo: True para bancos cuya matching_key es fecha+documento+monto
+    # (puede colisionar entre 2 pagos reales distintos, ver Fase 1.2). False
+    # para los que usan un id de transacción único (no colisiona nunca).
+    'placetopay': {'mod': mod_placetopay, 'prefix': 'PLACETOPAY', 'dedup_sufijo': False},
+    'wompi':      {'mod': mod_wompi,      'prefix': 'WOMPI',      'dedup_sufijo': False},
+    'stripe':     {'mod': mod_stripe,     'prefix': 'STRIPE',     'dedup_sufijo': False},
+    'colpatria':  {'mod': mod_colpatria,  'prefix': 'COLPATRIA',  'dedup_sufijo': True},
+    'davivienda': {'mod': mod_davivienda, 'prefix': 'DAVIVIENDA', 'dedup_sufijo': True},
 }
 
 
@@ -96,6 +98,154 @@ def _build_services():
     drive  = build('drive',  'v3', credentials=creds, cache_discovery=False)
     sheets = build('sheets', 'v4', credentials=creds, cache_discovery=False)
     return drive, sheets
+
+
+# ── Dedup / colisiones de matching_key ────────────────────────────────────────
+
+def _asignar_sufijos_duplicados(rows: list[tuple], banco: str) -> list[tuple]:
+    """Numera colisiones de matching_key por POSICIÓN dentro del lote (un
+    mismo archivo) en vez de descartarlas. Dos pagos reales con la misma
+    llave (mismo día, mismo documento, mismo monto) antes se perdían: el
+    segundo pisaba al primero en el upsert. El sufijo se asigna por posición
+    (1ra ocurrencia sin sufijo, 2da " (duplicado)", 3ra " (duplicado 2)", …)
+    para que reprocesar el mismo archivo dé siempre el mismo resultado."""
+    contador: dict[str, int] = {}
+    resultado = []
+    for row in rows:
+        base = row[10]
+        n = contador.get(base, 0)
+        contador[base] = n + 1
+        if n == 0:
+            resultado.append(row)
+            continue
+        sufijo = ' (duplicado)' if n == 1 else f' (duplicado {n})'
+        row = list(row)
+        row[10] = base + sufijo
+        log.warning('[%s] matching_key duplicado dentro del lote: %s -> %s', banco, base, row[10])
+        resultado.append(tuple(row))
+    return resultado
+
+
+def _filtrar_duplicados(candidatos: list[tuple], yesterday_keys: set[str],
+                         banco: str, usar_sufijos: bool) -> list[tuple]:
+    """Descarta filas cuya llave ya está en el tab de ayer (Sheets, sin
+    cambios). Dentro del lote de hoy: si usar_sufijos, no descarta
+    colisiones — las numera (ver _asignar_sufijos_duplicados); si no,
+    mantiene el comportamiento viejo de quedarse solo con la 1ra ocurrencia."""
+    sin_ayer = [row for row in candidatos if row[10] not in yesterday_keys]
+    omitidos = len(candidatos) - len(sin_ayer)
+    if omitidos:
+        log.debug('[%s] %d duplicado(s) omitido(s) (ya en ayer).', banco, omitidos)
+
+    if usar_sufijos:
+        return _asignar_sufijos_duplicados(sin_ayer, banco)
+
+    seen, filtradas = set(), []
+    for row in sin_ayer:
+        key = row[10]
+        if key in seen:
+            log.debug('[%s] Duplicado omitido: %s', banco, key)
+            continue
+        seen.add(key)
+        filtradas.append(row)
+    return filtradas
+
+
+def _alertar_colision_supabase(filtradas: list[tuple], banco: str,
+                                supabase_url: str, srk: str) -> None:
+    """Alerta (log) si alguna matching_key de este lote ya existe en
+    Supabase — colisión entre archivos/días distintos, no detectable con
+    solo mirar el lote actual. No cambia sufijos (eso es solo por posición
+    dentro del lote, para mantener el reproceso idempotente)."""
+    ya_existentes = existing_matching_keys(supabase_url, srk, [r[10] for r in filtradas])
+    for k in ya_existentes:
+        log.warning('[%s] matching_key ya existe en Supabase (colisión entre lotes/días): %s', banco, k)
+
+
+# ── Cheques (Fase 2E): se apartan del proceso por completo ────────────────────
+
+_CAMPOS_FIRMA_CHEQUE = (
+    'val', 'identification', 'transaction_code_1', 'transaction_code_2',
+    'email', 'payment_method', 'program', 'phone', 'payment_amount',
+)
+
+
+def _firma_cheque(vals: dict) -> tuple:
+    """Firma de contenido de un cheque para detectar `aparicion` (primera vez
+    / segunda vez): todas las columnas del consolidado EXCEPTO payment_date
+    (y matching_key, que deriva de la fecha) — ver Fase 2.2 (E)."""
+    monto = vals.get('payment_amount')
+    try:
+        monto_norm = round(float(monto), 2) if monto not in (None, '') else None
+    except (TypeError, ValueError):
+        monto_norm = monto
+    return tuple(str(vals.get(c) or '') for c in _CAMPOS_FIRMA_CHEQUE if c != 'payment_amount') + (monto_norm,)
+
+
+def _apartar_cheques(cheques: list[tuple], banco: str, supabase_url: str, srk: str, dry_run: bool) -> None:
+    """Aparta cheques a pagos_apartados (tipo='cheque'). Nunca entran al
+    consolidado ni al cruce — el área financiera no maneja cheques, se los
+    pasa al área de Cartera. Calcula `aparicion` comparando contra cheques ya
+    apartados (mismo criterio de firma que arriba). Sin conciliación ni
+    rebote: solo 'primera vez'/'segunda vez'; una 3ra aparición es inesperada
+    y solo se alerta por log (no hay un tercer valor válido en el esquema)."""
+    if not cheques:
+        return
+
+    cheques = _asignar_sufijos_duplicados(cheques, banco)
+
+    if dry_run:
+        log.info('[%s] [DRY RUN] %d cheque(s) se apartarían a pagos_apartados (no se escriben).',
+                  banco, len(cheques))
+        return
+
+    tz_bogota = pytz.timezone('America/Bogota')
+    hoy = datetime.now(tz_bogota).strftime('%Y-%m-%d')
+
+    existentes = select_all(supabase_url, srk, 'pagos_apartados',
+                             select=','.join(_CAMPOS_FIRMA_CHEQUE) + ',tipo')
+    conteo_firmas: dict[tuple, int] = {}
+    for e in existentes:
+        if e.get('tipo') != 'cheque':
+            continue
+        firma = _firma_cheque(e)
+        conteo_firmas[firma] = conteo_firmas.get(firma, 0) + 1
+
+    payload = []
+    for row in cheques:
+        dd, mm, yyyy = str(row[2]).split('-')
+        vals = {
+            'val': row[0], 'identification': row[1], 'transaction_code_1': row[3],
+            'transaction_code_2': row[4], 'email': row[5], 'payment_method': row[6],
+            'program': row[7], 'phone': row[8], 'payment_amount': row[9],
+        }
+        firma = _firma_cheque(vals)
+        n = conteo_firmas.get(firma, 0) + 1
+        conteo_firmas[firma] = n
+
+        if n == 1:
+            aparicion = 'primera vez'
+        elif n == 2:
+            aparicion = 'segunda vez'
+        else:
+            log.warning('[%s] Cheque con %da aparición (inesperado, solo debería haber 2): %s',
+                        banco, n, row[10])
+            aparicion = 'segunda vez'
+
+        payload.append({
+            'matching_key':  row[10],
+            'tipo':          'cheque',
+            'origen':        'automatico',
+            'es_pago_unico': False,
+            'incp_resuelto': None,
+            'aparicion':     aparicion,
+            'fecha_ingreso': hoy,
+            'payment_date':  f'{yyyy}-{mm}-{dd}',
+            **vals,
+        })
+
+    upsert_pagos_apartados(supabase_url, srk, payload)
+    log.info('[%s] %d cheque(s) apartados a pagos_apartados.', banco, len(payload))
 
 
 # ── Procesamiento genérico ────────────────────────────────────────────────────
@@ -136,21 +286,16 @@ def _procesar_banco(drive, sheets, banco: str, cfg: dict,
                 continue
 
             normalized = mod.normalize(raw_rows)
-            normales, _nuevos, conciliados, _acts = mod.cheque_logic(normalized, [])
-            candidatos = normales + conciliados
+            candidatos, cheques = mod.cheque_logic(normalized)
 
-            # Dedup contra llaves de ayer
-            seen, filtradas = set(), []
-            for row in candidatos:
-                key = row[10]
-                if key in yesterday_keys or key in seen:
-                    log.debug('[%s] Duplicado omitido: %s', banco, key)
-                    continue
-                seen.add(key)
-                filtradas.append(row)
+            usar_sufijos = cfg.get('dedup_sufijo', False)
+            filtradas = _filtrar_duplicados(candidatos, yesterday_keys, banco, usar_sufijos)
 
-            log.info('[%s] %d filas normalizadas → %d tras dedup.',
-                     banco, len(normalized), len(filtradas))
+            log.info('[%s] %d filas normalizadas → %d tras dedup (%d cheque(s) apartado(s)).',
+                     banco, len(normalized), len(filtradas), len(cheques))
+
+            _apartar_cheques(cheques, banco, os.environ['SUPABASE_URL'],
+                              os.environ['SUPABASE_SERVICE_ROLE_KEY'], dry_run)
 
             if dry_run:
                 for s in filtradas[:3]:
@@ -167,10 +312,9 @@ def _procesar_banco(drive, sheets, banco: str, cfg: dict,
                 if skip_supa:
                     log.info('[%s] SKIP_SUPABASE=true — solo Sheets.', banco)
                 else:
+                    if usar_sufijos:
+                        _alertar_colision_supabase(filtradas, banco, supabase_url, srk)
                     upsert(supabase_url, srk, filtradas)
-                    if cfg['cheques']:
-                        for row in conciliados:
-                            upsert_cheque(supabase_url, srk, banco, row)
 
             if hist:
                 move_file(drive, fid, hist)
@@ -189,7 +333,6 @@ def _procesar_bancolombia(drive, sheets, banco: str, cfg: dict,
     prefix = cfg['prefix']
     inbox  = os.environ.get(f'{prefix}_INBOX_FOLDER_ID', '')
     hist   = os.environ.get(f'{prefix}_HISTORICO_FOLDER_ID', '')
-    cheques_id = os.environ.get(f'{prefix}_CHEQUES_SHEET_ID', '')
 
     if not inbox:
         log.warning('[%s] Sin INBOX configurado, saltando.', banco)
@@ -206,14 +349,6 @@ def _procesar_bancolombia(drive, sheets, banco: str, cfg: dict,
     srk          = os.environ['SUPABASE_SERVICE_ROLE_KEY']
     skip_supa    = os.environ.get('SKIP_SUPABASE', '').lower() == 'true'
 
-    # Leer cheques pendientes existentes antes de procesar
-    pendientes_raw = []
-    if cheques_id and not dry_run:
-        try:
-            pendientes_raw = read_cheques(sheets, cheques_id)
-        except Exception:
-            log.exception('[%s] No se pudo leer sheet de cheques.', banco)
-
     for f in archivos:
         fid   = f['id']
         fname = f['name']
@@ -227,45 +362,30 @@ def _procesar_bancolombia(drive, sheets, banco: str, cfg: dict,
                 continue
 
             normalized = mod.normalize(raw_rows)
-            normales, pendientes_nuevos, conciliados, actualizaciones = \
-                mod.cheque_logic(normalized, pendientes_raw)
+            candidatos, cheques = mod.cheque_logic(normalized)
 
-            # Solo normales + conciliados van al consolidado
-            candidatos = normales + conciliados
+            # Bancolombia (2576/2833): matching_key = fecha_documento_monto,
+            # puede colisionar entre 2 pagos reales distintos (Fase 1.2) — se
+            # numeran en vez de descartarse.
+            filtradas = _filtrar_duplicados(candidatos, yesterday_keys, banco, True)
 
-            seen, filtradas = set(), []
-            for row in candidatos:
-                key = row[10]
-                if key in yesterday_keys or key in seen:
-                    log.debug('[%s] Duplicado omitido: %s', banco, key)
-                    continue
-                seen.add(key)
-                filtradas.append(row)
+            log.info('[%s] %d normalizadas → %d al consolidado (%d cheque(s) apartado(s))',
+                     banco, len(normalized), len(filtradas), len(cheques))
 
-            log.info('[%s] %d normalizadas → %d al consolidado | %d PENDIENTE | %d conciliados',
-                     banco, len(normalized), len(filtradas),
-                     len(pendientes_nuevos), len(conciliados))
+            _apartar_cheques(cheques, banco, supabase_url, srk, dry_run)
 
             if dry_run:
                 for s in filtradas[:3]:
                     log.info('[DRY RUN] matching_key=%s | amount=%s', s[10], s[9])
-                if pendientes_nuevos:
-                    log.info('[DRY RUN] %d cheques nuevos PENDIENTE (no se escriben)', len(pendientes_nuevos))
                 continue
 
             if filtradas:
                 append_rows(sheets, consolidado_id, today_tab, filtradas)
                 if not skip_supa:
+                    _alertar_colision_supabase(filtradas, banco, supabase_url, srk)
                     upsert(supabase_url, srk, filtradas)
                 else:
                     log.info('[%s] SKIP_SUPABASE=true — solo Sheets.', banco)
-
-            if cheques_id:
-                ensure_cheques_header(sheets, cheques_id, mod.CHEQUES_HEADERS)
-                if pendientes_nuevos:
-                    write_pendientes(sheets, cheques_id, pendientes_nuevos)
-                if actualizaciones:
-                    mark_conciliado(sheets, cheques_id, actualizaciones)
 
             if hist:
                 move_file(drive, fid, hist)

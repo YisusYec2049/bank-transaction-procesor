@@ -138,6 +138,6 @@ def normalize(raw_rows: list[dict]) -> list[list]:
     ]
 
 
-def cheque_logic(normalized_rows, _pendientes_raw):
+def cheque_logic(normalized_rows: list[list]) -> tuple[list, list]:
     """Placetopay no maneja cheques."""
-    return normalized_rows, [], [], []
+    return normalized_rows, []

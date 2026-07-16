@@ -15,7 +15,7 @@ from collections import defaultdict
 
 import pdfplumber
 
-from utils.parser import parse_valor, valor_str, norm_valor_str
+from utils.parser import parse_valor, valor_str
 
 log = logging.getLogger(__name__)
 
@@ -265,59 +265,12 @@ def normalize(raw_rows: list[dict]) -> list[list]:
     return result
 
 
-def cheque_logic(
-    normalized_rows: list[list],
-    pendientes_raw: list[list],
-) -> tuple[list, list, list, list]:
-    normales = [r for r in normalized_rows if 'CHEQUE' not in str(r[2]).upper()]
-    cheques  = [r for r in normalized_rows if 'CHEQUE'     in str(r[2]).upper()]
-
-    if not cheques:
-        return normales, [], [], []
-
-    if not pendientes_raw:
-        return normales, cheques, [], []
-
-    first = pendientes_raw[0]
-    if 'ESTADO' in first:
-        header     = [h.strip() for h in first]
-        data_rows  = pendientes_raw[1:]
-        start_row  = 2
-        ident_idx  = header.index('identification') if 'identification' in header else 0
-        valor_idx  = header.index('payment_amount') if 'payment_amount' in header else 8
-        estado_idx = header.index('ESTADO')
-    else:
-        data_rows  = pendientes_raw
-        start_row  = 1
-        ident_idx, valor_idx, estado_idx = 1, 9, 12
-
-    mapa: dict[str, list] = {}
-    for i, row in enumerate(data_rows, start=start_row):
-        ident  = str(row[ident_idx]  if len(row) > ident_idx  else '').strip()
-        val    = norm_valor_str(row[valor_idx]  if len(row) > valor_idx  else '')
-        estado = str(row[estado_idx] if len(row) > estado_idx else '').strip()
-        clave  = f'{ident}|{val}'
-        mapa.setdefault(clave, []).append(
-            {'row_index': i, 'estado': estado, 'estado_col': estado_idx}
-        )
-
-    pendientes_nuevos, conciliados, actualizaciones = [], [], []
-
-    for row in cheques:
-        clave = f'{row[0]}|{norm_valor_str(row[8])}'
-
-        if clave not in mapa:
-            pendientes_nuevos.append(row)
-            continue
-
-        registros = mapa[clave]
-        pendiente = next((r for r in registros if r['estado'] == 'PENDIENTE'), None)
-        ya_concil = next((r for r in registros if r['estado'] == 'CONCILIADO'), None)
-
-        if pendiente:
-            conciliados.append(row)
-            actualizaciones.append(pendiente)
-        elif ya_concil:
-            log.warning('Cheque ya CONCILIADO ignorado: %s', clave)
-
-    return normales, pendientes_nuevos, conciliados, actualizaciones
+def cheque_logic(normalized_rows: list[list]) -> tuple[list, list]:
+    """Separa cheques del resto. Los cheques se apartan del proceso por
+    completo (nunca entran al consolidado ni al cruce — ver pagos_apartados
+    en procesar_todos.py). transaction_code_1 (índice 3) es la descripción;
+    antes se comparaba por error contra payment_date (índice 2), así que
+    ningún cheque se detectaba nunca (bug de Fase 1.1)."""
+    normales = [r for r in normalized_rows if 'CHEQUE' not in str(r[3]).upper()]
+    cheques  = [r for r in normalized_rows if 'CHEQUE'     in str(r[3]).upper()]
+    return normales, cheques

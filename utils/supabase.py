@@ -53,6 +53,31 @@ def upsert(supabase_url: str, service_role_key: str, rows: list[list]) -> None:
     log.info('Upsert Supabase OK: %d registros, HTTP %s.', len(payload), resp.status_code)
 
 
+def existing_matching_keys(supabase_url: str, service_role_key: str, keys: list[str]) -> set[str]:
+    """Subconjunto de `keys` que ya existe en consolidated_transactions.
+
+    Usado para alertar colisiones de matching_key entre lotes/archivos
+    distintos (dentro de un mismo archivo la numeración de duplicados es
+    por posición, ver procesar_todos.py — esto solo detecta y loguea, no
+    decide sufijos)."""
+    if not keys:
+        return set()
+    encontrados: set[str] = set()
+    batch_size = 200
+    for i in range(0, len(keys), batch_size):
+        batch = keys[i:i + batch_size]
+        valores = ','.join(f'"{v}"' for v in batch)
+        resp = http.get(
+            f'{supabase_url}/rest/v1/consolidated_transactions',
+            params={'select': 'matching_key', 'matching_key': f'in.({valores})'},
+            headers=_headers(service_role_key),
+            timeout=30,
+        )
+        resp.raise_for_status()
+        encontrados.update(r['matching_key'] for r in resp.json())
+    return encontrados
+
+
 def _headers(service_role_key: str, prefer: str | None = None) -> dict:
     hdrs = {
         'apikey':        service_role_key,
@@ -127,7 +152,13 @@ def sync_cartera_preventiva(supabase_url: str, service_role_key: str, rows: list
     (sql/007_cartera_preventiva_llave_unique.sql).
 
     Las llaves que ya no aparecen en el Excel nuevo (cuota que salió de
-    cartera pendiente) se borran aparte, al final.
+    cartera pendiente) se borran aparte, al final — EXCEPTO (Fase 4, 16 de
+    julio): llaves de "línea de saldo" generadas por
+    cruzar_cartera_preventiva.py (contienen " (saldo" en el texto, ver
+    _generar_llave_saldo) — no existen en ningún Excel, así que sin esto se
+    borrarían solas en el primer sync después de crearse; y llaves con
+    cerrado_manual=true en cartera_preventiva_overrides — una cuota cerrada
+    a mano no debe desaparecer si el Excel deja de traerla.
     """
     vistas: set[str] = set()
     deduped = []
@@ -156,7 +187,15 @@ def sync_cartera_preventiva(supabase_url: str, service_role_key: str, rows: list
 
     existentes = select_all(supabase_url, service_role_key, 'cartera_preventiva', select='llave')
     llaves_actuales = {r['llave'] for r in existentes if r.get('llave')}
-    llaves_a_borrar = list(llaves_actuales - vistas)
+
+    overrides_cerrados = select_all(supabase_url, service_role_key, 'cartera_preventiva_overrides',
+                                     select='llave,cerrado_manual')
+    llaves_protegidas = {r['llave'] for r in overrides_cerrados if r.get('cerrado_manual')}
+
+    llaves_a_borrar = [
+        k for k in (llaves_actuales - vistas)
+        if ' (saldo' not in k and k not in llaves_protegidas
+    ]
 
     if llaves_a_borrar:
         hdrs_delete = _headers(service_role_key, prefer='return=minimal')
@@ -207,6 +246,40 @@ def upsert_cartera_preventiva(supabase_url: str, service_role_key: str, rows: li
     log.info('Upsert cartera_preventiva OK: %d registros, HTTP %s.', len(rows), resp.status_code)
 
 
+def insert_cartera_preventiva_lineas(supabase_url: str, service_role_key: str, rows: list[dict]) -> None:
+    """Inserta líneas NUEVAS de saldo pendiente (Fase 4.4, pago parcial) —
+    filas que no existen todavía, sin `id` (bigserial). Upsert por `llave`
+    (no por `id`, que no existe aún) para que un reproceso del mismo evento
+    no duplique la línea si ya se había creado."""
+    if not rows:
+        return
+    hdrs = _headers(service_role_key, prefer='return=minimal,resolution=merge-duplicates')
+    resp = http.post(
+        f'{supabase_url}/rest/v1/cartera_preventiva?on_conflict=llave',
+        json=rows,
+        headers=hdrs,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    log.info('Líneas de saldo nuevas insertadas en cartera_preventiva: %d.', len(rows))
+
+
+def upsert_pago_asociaciones(supabase_url: str, service_role_key: str, rows: list[dict]) -> None:
+    """Upsert por (matching_key, llave) a pago_asociaciones (Fase 4.2/4.3):
+    cada dict trae matching_key, llave, monto, origen."""
+    if not rows:
+        return
+    hdrs = _headers(service_role_key, prefer='return=minimal,resolution=merge-duplicates')
+    resp = http.post(
+        f'{supabase_url}/rest/v1/pago_asociaciones?on_conflict=matching_key,llave',
+        json=rows,
+        headers=hdrs,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    log.info('Upsert pago_asociaciones OK: %d registros.', len(rows))
+
+
 def update_cruce_valores(supabase_url: str, service_role_key: str, updates: list[dict]) -> None:
     """PATCH individual por matching_key: cada dict trae matching_key + los
     campos a actualizar (ej. {'matching_key': ..., 'cruce': 'Juan Perez'}).
@@ -228,38 +301,36 @@ def update_cruce_valores(supabase_url: str, service_role_key: str, updates: list
     log.info('Update cruce_cartera (cruce inverso) OK: %d filas.', len(updates))
 
 
-def upsert_cheque(supabase_url: str, service_role_key: str, banco: str, row: list) -> None:
-    """
-    Inserta un cheque en cheques_pendientes si no existe ya uno PENDIENTE igual.
-    row: fila normalizada [identification, payment_date(DD-MM-YYYY), ..., payment_amount, matching_key]
-    """
-    dd, mm, yyyy = str(row[2]).split('-')
-    payload = {
-        'banco':          banco,
-        'identification': row[1],
-        'payment_amount': row[9],
-        'payment_date':   f'{yyyy}-{mm}-{dd}',
-        'raw_row':        {
-            'transaction_code_1': row[3],
-            'transaction_code_2': row[4],
-            'payment_method':     row[6],
-            'matching_key':       row[10],
-        },
-        'estado': 'PENDIENTE',
-    }
-    hdrs = {
-        'apikey':        service_role_key,
-        'Authorization': f'Bearer {service_role_key}',
-        'Content-Type':  'application/json',
-        'Prefer':        'return=minimal',
-    }
+def upsert_pagos_apartados(supabase_url: str, service_role_key: str, rows: list[dict]) -> None:
+    """Upsert por matching_key a pagos_apartados (matrículas, cesantías,
+    pago por llave, cheques — ver Fase 2 del rediseño)."""
+    if not rows:
+        return
+    hdrs = _headers(service_role_key, prefer='return=minimal,resolution=merge-duplicates')
     resp = http.post(
-        f'{supabase_url}/rest/v1/cheques_pendientes',
-        json=payload,
+        f'{supabase_url}/rest/v1/pagos_apartados?on_conflict=matching_key',
+        json=rows,
         headers=hdrs,
         timeout=30,
     )
-    if resp.status_code == 409:
-        return  # ya existe
     resp.raise_for_status()
-    log.info('Cheque PENDIENTE registrado: %s / %s / %s', banco, row[0], row[8])
+    log.info('Upsert pagos_apartados OK: %d registros, HTTP %s.', len(rows), resp.status_code)
+
+
+def delete_by_keys(supabase_url: str, service_role_key: str, table: str,
+                    key_column: str, keys: list[str], batch_size: int = 200) -> None:
+    """Borra de `table` todas las filas cuyo `key_column` esté en `keys`."""
+    if not keys:
+        return
+    hdrs = _headers(service_role_key, prefer='return=minimal')
+    for i in range(0, len(keys), batch_size):
+        batch = keys[i:i + batch_size]
+        valores = ','.join(f'"{v}"' for v in batch)
+        resp = http.delete(
+            f'{supabase_url}/rest/v1/{table}',
+            params={key_column: f'in.({valores})'},
+            headers=hdrs,
+            timeout=30,
+        )
+        resp.raise_for_status()
+    log.info('Borradas de "%s" (por %s): %d llave(s).', table, key_column, len(keys))

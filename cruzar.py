@@ -53,15 +53,26 @@ solas aquí):
                       sin que el documento lo confirme, no cierra la fila,
                       queda pendiente para revisión manual.
 
-Regla "cesantías" (BANCOLOMBIA): NITS_CESANTIAS son referencia_1 de terceros
-que reciben pagos por cuenta de muchos estudiantes distintos (ej. NIT de
-"PROTECCIÓN SA", que en la hoja BANCOLOMBIA 2576 aparece repetido con 190+
-incp distintos — no identifica a una persona, así que buscar por esa llave
-siempre "ambiguaría" en falso). Si el email/identification de la transacción
-es uno de estos NIT, CORREO(2) se fija directo en "Cesantías" (no se hace
-lookup), no cuenta como cruce_ambiguo, y se excluye también de la
-comparación de cruce_discrepante contra INCP — la fila puede quedar
-'cruzado' con INCP resuelto normalmente por su lado.
+Pagos apartados (Fase 2 del rediseño, 16 de julio): cesantías y "pago por
+llave" ya NO se resuelven dentro del cruce (la regla vieja NITS_CESANTIAS,
+que fijaba CORREO(2)="Cesantías" por NIT en Bancolombia 2576, se elimina —
+nunca disparaba para el resto de bancos y no describía bien los datos
+reales). Ahora, al inicio de main(), cada transacción se revisa contra:
+  - Cesantías: transaction_code_1 contiene "PROTECCION" o "FONDO NACIONAL"
+    (semilla fija, no se agregan fondos especulativos), o coincide
+    exactamente (normalizado) con algo en la tabla cesantias_patrones (lista
+    aprendida, crece por uso desde financial-platform).
+  - Pago por llave: identification o email es uno de los identificadores de
+    canal fijos (ID_CANAL_PAGO_LLAVE) — NO son cédulas de personas, son
+    llaves de la universidad que aparecen idénticas en pagos de decenas de
+    estudiantes distintos.
+Las que matchean y todavía no están en pagos_apartados se insertan ahí
+(tipo='cesantias'/'pago_llave', origen='automatico') y se excluyen por
+completo del cruce (ni INCP ni CORREO(2), tampoco _sugerir_por_cadencia) —
+si alguna ya estaba en cruce_cartera de una corrida anterior, se borra
+(retroactivo). Las que YA están en pagos_apartados con incp_resuelto
+llenado a mano desde financial-platform vuelven al flujo con ese INCP
+forzado (sin recalcular por lookup) y cierran 'cruzado' directamente.
 
 Sugerencia por fecha (CORREO(2) de BC2576/WOMPI/STRIPE_USA, las únicas hojas
 con fecha por fila): cuando una llave sigue ambigua tras la normalización PN,
@@ -120,11 +131,46 @@ omite esta regla por completo — NOMBRE/MÉTODO DE PAGO/CI quedan NULL para
 todas las transacciones WOMPI de esa corrida, sin afectar estado_cruce de
 ninguna forma (ya era informativo de por sí). El resto de bancos/pasarelas
 quedan fuera de alcance (diseño sin cerrar todavía).
+
+Stripe: cierre por doble señal correo+nombre, respaldo por nombre, excepción
+pendiente_asignar_incp (16 de julio, Fase 3.1-3.3 del rediseño):
+
+Stripe nunca trae `identification` (Stripe no manda documento), así que
+`incp` siempre da vacío — con la asimetría INCP/CORREO(2) del 14 de julio
+(CORREO(2) solo → cruce_unico), Stripe quedaba pendiente para siempre.
+
+  1. Si el correo cruza contra STRIPE_USA (sin ambigüedad) y el nombre del
+     pagador (transaction_code_1 = Card Name) coincide con NOMBRE CLIENTE de
+     esa fila → cierra 'cruzado' directo, sin esperar confirmación manual.
+     Si el correo cruza pero el nombre NO coincide, sigue 'cruce_unico' (caso
+     legítimo: un tercero pagando por otro).
+  2. Si el correo NO cruza, se busca por nombre entre TODAS las filas de
+     STRIPE_USA (mismo criterio de comparación). Es señal débil (homónimos):
+     si resuelve a un único INCP, cierra como CORREO(2) solo → cruce_unico,
+     nunca 'cruzado' directo. Si el nombre es ambiguo (2+ INCP distintos
+     entre las filas que matchean) → cruce_ambiguo.
+  3. Si el correo (o el nombre) encuentra fila en la hoja pero esa fila tiene
+     el INCP vacío → no es 'sin_cruce' (el equipo aún no le asignó
+     inscripción todavía): excepción propia 'pendiente_asignar_incp', se
+     resuelve sola cuando alguien llene el INCP en el Excel.
+
+Comparación de nombres (_normalizar_nombre / _nombres_coinciden): NFKD →
+quitar acentos → ASCII → MAYÚSCULAS → quitar puntuación → colapsar espacios;
+tokenizar y quedarse con tokens de más de 2 caracteres; coincide si comparten
+2+ tokens (o si son idénticos y el nombre tiene 1 solo token). No exige
+igualdad exacta porque Card Name suele venir recortado (ej. "GABRIELA
+VALDIVIA" vs "GABRIELA VALDIVIA PARODI"). Requiere reparar mojibake primero
+(los nombres de STRIPE_USA vienen con UTF-8 mal leído como cp1252 en el
+Excel de origen) — se repara en utils/excel_cartera.py (reparar_mojibake,
+aplicada en _cell_str para todas las hojas, no solo Stripe) antes de que
+estos nombres lleguen aquí.
 """
 
 import logging
 import os
+import re
 import sys
+import unicodedata
 from datetime import date, datetime as dt
 
 from dotenv import load_dotenv
@@ -133,7 +179,7 @@ from utils.drive import build_drive_service, find_latest_file, download_pdf as d
 from utils.excel_cartera import read_pagos_wompi_reporte
 from utils.parser import normalizar_nit as _normalizar_nit
 from utils.parser import normalizar_sufijo as _normalizar_sufijo
-from utils.supabase import select_all, upsert_cruce
+from utils.supabase import select_all, upsert_cruce, upsert_pagos_apartados, delete_by_keys
 
 logging.basicConfig(
     level=logging.INFO,
@@ -148,13 +194,40 @@ CADENCIA_DIAS_MAX = 60
 COINCIDENCIA_DIAS = 3
 
 
-# NIT de terceros/entidades que reciben pagos de cesantías por cuenta de
-# muchos estudiantes distintos (ej. "PROTECCIÓN SA"). En la hoja BANCOLOMBIA
-# 2576 aparecen como referencia_1 repetida con decenas de incp distintos —
-# no identifican a una persona, así que nunca deben tratarse como ambigüedad
-# real. Confirmado por el usuario el 8 de julio para "800138188".
-NITS_CESANTIAS = {'800138188'}
-CESANTIAS_LABEL = 'Cesantías'
+# Identificadores de canal (no cédulas de personas): "90473364" es la llave
+# fija del canal de pago de la universidad, aparece idéntica en pagos de
+# decenas de estudiantes distintos (56 incp distintos en
+# cartera_ingresos_bancolombia_2576, confirmado el 16 de julio). "800138188"
+# es el NIT de un intermediario de cesantías (ej. "PROTECCIÓN SA") que
+# también recibe pagos por cuenta de muchos estudiantes — mismo patrón.
+# Ninguno de los dos identifica a una persona, así que nunca deben cruzarse
+# ni sugerirse por cadencia — se apartan del proceso por completo.
+ID_CANAL_PAGO_LLAVE = {'90473364', '800138188'}
+
+# Semilla fija para detectar cesantías por descripción (Bancolombia). NO
+# agregar fondos especulativos (PORVENIR, COLFONDOS...) que no aparecen en
+# los datos reales — decisión explícita del 16 de julio. "PAGO DE PROV" NO
+# es señal (es el tipo genérico de pago a proveedores, lo usan empresas
+# normales) — solo el nombre del fondo cuenta.
+CESANTIAS_SEMILLA = ('PROTECCION', 'FONDO NACIONAL')
+
+
+def _normalizar_descripcion(desc: str) -> str:
+    return ' '.join(str(desc or '').upper().split())
+
+
+def _es_cesantias(transaction_code_1: str, patrones_aprendidos: set[str]) -> bool:
+    desc = _normalizar_descripcion(transaction_code_1)
+    if not desc:
+        return False
+    if any(semilla in desc for semilla in CESANTIAS_SEMILLA):
+        return True
+    return desc in patrones_aprendidos
+
+
+def _es_pago_llave(identification: str, email: str) -> bool:
+    return identification in ID_CANAL_PAGO_LLAVE or email in ID_CANAL_PAGO_LLAVE
+
 
 def _es_valor_relleno(valor: str) -> bool:
     """True si el valor es basura de captura del Excel de referencia, no un
@@ -229,6 +302,110 @@ def _tiene_sufijo_financiero(valor: str) -> bool:
     return valor.strip().upper().endswith(('PN', 'PJ'))
 
 
+def _normalizar_candidatos(valores: set[str]) -> set[str]:
+    """Colapsa variantes de formato (mismo número base, con/sin sufijo PN/PJ)
+    en un solo candidato — mismo criterio de _build_lookup, pero aquí
+    interesa el CONJUNTO completo de candidatos reales (Fase 3.6), no solo
+    detectar ambigüedad. Si dos variantes comparten base y una trae sufijo
+    financiero y la otra no, se prefiere la que trae sufijo (mismo criterio
+    "sistema financiero sobre Access" que preferir_sufijo_financiero)."""
+    por_base: dict[str, set[str]] = {}
+    for v in valores:
+        base = _normalizar_sufijo(v) or v
+        por_base.setdefault(base, set()).add(v)
+    resultado = set()
+    for variantes in por_base.values():
+        con_sufijo = {v for v in variantes if _tiene_sufijo_financiero(v)}
+        resultado |= con_sufijo if con_sufijo else variantes
+    return resultado
+
+
+def _tiene_deuda_pendiente(candidato: str, bases_con_deuda: set[str]) -> bool:
+    return (_normalizar_sufijo(candidato) or candidato) in bases_con_deuda
+
+
+_RE_NO_ALFANUM = re.compile(r'[^A-Z0-9\s]')
+
+
+def _normalizar_nombre(nombre: str) -> str:
+    """NFKD -> quitar acentos -> ASCII -> MAYÚSCULAS -> quitar puntuación ->
+    colapsar espacios (Fase 3.1, comparación de nombres para Stripe)."""
+    nfkd = unicodedata.normalize('NFKD', str(nombre or ''))
+    solo_ascii = nfkd.encode('ascii', 'ignore').decode('ascii')
+    solo_alfanum = _RE_NO_ALFANUM.sub(' ', solo_ascii.upper())
+    return ' '.join(solo_alfanum.split())
+
+
+def _tokens_nombre(nombre: str) -> set[str]:
+    """Tokens de más de 2 caracteres del nombre normalizado — descarta
+    partículas como "DE"/"A" e iniciales sueltas."""
+    return {t for t in _normalizar_nombre(nombre).split() if len(t) > 2}
+
+
+def _nombres_coinciden(a: str, b: str) -> bool:
+    """Coincide si comparten 2+ tokens, o si ambos se reducen a un único
+    token idéntico (nombre de una sola palabra, ej. "MADONNA"). No exige
+    igualdad exacta — el Card Name de Stripe suele venir recortado."""
+    tokens_a, tokens_b = _tokens_nombre(a), _tokens_nombre(b)
+    if not tokens_a or not tokens_b:
+        return False
+    if len(tokens_a & tokens_b) >= 2:
+        return True
+    return len(tokens_a) == 1 and len(tokens_b) == 1 and tokens_a == tokens_b
+
+
+def _cruzar_stripe(card_name: str, email_lower: str, lookup_stripe: dict,
+                    ambiguos_stripe: set, nombre_por_email: dict, emails_hoja: set,
+                    candidatos_nombre: list[tuple[str, str]]) -> tuple[str, bool, bool, bool]:
+    """Cruce de Stripe con doble señal correo+nombre (Fase 3.1-3.3, ver
+    docstring del módulo). Devuelve (correo_2, ambiguo, pendiente_incp,
+    confirmado_por_nombre):
+      - Si el correo cruza sin ambigüedad: correo_2 = valor encontrado,
+        confirmado_por_nombre = True si el Card Name coincide con NOMBRE
+        CLIENTE de esa fila (ver _nombres_coinciden).
+      - Si el correo cruza pero esa fila no tiene INCP: pendiente_incp=True.
+      - Si el correo no cruza en absoluto: respaldo por nombre, comparando
+        contra TODAS las filas de la hoja (candidatos_nombre). Nunca marca
+        confirmado_por_nombre (es señal débil por sí sola, ver 3.2)."""
+    if email_lower and email_lower in ambiguos_stripe:
+        return '', True, False, False
+
+    if email_lower and lookup_stripe.get(email_lower):
+        # .get(...) en vez de "in": _build_lookup guarda la llave igual
+        # aunque el INCP de esa fila venga vacío (_es_valor_relleno('') es
+        # False — una cadena vacía no cuenta como "relleno"), así que
+        # lookup_stripe puede tener email_lower -> '' — eso es justo el
+        # caso "fila existe, INCP vacío" que cae más abajo, no un cruce real.
+        valor = lookup_stripe[email_lower]
+        nombre_fila = nombre_por_email.get(email_lower, '')
+        confirmado = _nombres_coinciden(card_name, nombre_fila)
+        return valor, False, False, confirmado
+
+    if email_lower and email_lower in emails_hoja:
+        # la(s) fila(s) de este correo existen pero su INCP está vacío
+        return '', False, True, False
+
+    if not card_name:
+        return '', False, False, False
+
+    incps_match, fila_con_incp_vacio = set(), False
+    for nombre_fila, incp in candidatos_nombre:
+        if not _nombres_coinciden(card_name, nombre_fila):
+            continue
+        if _es_valor_relleno(incp):
+            fila_con_incp_vacio = True
+        else:
+            incps_match.add(incp)
+
+    if len(incps_match) == 1:
+        return next(iter(incps_match)), False, False, False
+    if len(incps_match) > 1:
+        return '', True, False, False
+    if fila_con_incp_vacio:
+        return '', False, True, False
+    return '', False, False, False
+
+
 WOMPI_REPORTE_PATTERN = 'ReportePagosWompi'
 PAGOS_MANUALES_LABEL  = 'PAGOS MANUALES'
 _PREFIJOS_DOCUMENTO_WOMPI = ('CC-', 'CEDULA_DE_EXTRANJERIA-')
@@ -284,7 +461,7 @@ def _cargar_lookup_wompi_reporte(sa_json: str, folder_id: str) -> tuple[dict[str
 def _build_lookup(rows: list[dict], key_field: str, value_field: str,
                    lower: bool = False, fecha_field: str | None = None,
                    preferir_sufijo_financiero: bool = False,
-                   ) -> tuple[dict, set, dict]:
+                   ) -> tuple[dict, set, dict, dict]:
     """Primera coincidencia gana (replica BUSCARV de Excel).
 
     Devuelve además el conjunto de llaves ambiguas: aquellas donde la hoja de
@@ -324,6 +501,12 @@ def _build_lookup(rows: list[dict], key_field: str, value_field: str,
     Si se pasa `fecha_field`, arma además un historial {key: {valor: [fechas]}}
     con las fechas de pago registradas por valor, usado por
     _sugerir_por_cadencia para las llaves que sigan ambiguas.
+
+    Devuelve también `valores_no_vacios` ({key: set(valores crudos)}) — el
+    conjunto COMPLETO de candidatos vistos para cada llave, sin importar si
+    quedó ambigua o no. Lo usa el árbitro de cartera preventiva (Fase 3.6)
+    para armar la lista de candidatos reales de una llave ambigua (no solo
+    el valor que "ganó" el BUSCARV).
     """
     lookup: dict = {}
     valores_no_vacios: dict[str, set] = {}
@@ -374,7 +557,7 @@ def _build_lookup(rows: list[dict], key_field: str, value_field: str,
             # corresponde, se deja como ambigüedad real para revisión manual.
             ambiguos.add(key)
 
-    return lookup, ambiguos, historial
+    return lookup, ambiguos, historial, valores_no_vacios
 
 
 def main():
@@ -408,19 +591,51 @@ def main():
     wompi_rows   = select_all(supabase_url, srk, 'cartera_ingresos_wompi',
                                select='email,inscrip,fecha')
     stripe_rows  = select_all(supabase_url, srk, 'cartera_ingresos_stripe_usa',
-                               select='email_cliente,incp,fecha')
+                               select='email_cliente,incp,nombre_cliente,fecha')
 
-    lookup_inscrip, ambiguos_inscrip, _                   = _build_lookup(
+    lookup_inscrip, ambiguos_inscrip, _, valores_inscrip       = _build_lookup(
         inscrip_rows, 'numero_id', 'id_inscripcion', preferir_sufijo_financiero=True)
-    lookup_bc2576, ambiguos_bc2576, historial_bc2576      = _build_lookup(
+    lookup_bc2576, ambiguos_bc2576, historial_bc2576, valores_bc2576 = _build_lookup(
         bc2576_rows, 'referencia_1', 'incp', fecha_field='fecha')
-    lookup_wompi, ambiguos_wompi, historial_wompi         = _build_lookup(
+    lookup_wompi, ambiguos_wompi, historial_wompi, valores_wompi     = _build_lookup(
         wompi_rows, 'email', 'inscrip', lower=True, fecha_field='fecha')
-    lookup_stripe, ambiguos_stripe, historial_stripe      = _build_lookup(
+    lookup_stripe, ambiguos_stripe, historial_stripe, valores_stripe = _build_lookup(
         stripe_rows, 'email_cliente', 'incp', lower=True, fecha_field='fecha')
 
     log.info('Referencias cargadas: inscrip=%d, bc2576=%d, wompi=%d, stripe=%d',
               len(lookup_inscrip), len(lookup_bc2576), len(lookup_wompi), len(lookup_stripe))
+
+    # Fase 3.1-3.3: estructuras auxiliares para el cruce de Stripe por doble
+    # señal correo+nombre (ver _cruzar_stripe). nombre_cliente ya viene
+    # reparado de mojibake desde utils/excel_cartera.py (_cell_str).
+    nombre_cliente_por_email_stripe: dict[str, str] = {}
+    emails_stripe: set[str] = set()
+    candidatos_nombre_stripe: list[tuple[str, str]] = []
+    for row in stripe_rows:
+        email = str(row.get('email_cliente') or '').strip().lower()
+        nombre_cliente = row.get('nombre_cliente') or ''
+        if email:
+            emails_stripe.add(email)
+            if email not in nombre_cliente_por_email_stripe:
+                nombre_cliente_por_email_stripe[email] = nombre_cliente
+        if nombre_cliente:
+            candidatos_nombre_stripe.append((nombre_cliente, str(row.get('incp') or '').strip()))
+
+    # Fase 3.6: inscripciones con al menos una cuota SIN pago identificado en
+    # cartera_preventiva — el árbitro solo puede elegir entre estas (ver
+    # _tiene_deuda_pendiente). "resuelta" = tiene fecha_pago; no toca a
+    # cartera_preventiva ni requiere que cruzar_cartera_preventiva.py haya
+    # corrido en este mismo ciclo (usa el estado tal cual está ahora mismo).
+    preventiva_rows_arbitro = select_all(supabase_url, srk, 'cartera_preventiva',
+                                          select='inscrip,fecha_pago')
+    bases_con_deuda: set[str] = set()
+    for r in preventiva_rows_arbitro:
+        if r.get('fecha_pago') is not None:
+            continue
+        insc = str(r.get('inscrip') or '').strip()
+        if insc:
+            bases_con_deuda.add(_normalizar_sufijo(insc) or insc)
+    log.info('%d inscripciones (base) con al menos una cuota sin pago identificado.', len(bases_con_deuda))
 
     sa_json = os.environ.get('GOOGLE_SA_JSON', '')
     wompi_reporte_folder_id = os.environ.get('WOMPI_REPORTE_DRIVE_FOLDER_ID', '')
@@ -445,8 +660,103 @@ def main():
     transacciones = [t for t in transacciones if t.get('matching_key') not in llaves_terminadas]
     log.info('%d transacciones a cruzar.', len(transacciones))
 
-    resultado = []
+    log.info('Cargando pagos_apartados y patrones de cesantías...')
+    apartados_rows = select_all(supabase_url, srk, 'pagos_apartados',
+                                 select='matching_key,tipo,incp_resuelto')
+    apartados_map = {r['matching_key']: r for r in apartados_rows}
+    patrones_cesantias = {
+        r['descripcion'] for r in select_all(supabase_url, srk, 'cesantias_patrones', select='descripcion')
+        if r.get('descripcion')
+    }
+
+    nuevas_apartadas = []
     for t in transacciones:
+        mk = t.get('matching_key')
+        if mk in apartados_map:
+            continue
+        identification = str(t.get('identification') or '').strip()
+        email          = str(t.get('email') or '').strip()
+        if _es_pago_llave(identification, email):
+            tipo = 'pago_llave'
+        elif _es_cesantias(t.get('transaction_code_1'), patrones_cesantias):
+            tipo = 'cesantias'
+        else:
+            continue
+        nuevas_apartadas.append({
+            'matching_key':       mk,
+            'tipo':               tipo,
+            'origen':             'automatico',
+            'es_pago_unico':      False,
+            'incp_resuelto':      None,
+            'aparicion':          None,
+            'fecha_ingreso':      t.get('registration_date'),
+            'val':                None,
+            'identification':     t.get('identification'),
+            'payment_date':       t.get('payment_date'),
+            'transaction_code_1': t.get('transaction_code_1'),
+            'transaction_code_2': t.get('transaction_code_2'),
+            'email':              t.get('email'),
+            'payment_method':     t.get('payment_method'),
+            'program':            t.get('program'),
+            'phone':              t.get('phone'),
+            'payment_amount':     t.get('payment_amount'),
+        })
+        apartados_map[mk] = {'matching_key': mk, 'tipo': tipo, 'incp_resuelto': None}
+
+    if nuevas_apartadas:
+        upsert_pagos_apartados(supabase_url, srk, nuevas_apartadas)
+        n_cesantias = sum(1 for a in nuevas_apartadas if a['tipo'] == 'cesantias')
+        n_llave     = sum(1 for a in nuevas_apartadas if a['tipo'] == 'pago_llave')
+        log.info('%d pago(s) apartados automáticamente (cesantias=%d, pago_llave=%d).',
+                  len(nuevas_apartadas), n_cesantias, n_llave)
+
+    excluir_sin_incp    = {mk for mk, info in apartados_map.items() if not info.get('incp_resuelto')}
+    reintegrar_con_incp = {mk: info['incp_resuelto'] for mk, info in apartados_map.items()
+                            if info.get('incp_resuelto')}
+
+    llaves_en_cruce = {r['matching_key'] for r in existentes}
+    a_borrar = [mk for mk in excluir_sin_incp if mk in llaves_en_cruce]
+    if a_borrar:
+        delete_by_keys(supabase_url, srk, 'cruce_cartera', 'matching_key', a_borrar)
+        log.info('%d fila(s) borradas de cruce_cartera por quedar apartadas (retroactivo).', len(a_borrar))
+
+    transacciones_activas, filas_reintegradas = [], []
+    for t in transacciones:
+        mk = t.get('matching_key')
+        if mk in excluir_sin_incp:
+            continue
+        if mk in reintegrar_con_incp:
+            filas_reintegradas.append(t)
+        else:
+            transacciones_activas.append(t)
+
+    log.info('%d transacciones activas, %d apartadas sin INCP, %d reintegradas con INCP forzado.',
+              len(transacciones_activas), len(excluir_sin_incp), len(filas_reintegradas))
+
+    resultado = []
+    for t in filas_reintegradas:
+        resultado.append({
+            'matching_key':       t.get('matching_key'),
+            'identification':     t.get('identification'),
+            'registration_date':  t.get('registration_date'),
+            'payment_date':       t.get('payment_date'),
+            'transaction_code_1': t.get('transaction_code_1'),
+            'transaction_code_2': t.get('transaction_code_2'),
+            'email':              t.get('email'),
+            'payment_method':     t.get('payment_method'),
+            'program':            t.get('program'),
+            'phone':              t.get('phone'),
+            'payment_amount':     t.get('payment_amount'),
+            'incp':               reintegrar_con_incp[t.get('matching_key')],
+            'correo_2':           None,
+            'nombre':             None,
+            'metodo_de_pago':     None,
+            'ci':                 None,
+            'excepcion_motivo':   None,
+            'estado_cruce':       'cruzado',
+        })
+
+    for t in transacciones_activas:
         identification = str(t.get('identification') or '').strip()
         email          = str(t.get('email') or '').strip()
         email_lower    = email.lower()
@@ -458,22 +768,21 @@ def main():
         correo_2            = ''
         correo_2_ambiguo    = False
         correo_2_historial  = {}
+        stripe_pendiente_incp    = False
+        stripe_confirmado_nombre = False
         if payment_method == 'BANCOLOMBIA':
-            if email in NITS_CESANTIAS:
-                correo_2           = CESANTIAS_LABEL
-                correo_2_ambiguo   = False
-                correo_2_historial = {}
-            else:
-                correo_2           = lookup_bc2576.get(email, '')
-                correo_2_ambiguo   = email in ambiguos_bc2576
-                correo_2_historial = historial_bc2576.get(email, {})
+            correo_2           = lookup_bc2576.get(email, '')
+            correo_2_ambiguo   = email in ambiguos_bc2576
+            correo_2_historial = historial_bc2576.get(email, {})
         elif payment_method.startswith('WOMPI'):
             correo_2           = lookup_wompi.get(email_lower, '')
             correo_2_ambiguo   = email_lower in ambiguos_wompi
             correo_2_historial = historial_wompi.get(email_lower, {})
         elif payment_method == 'STRIPE_USA':
-            correo_2           = lookup_stripe.get(email_lower, '')
-            correo_2_ambiguo   = email_lower in ambiguos_stripe
+            card_name = str(t.get('transaction_code_1') or '')
+            correo_2, correo_2_ambiguo, stripe_pendiente_incp, stripe_confirmado_nombre = _cruzar_stripe(
+                card_name, email_lower, lookup_stripe, ambiguos_stripe,
+                nombre_cliente_por_email_stripe, emails_stripe, candidatos_nombre_stripe)
             correo_2_historial = historial_stripe.get(email_lower, {})
 
         if correo_2_ambiguo:
@@ -487,7 +796,7 @@ def main():
         # desde Ingresos PSE y PAYU.xlsx — misma inscripción, dos hojas). Ya
         # NO se marcan como cruce_discrepante entre sí (misma base), pero sin
         # esto se guardaban/mostraban distinto pese a ser el mismo número.
-        if (incp and correo_2 and correo_2 != CESANTIAS_LABEL
+        if (incp and correo_2
                 and incp != correo_2 and _normalizar_sufijo(incp) == _normalizar_sufijo(correo_2)):
             if _tiene_sufijo_financiero(incp) and not _tiene_sufijo_financiero(correo_2):
                 correo_2 = incp
@@ -517,18 +826,60 @@ def main():
             else:
                 metodo_de_pago = PAGOS_MANUALES_LABEL
 
+        # Fase 3.6: cartera preventiva como árbitro del INCP. SOLO desempata
+        # filas que YA iban a quedar cruce_ambiguo (2+ candidatos) — un cruce
+        # limpio de 1 solo candidato nunca pasa por acá, y una fila ya
+        # 'cruzado' tampoco (queda fuera de transacciones_activas). Candidatos
+        # = unión de lo que trajo el lookup por documento (INCP) y por correo
+        # (CORREO(2)), filtrados a los que tienen cuota pendiente; si queda
+        # exactamente uno, gana — aunque contradiga el valor que había en
+        # incp/correo_2 (ver "caso conflicto" en la spec).
+        if incp_ambiguo or correo_2_ambiguo:
+            candidatos_doc = valores_inscrip.get(identification, set())
+            if payment_method == 'BANCOLOMBIA':
+                candidatos_correo = valores_bc2576.get(email, set())
+            elif payment_method.startswith('WOMPI'):
+                candidatos_correo = valores_wompi.get(email_lower, set())
+            elif payment_method == 'STRIPE_USA':
+                candidatos_correo = valores_stripe.get(email_lower, set())
+            else:
+                candidatos_correo = set()
+
+            candidatos = _normalizar_candidatos(candidatos_doc | candidatos_correo)
+            candidatos_con_deuda = {c for c in candidatos if _tiene_deuda_pendiente(c, bases_con_deuda)}
+
+            if len(candidatos_con_deuda) == 1:
+                ganador = next(iter(candidatos_con_deuda))
+                incp, correo_2 = ganador, ganador
+                incp_ambiguo, correo_2_ambiguo = False, False
+            # 2+ o 0 candidatos con deuda: sin cambio, sigue cruce_ambiguo
+            # (ya lo era) — ver puntos 4 y 5 de la regla.
+
         if incp_ambiguo or correo_2_ambiguo:
             excepcion_motivo, estado_cruce = 'cruce_ambiguo', 'pendiente'
-        elif (incp and correo_2 and correo_2 != CESANTIAS_LABEL
+        elif (incp and correo_2
               and _normalizar_sufijo(incp) != _normalizar_sufijo(correo_2)):
             excepcion_motivo, estado_cruce = 'cruce_discrepante', 'pendiente'
         elif not incp and not correo_2:
-            excepcion_motivo, estado_cruce = 'sin_cruce', 'pendiente'
+            # Stripe (3.3): el correo/nombre encontró fila en STRIPE_USA pero
+            # esa fila todavía no tiene INCP asignado — no es lo mismo que no
+            # encontrar nada, se resuelve solo cuando el equipo llene el
+            # Excel. Motivo propio, no 'sin_cruce'.
+            if stripe_pendiente_incp:
+                excepcion_motivo, estado_cruce = 'pendiente_asignar_incp', 'pendiente'
+            else:
+                excepcion_motivo, estado_cruce = 'sin_cruce', 'pendiente'
         elif not incp and correo_2:
             # Solo CORREO(2) identificó, sin confirmación de INCP — señal más
             # débil (regla del 14 de julio: INCP solo SÍ cierra 'cruzado' sin
             # problema, CORREO(2) solo NO, queda para revisión manual).
-            excepcion_motivo, estado_cruce = 'cruce_unico', 'pendiente'
+            # Excepción (3.1): Stripe con doble señal correo+nombre confirmada
+            # SÍ cierra 'cruzado' directo — el nombre del pagador coincide con
+            # NOMBRE CLIENTE de la fila que encontró el correo.
+            if stripe_confirmado_nombre:
+                excepcion_motivo, estado_cruce = None, 'cruzado'
+            else:
+                excepcion_motivo, estado_cruce = 'cruce_unico', 'pendiente'
         else:
             excepcion_motivo, estado_cruce = None, 'cruzado'
 

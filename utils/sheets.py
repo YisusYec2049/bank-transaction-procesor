@@ -8,10 +8,6 @@ import pytz
 log = logging.getLogger(__name__)
 
 
-def _col_letter(idx: int) -> str:
-    return chr(ord('A') + idx)
-
-
 def get_yesterday_keys(sheets, spreadsheet_id: str) -> set[str]:
     """Devuelve las matching_keys del tab más reciente anterior a hoy."""
     meta = sheets.spreadsheets().get(
@@ -86,21 +82,6 @@ def ensure_tab(sheets, spreadsheet_id: str, tab_name: str, headers: list) -> Non
     log.info('Tab "%s" creada con cabecera.', tab_name)
 
 
-def ensure_cheques_header(sheets, cheques_sheet_id: str, headers: list) -> None:
-    resp = sheets.spreadsheets().values().get(
-        spreadsheetId=cheques_sheet_id, range="'Hoja 1'!A1:A1"
-    ).execute()
-    if resp.get('values'):
-        return
-    sheets.spreadsheets().values().update(
-        spreadsheetId=cheques_sheet_id,
-        range="'Hoja 1'!A1",
-        valueInputOption='RAW',
-        body={'values': [headers]},
-    ).execute()
-    log.info('Cabecera escrita en CHEQUES_PENDIENTES.')
-
-
 def append_rows(sheets, spreadsheet_id: str, tab_name: str, rows: list[list]) -> None:
     sheets.spreadsheets().values().append(
         spreadsheetId=spreadsheet_id,
@@ -110,37 +91,3 @@ def append_rows(sheets, spreadsheet_id: str, tab_name: str, rows: list[list]) ->
         body={'values': rows},
     ).execute()
     log.info('Escritas %d filas en tab "%s".', len(rows), tab_name)
-
-
-def read_cheques(sheets, cheques_sheet_id: str) -> list[list]:
-    resp = sheets.spreadsheets().values().get(
-        spreadsheetId=cheques_sheet_id,
-        range="'Hoja 1'!A1:M",
-    ).execute()
-    return resp.get('values', [])
-
-
-def write_pendientes(sheets, cheques_sheet_id: str, rows: list[list]) -> None:
-    sheets.spreadsheets().values().append(
-        spreadsheetId=cheques_sheet_id,
-        range="'Hoja 1'!A1",
-        valueInputOption='RAW',
-        insertDataOption='INSERT_ROWS',
-        body={'values': [[*r, 'PENDIENTE'] for r in rows]},
-    ).execute()
-    log.info('Cheques PENDIENTE escritos: %d', len(rows))
-
-
-def mark_conciliado(sheets, cheques_sheet_id: str, actualizaciones: list[dict]) -> None:
-    data = [
-        {
-            'range': f"'Hoja 1'!{_col_letter(a['estado_col'])}{a['row_index']}",
-            'values': [['CONCILIADO']],
-        }
-        for a in actualizaciones
-    ]
-    sheets.spreadsheets().values().batchUpdate(
-        spreadsheetId=cheques_sheet_id,
-        body={'valueInputOption': 'RAW', 'data': data},
-    ).execute()
-    log.info('Cheques marcados CONCILIADO: %d', len(actualizaciones))

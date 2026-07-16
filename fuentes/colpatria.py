@@ -16,9 +16,9 @@ Filtros:
   [8] payment_amount      ← Valor Crédito (float)
   [9] matching_key        ← {DD/MM/YYYY}_{valor_js}_{identificacion}
 
-Los cheques se detectan por 'CHEQUE' en la descripción:
-  - Se insertan en Supabase cheques_pendientes como PENDIENTE
-  - También se incluyen en consolidated_transactions
+Los cheques se detectan por 'CHEQUE' en la descripción (transaction_code_1) y
+se apartan del proceso por completo — nunca entran a consolidated_transactions
+ni al cruce (ver pagos_apartados en procesar_todos.py).
 """
 
 import csv
@@ -149,13 +149,12 @@ def normalize(raw_rows: list[dict]) -> list[list]:
     ]
 
 
-def cheque_logic(normalized_rows, _pendientes_raw):
-    """
-    Para Colpatria los cheques se registran en Supabase cheques_pendientes
-    pero también van al consolidado (no esperan conciliación manual).
-    procesar_todos.py se encarga de hacer el upsert_cheque.
-    """
-    normales = [r for r in normalized_rows if 'CHEQUE' not in str(r[2]).upper()]
-    cheques  = [r for r in normalized_rows if 'CHEQUE'     in str(r[2]).upper()]
-    # conciliados = cheques (van al consolidado igual)
-    return normales, [], cheques, []
+def cheque_logic(normalized_rows: list[list]) -> tuple[list, list]:
+    """Separa cheques del resto. Los cheques se apartan del proceso por
+    completo (nunca entran al consolidado ni al cruce — ver pagos_apartados
+    en procesar_todos.py). Antes se comparaba por error contra payment_date
+    (índice 2) en vez de transaction_code_1 (índice 3, la descripción), así
+    que ningún cheque se detectaba nunca (bug de Fase 1.1)."""
+    normales = [r for r in normalized_rows if 'CHEQUE' not in str(r[3]).upper()]
+    cheques  = [r for r in normalized_rows if 'CHEQUE'     in str(r[3]).upper()]
+    return normales, cheques

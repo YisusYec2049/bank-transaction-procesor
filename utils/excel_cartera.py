@@ -12,6 +12,22 @@ from utils.parser import parse_valor, valor_str
 log = logging.getLogger(__name__)
 
 
+def reparar_mojibake(s: str) -> str:
+    """Repara texto UTF-8 mal decodificado como cp1252 (ej. 'JosÃ©' -> 'José'),
+    visto en los nombres de la hoja STRIPE_USA (hallazgo del 16 de julio: sin
+    esto ninguna comparación por nombre funciona con tildes o ñ). Se aplica
+    en _cell_str para TODAS las hojas — no se había verificado si el problema
+    también afecta a otras (WOMPI, BC2576, Inscrip, Cartera Preventiva), y el
+    chequeo ('Ã'/'Â' en el texto) no cuesta nada cuando el texto ya viene
+    limpio."""
+    if 'Ã' in s or 'Â' in s:
+        try:
+            return s.encode('cp1252').decode('utf-8')
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            pass
+    return s
+
+
 def _cell_str(v) -> str:
     if v is None:
         return ''
@@ -19,7 +35,7 @@ def _cell_str(v) -> str:
         return valor_str(v)
     if isinstance(v, int):
         return str(v)
-    return str(v).strip()
+    return reparar_mojibake(str(v).strip())
 
 
 def _cell_float(v) -> float | None:
@@ -167,11 +183,18 @@ def read_wompi(path: str | BinaryIO) -> list[dict]:
 
 
 def read_stripe_usa(path: str | BinaryIO) -> list[dict]:
-    """Ingresos PSE y PAYU.xlsx → hoja STRIPE_USA. [{email_cliente, incp, fecha}, ...].
+    """Ingresos PSE y PAYU.xlsx → hoja STRIPE_USA.
+    [{email_cliente, incp, nombre_cliente, fecha}, ...].
 
     La primera columna de esta hoja no trae un encabezado utilizable (celda A1
     es texto suelto, no un nombre de columna), pero sus datos son siempre la
-    fecha/hora del pago — se captura por posición (índice 0), no por nombre."""
+    fecha/hora del pago — se captura por posición (índice 0), no por nombre.
+
+    `nombre_cliente` (16 de julio, D.2) también se captura por posición
+    (índice 4, "NOMBRE CLIENTE") en vez de por header: la hoja tiene una
+    SEGUNDA columna llamada "nombre" (índice 16, distinta) que confundiría
+    una búsqueda por nombre de columna. Se usa para el cierre de Stripe por
+    doble señal (correo + nombre) en cruzar.py."""
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
     try:
         ws = wb['STRIPE_USA']
@@ -183,9 +206,10 @@ def read_stripe_usa(path: str | BinaryIO) -> list[dict]:
             if not email:
                 continue
             rows.append({
-                'email_cliente': email,
-                'incp':          _cell_str(row[cols['incp']]),
-                'fecha':         _cell_date(row[0]),
+                'email_cliente':  email,
+                'incp':           _cell_str(row[cols['incp']]),
+                'nombre_cliente': _cell_str(row[4]) if len(row) > 4 else '',
+                'fecha':          _cell_date(row[0]),
             })
         log.info('STRIPE_USA (Ingresos): %d filas leídas.', len(rows))
         return rows
