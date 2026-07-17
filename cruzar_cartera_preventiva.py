@@ -36,15 +36,10 @@ fondo respecto a las versiones anteriores de este script:
   - `cartera_preventiva_overrides` (cierre manual desde la UI) se respeta:
     una cuota con `cerrado_manual=true` nunca entra a la cascada ni se
     toca acá.
-  - Tolerancia de redondeo ±100 pesos (confirmado por el usuario): un saldo
-    de $100 o menos se considera cuota cubierta, no genera línea nueva —
-    los desfases de 1-2 pesos en WOMPI son redondeo real (Sistema
-    Financiero vs. lo que cobró el link), no error.
   - `correo_elec` (4.6): si el pago es WOMPI automático (encontrado en
     ReportePagosWompi, `cruce_cartera.metodo_de_pago` distinto de
     "PAGOS MANUALES") se muestra "WOMPI (Automático Genera Link)" en vez
-    del correo. Si además hay SOBRANTE, se concatena con " | " (confirmado
-    por el usuario).
+    del correo.
   - `fecha_cruce` (4.7): se llena con la fecha de esta corrida en toda cuota
     que la corrida toque (cierre o línea nueva de saldo se deja sin fecha
     hasta que reciba su propio pago).
@@ -69,25 +64,42 @@ de esa cuota. Se recalcula sobre TODOS los pagos cruzados en cada corrida
 completo, incluidas asociaciones de corridas anteriores. Puramente
 informativo — no toca estado_cruce/excepcion_motivo de cruce_cartera.
 
-Fase 8 del rediseño (bloque G "Montos", 16 de julio) — montos exactos del
-excedente, sobre la línea de cierre ya existente (4.4/8.1 no son la misma
-cosa: 4.4 es SALDO, cuando falta plata; 8.1 es EXCEDENTE, cuando sobra):
-  - `valor_pago` de la ÚLTIMA cuota que un pago toca deja de ser solo el
-    monto de esa cuota — pasa a ser lo que realmente llegó (su parte +
-    el excedente sin cuota registrada), para que la suma de `valor_pago`
-    de todas las cuotas que tocó un pago sea igual al monto de la
-    transacción (nada se pierde ni se duplica).
-  - `diferencia` puede ser positiva ahora (antes solo 0 o negativa): saldo
-    a favor cuando sobró plata.
-  - `notificacion` (columna nueva, `sql/014`): etiqueta de excedente
-    ('1 CUOTA + ABONO', '2 CUOTAS + ABONO', 'PAGA DOS CUOTAS', ...) o NULL
-    si el excedente es ruido de redondeo (< $50.000, ver
-    `_calcular_notificacion`). Campo aparte, no reemplaza nada —
-    `correo_elec` y su texto SOBRANTE siguen igual, así que el filtro de
-    financial-platform (`correo_elec ilike '%SOBRANTE%'`) no se toca.
-  - Nada se redondea (8.3): la tolerancia ±100 sigue aplicando solo al
-    SALDO (4.4), nunca al excedente — un excedente de $1 da
-    `diferencia = +1`, no 0 (la etiqueta ya filtra ese ruido).
+Sobrantes, Excedentes y Condonación (17 de julio) — REEMPLAZA la Fase 8
+("bloque G Montos": `_calcular_notificacion`, tolerancia ±100, texto
+"SOBRANTE $X sin cuota registrada" en `correo_elec`). Ver
+`~/Documents/Y15U5/Spec - Sobrantes-Excedentes (matching-test).md`.
+
+Modelo: cada inscripción está en modo A (en curso, default) o modo B
+(última cuota — activado a mano por un humano en financial-platform,
+`cartera_preventiva_overrides.es_ultima_cuota`). La aplicación INICIAL de
+un pago es SIEMPRE modo A (§4.3) — el humano marca B recién después de ver
+el resultado en pantalla. El paso a modo B (o el regreso a A si se apaga el
+flag) lo hace un paso de RECONCILIACIÓN aparte (§4.4), en la corrida
+siguiente, que resetea la inscripción completa y la reprocesa desde cero
+con el modo correcto.
+
+La tolerancia de redondeo ±100 se ELIMINA — los montos son exactos, lo que
+sobre o falte (aunque sea $1) se clasifica según la matriz:
+
+| Situación (tras FIFO)      | Modo A (no es última)          | Modo B (es última)     |
+|-----------------------------|---------------------------------|--------------------------|
+| Falta < $50.000             | diferencia negativa, sin línea  | CONDONAR (notif=CONDONADO, sin línea) |
+| Falta = $50.000 exacto      | cierra dif=0 + línea nueva      | CONDONAR                |
+| Falta > $50.000             | cierra dif=0 + línea nueva      | cierra dif=0 + línea nueva (igual que A) |
+| Sobra >= $1                 | SOBRANTE: crédito a cartera_saldos_favor, notif=SOBRANTE, NO se suma a valor_pago | EXCEDENTE: se suma a valor_pago, diferencia positiva, notif=EXCEDENTE |
+
+`cartera_saldos_favor` (tabla nueva, `sql/017`) guarda esos créditos — se
+anteponen como pagos sintéticos (ordenados por fecha, más viejo primero) en
+la próxima corrida que toque esa misma inscripción, y se consumen por FIFO
+igual que un pago real. Un crédito, una vez que entra a una cascada, se da
+por completamente consumido (`aplicado=true`) — si sobra algo tras esa
+cascada, ese remanente se registra como un crédito NUEVO (misma mecánica de
+excedente), nunca se deja el crédito viejo "parcialmente" vigente.
+
+`notificacion` se reusa (ya existía desde `sql/014`, Fase 8): ahora solo
+tres valores posibles — 'CONDONADO' / 'SOBRANTE' / 'EXCEDENTE' — o NULL
+(cierre limpio, o faltante en modo A < $50.000, identificable por
+`diferencia < 0`).
 
 BUG CRÍTICO corregido (16 de julio, tarde) — Fase 4 nunca había aplicado un
 pago en producción desde su deploy: `pago_asociaciones` en 0 filas,
@@ -131,7 +143,8 @@ from dotenv import load_dotenv
 from utils.parser import normalizar_nit, normalizar_sufijo
 from utils.supabase import (select_all, delete_by_keys, update_cruce_valores,
                              upsert_cartera_preventiva, insert_cartera_preventiva_lineas,
-                             upsert_pago_asociaciones)
+                             upsert_pago_asociaciones, upsert_cartera_saldos_favor,
+                             marcar_saldos_favor_aplicados)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -141,38 +154,19 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# Confirmado por el usuario el 16 de julio.
-TOLERANCIA_REDONDEO = 100
 WOMPI_LINK_LABEL = 'WOMPI (Automático Genera Link)'
 PAGOS_MANUALES_LABEL = 'PAGOS MANUALES'
 _FECHA_MAX = '9999-12-31'
 
-# Fase 8 (bloque G, 16 de julio): umbral de excedente "real" vs. ruido de
-# redondeo, validado contra los 26 excedentes de producción — el mayor por
-# debajo es $45.000, el menor por encima es $192.349, no hay nada en el
-# medio.
-UMBRAL_NOTIFICACION = 50000
-_NUMEROS_LETRAS = {2: 'DOS', 3: 'TRES', 4: 'CUATRO', 5: 'CINCO', 6: 'SEIS'}
-
-
-def _calcular_notificacion(valor_cuota: float, excedente: float) -> str | None:
-    """Fase 8.2: etiqueta de excedente para la última cuota que lo absorbe.
-    `n` = cuántas cuotas ENTERAS MÁS cubre el excedente (además de la que se
-    está cerrando, que ya cuenta por su cuenta); `resto` = lo que sobra
-    después de esas. Ninguna de las dos variables se redondea (8.3) — el
-    ruido de redondeo lo filtra el umbral, no un round()."""
-    if valor_cuota <= 0 or excedente <= 0:
-        return None
-    n = int(excedente // valor_cuota)
-    resto = round(excedente - (n * valor_cuota), 2)
-    if n >= 1 and resto >= UMBRAL_NOTIFICACION:
-        return f'{n + 1} CUOTAS + ABONO'
-    if n >= 1:
-        cuotas = n + 1
-        return f'PAGA {_NUMEROS_LETRAS.get(cuotas, cuotas)} CUOTAS'
-    if excedente >= UMBRAL_NOTIFICACION:
-        return '1 CUOTA + ABONO'
-    return None
+# Sobrantes/Excedentes (17 de julio): umbral que separa "ruido de redondeo"
+# de "deuda/sobrante real", validado contra los 26 excedentes reales de
+# producción — el mayor por debajo es $45.000, el menor por encima es
+# $192.349, no hay nada en el medio. Se usa con distinta estrictitud según
+# el modo: A dispara línea nueva con `>=` (falta exacta de $50.000 YA es
+# demasiada para dejarla como simple diferencia); B dispara CONDONAR con
+# `<=` (una falta de exactamente $50.000, siendo la última cuota, se
+# perdona).
+UMBRAL_LINEA_NUEVA = 50000
 
 
 def _normalizar_documento(valor) -> str:
@@ -198,40 +192,79 @@ def _correo_elec_para(pago: dict) -> str:
 
 def _generar_llave_saldo(llave_base: str, matching_key: str) -> str:
     """Llave DETERMINÍSTICA para la línea de saldo pendiente de un pago
-    parcial (Fase 4.4), derivada del `matching_key` del pago que la origina
-    — no de "buscar el primer sufijo libre" (bug crítico corregido el 16 de
-    julio, tarde: esa búsqueda nunca era estable entre corridas. Si el
-    mismo pago se reprocesaba tras un fallo a mitad de la escritura —ver
-    docstring de "Orden de escritura" en main()—, el sufijo "(saldo)" ya
-    estaba ocupado por el intento anterior y se generaba uno nuevo cada
-    vez, produciendo una línea de saldo distinta por cada reintento en vez
-    de reusar la misma — así se generaron las 74 filas basura encadenadas
-    "(saldo 9)"/"(saldo 32)"/"(saldo 15)" de la corrida real). Con la llave
-    derivada del pago, reprocesar el MISMO pago siempre calcula la MISMA
-    llave, y el upsert por `llave` en insert_cartera_preventiva_lineas
-    actualiza esa fila en vez de crear una nueva — colisión estructuralmente
-    imposible entre pagos distintos, porque matching_key ya es único por
-    diseño en todo el sistema."""
+    parcial, derivada del `matching_key` del pago que la origina — no de
+    "buscar el primer sufijo libre" (bug crítico corregido el 16 de julio,
+    tarde: esa búsqueda nunca era estable entre corridas. Si el mismo pago
+    se reprocesaba tras un fallo a mitad de la escritura —ver docstring de
+    "Orden de escritura" en main()—, el sufijo "(saldo)" ya estaba ocupado
+    por el intento anterior y se generaba uno nuevo cada vez, produciendo
+    una línea de saldo distinta por cada reintento en vez de reusar la
+    misma — así se generaron las 74 filas basura encadenadas "(saldo
+    9)"/"(saldo 32)"/"(saldo 15)" de la corrida real). Con la llave derivada
+    del pago, reprocesar el MISMO pago siempre calcula la MISMA llave, y el
+    upsert por `llave` en insert_cartera_preventiva_lineas actualiza esa
+    fila en vez de crear una nueva — colisión estructuralmente imposible
+    entre pagos distintos, porque matching_key ya es único por diseño en
+    todo el sistema."""
     return f'{llave_base} (saldo {matching_key})'
 
 
-def _aplicar_pagos_inscripcion(cuotas_abiertas: list[dict], pagos_nuevos: list[dict],
-                                tolerancia: float = TOLERANCIA_REDONDEO):
-    """FIFO de pagos_nuevos (ordenados por payment_date) contra
-    cuotas_abiertas (ordenadas por fecha_vencimiento) de UNA sola
-    inscripción (4.1). Cada cuota tocada se resuelve por completo en esta
-    misma pasada: si el pago no la cubre del todo (más allá de la
-    tolerancia), se cierra por lo recibido y el resto queda para una línea
-    nueva (4.4) — no se deja "abierta" esperando un pago futuro.
+def _fila_reset(cuota_id) -> dict:
+    """Dict de reset a NULL de las columnas de resultado del cruce para una
+    cuota — reusado tanto por el reset de asociaciones huérfanas como por la
+    reconciliación de modo A/B (§4.4)."""
+    return {'id': cuota_id, 'fecha_pago': None, 'medio_pago': None, 'valor_pago': None,
+            'codigo_transaccion_1': None, 'codigo_transaccion_2': None, 'correo_elec': None,
+            'diferencia': None, 'fecha_cruce': None, 'notificacion': None}
+
+
+def _mismatch_a_b(cuota_frontera: dict, lineas_saldo: list[dict]) -> bool:
+    """True si la cuota marcada `es_ultima_cuota` todavía muestra un
+    resultado calculado en modo A (SOBRANTE, diferencia negativa sin
+    CONDONADO, o una línea de saldo <= UMBRAL_LINEA_NUEVA que en modo B
+    debería haberse condonado en vez de generar línea nueva) — dispara el
+    reset + reproceso en modo_final=True (§4.4)."""
+    if cuota_frontera.get('notificacion') == 'SOBRANTE':
+        return True
+    diferencia = cuota_frontera.get('diferencia')
+    if diferencia is not None and diferencia < 0 and cuota_frontera.get('notificacion') != 'CONDONADO':
+        return True
+    for linea in lineas_saldo:
+        if float(linea.get('valor_cuota') or 0) <= UMBRAL_LINEA_NUEVA:
+            return True
+    return False
+
+
+def _mismatch_b_a(cuota: dict) -> bool:
+    """True si una cuota NO marcada `es_ultima_cuota` todavía muestra un
+    resultado de modo B (CONDONADO/EXCEDENTE) — el toggle se apagó, dispara
+    reset + reproceso en modo_final=False (§4.4)."""
+    return cuota.get('notificacion') in ('CONDONADO', 'EXCEDENTE')
+
+
+def _aplicar_pagos_inscripcion(cuotas_abiertas: list[dict], pagos_nuevos: list[dict]):
+    """FIFO de pagos_nuevos (ordenados por payment_date — los créditos
+    sintéticos de cartera_saldos_favor entran mezclados aquí, con su propia
+    fecha, así que naturalmente se consumen primero si son más viejos que
+    el resto) contra cuotas_abiertas (ordenadas por fecha_vencimiento) de
+    UNA sola inscripción. Montos EXACTOS (17 de julio, se elimina la
+    tolerancia ±100 que existía antes): una cuota solo se considera cerrada
+    cuando el acumulado la cubre por completo, ni un peso menos.
+
+    Cada cuota tocada se resuelve por completo en esta misma pasada: si el
+    dinero disponible no la cubre del todo, se cierra por lo recibido y el
+    resto queda para que `_procesar_inscripcion` decida, según la matriz
+    A/B, si eso es una simple diferencia negativa, una línea nueva o un
+    CONDONADO.
 
     Devuelve (cierres, parcial, asociaciones, excedente):
       - cierres: [{'cuota', 'monto_aplicado', 'ultimo_pago'}] cuotas
-        cubiertas del todo (dentro de tolerancia).
+        cubiertas EXACTAMENTE.
       - parcial: misma forma, o None — la ÚLTIMA cuota tocada que se quedó
-        sin pagos para completarla (genera línea de saldo). A lo sumo una.
+        sin dinero para completarla. A lo sumo una.
       - asociaciones: [{'matching_key', 'cuota_id', 'monto'}].
       - excedente: plata que sobró tras cubrir TODAS las cuotas conocidas
-        de la inscripción (SOBRANTE, informativo)."""
+        de la inscripción (SOBRANTE/EXCEDENTE, según el modo)."""
     cuotas_ordenadas = sorted(cuotas_abiertas, key=lambda c: c.get('fecha_vencimiento') or _FECHA_MAX)
     pagos_ordenados = sorted(pagos_nuevos, key=lambda p: p.get('payment_date') or _FECHA_MAX)
 
@@ -252,7 +285,7 @@ def _aplicar_pagos_inscripcion(cuotas_abiertas: list[dict], pagos_nuevos: list[d
             valor_cuota = float(cuota.get('valor_cuota') or 0)
             ya = acumulado.get(cuota_id, 0.0)
             saldo = valor_cuota - ya
-            if saldo <= tolerancia:
+            if saldo <= 0:
                 idx += 1
                 continue
             aplicar = min(restante, saldo)
@@ -260,7 +293,7 @@ def _aplicar_pagos_inscripcion(cuotas_abiertas: list[dict], pagos_nuevos: list[d
             ultimo_pago_por_cuota[cuota_id] = pago
             asociaciones.append({'matching_key': matching_key, 'cuota_id': cuota_id, 'monto': round(aplicar, 2)})
             restante -= aplicar
-            if valor_cuota - acumulado[cuota_id] <= tolerancia:
+            if valor_cuota - acumulado[cuota_id] <= 0:
                 idx += 1
         if restante > 0:
             excedente += restante
@@ -273,7 +306,7 @@ def _aplicar_pagos_inscripcion(cuotas_abiertas: list[dict], pagos_nuevos: list[d
         monto = acumulado[cuota_id]
         valor_cuota = float(cuota.get('valor_cuota') or 0)
         info = {'cuota': cuota, 'monto_aplicado': monto, 'ultimo_pago': ultimo_pago_por_cuota[cuota_id]}
-        if valor_cuota - monto <= tolerancia:
+        if valor_cuota - monto <= 0:
             cierres.append(info)
         else:
             parcial = info
@@ -286,17 +319,11 @@ def _fila_cierre(info: dict, hoy: str, cerrar_al_monto_recibido: bool = False) -
     terminan en `actualizaciones_cierre` se postean juntas en un solo POST
     (`upsert_cartera_preventiva`, un array JSON) — y PostgREST exige que
     cada objeto de ese array tenga exactamente el mismo set de claves, o
-    responde 400 (`PGRST102: All object keys must match`). Antes, un cierre
-    normal devolvía 9 claves, uno con `cerrar_al_monto_recibido=True` (el de
-    un pago parcial) devolvía 11 (agregaba valor_cuota/valor_a_cobrar), y el
-    bloque de excedente (Fase 8) le agregaba `notificacion` a una sola fila
-    — cualquier corrida que mezclara dos de estas formas en el mismo batch
-    rompía TODO el batch (ninguna cuota se cerraba, aunque el log dijera
-    "actualizado"). Ahora esta función siempre devuelve el mismo set de
-    claves; para las que no cambian de verdad (`valor_cuota`/
-    `valor_a_cobrar` en un cierre normal), se manda el valor QUE YA TIENE la
-    cuota — nunca None, porque None SÍ los borraría (es un upsert real, no
-    un no-op)."""
+    responde 400 (`PGRST102: All object keys must match`). Esta función
+    siempre devuelve el mismo set de claves; para las que no cambian de
+    verdad (`valor_cuota`/`valor_a_cobrar` en un cierre normal), se manda el
+    valor QUE YA TIENE la cuota — nunca None, porque None SÍ los borraría
+    (es un upsert real, no un no-op)."""
     cuota = info['cuota']
     ultimo_pago = info['ultimo_pago']
     monto = round(info['monto_aplicado'], 2)
@@ -312,9 +339,9 @@ def _fila_cierre(info: dict, hoy: str, cerrar_al_monto_recibido: bool = False) -
         'notificacion':         None,
     }
     if cerrar_al_monto_recibido:
-        # 4.4: la cuota ORIGINAL de un pago parcial se ajusta a lo
-        # realmente recibido (no al monto original) y queda cerrada con
-        # diferencia=0 — el saldo real pasa a la línea nueva.
+        # La cuota ORIGINAL de un pago parcial que sí genera línea nueva se
+        # ajusta a lo realmente recibido (no al monto original) y queda
+        # cerrada con diferencia=0 — el saldo real pasa a la línea nueva.
         fila['valor_cuota']    = monto
         fila['valor_a_cobrar'] = monto
         fila['diferencia']     = 0
@@ -352,6 +379,150 @@ def _fila_linea_saldo(parcial: dict, nueva_llave: str) -> dict:
     }
 
 
+def _procesar_inscripcion(cuotas_inscripcion: list[dict], pagos_para: list[dict],
+                           creditos_para: list[dict], modo_final: bool, hoy: str):
+    """Corre el FIFO (créditos de cartera_saldos_favor como pagos sintéticos,
+    mezclados con los pagos reales) de UNA inscripción y arma las filas de
+    escritura según la matriz A/B (ver docstring del módulo, sección
+    "Sobrantes, Excedentes y Condonación").
+
+    `modo_final=False` (modo A) es lo único que usa el flujo normal (§4.3,
+    "la aplicación inicial de un pago es SIEMPRE modo A"). `modo_final=True`
+    (modo B) solo lo llama la reconciliación (§4.4), sobre una inscripción
+    ya reseteada por completo.
+
+    No escribe nada en Supabase — solo calcula. Devuelve:
+      (cierres_filas, linea_nueva_o_None, asociaciones, ids_creditos_a_marcar_aplicados, saldo_favor_nuevo_o_None)
+    """
+    pagos_sinteticos = [{
+        'matching_key':        c['matching_key'],
+        'payment_date':        c.get('fecha'),
+        'payment_amount':      c['monto'],
+        'payment_method':      None,
+        'transaction_code_1':  None,
+        'transaction_code_2':  None,
+        'email':               None,
+        'metodo_de_pago':      None,
+    } for c in creditos_para]
+
+    cierres, parcial, asociaciones, excedente = _aplicar_pagos_inscripcion(
+        cuotas_inscripcion, pagos_sinteticos + pagos_para)
+
+    cierres_filas = [_fila_cierre(info, hoy) for info in cierres]
+    linea_nueva = None
+
+    if parcial:
+        cuota = parcial['cuota']
+        s = round(float(cuota.get('valor_cuota') or 0) - parcial['monto_aplicado'], 2)
+        crea_linea = (s >= UMBRAL_LINEA_NUEVA) if not modo_final else (s > UMBRAL_LINEA_NUEVA)
+        if crea_linea:
+            fila = _fila_cierre(parcial, hoy, cerrar_al_monto_recibido=True)
+            cierres_filas.append(fila)
+            nueva_llave = _generar_llave_saldo(cuota['llave'], parcial['ultimo_pago']['matching_key'])
+            linea_nueva = _fila_linea_saldo(parcial, nueva_llave)
+        else:
+            fila = _fila_cierre(parcial, hoy, cerrar_al_monto_recibido=False)
+            if modo_final:
+                fila['notificacion'] = 'CONDONADO'
+            cierres_filas.append(fila)
+
+    saldo_favor_nuevo = None
+    if excedente > 0 and cierres_filas:
+        # El excedente lo absorbe la ÚLTIMA cuota que toca el pago (nunca la
+        # parcial: excedente y parcial son mutuamente excluyentes dentro de
+        # una misma llamada — si sobra plata es porque TODAS las cuotas ya
+        # se cerraron, ver docstring de _aplicar_pagos_inscripcion).
+        ultima_fila = cierres_filas[-1]
+        valor_cuota_ultima = float(cierres[-1]['cuota'].get('valor_cuota') or 0)
+        if modo_final:
+            ultima_fila['valor_pago'] = round(ultima_fila['valor_pago'] + excedente, 2)
+            ultima_fila['diferencia'] = round(ultima_fila['valor_pago'] - valor_cuota_ultima, 2)
+            ultima_fila['notificacion'] = 'EXCEDENTE'
+        else:
+            ultima_fila['notificacion'] = 'SOBRANTE'
+            ultimo_pago = cierres[-1]['ultimo_pago']
+            saldo_favor_nuevo = {
+                'inscrip':      cierres[-1]['cuota'].get('inscrip'),
+                'cliente':      cierres[-1]['cuota'].get('cliente'),
+                'monto':        round(excedente, 2),
+                'llave_origen': cierres[-1]['cuota']['llave'],
+                'matching_key': ultimo_pago['matching_key'],
+                'fecha':        ultimo_pago.get('payment_date'),
+                'aplicado':     False,
+            }
+
+    # Un crédito que entra a una cascada se da por completamente consumido
+    # (aplicado=true) — si sobra algo tras la cascada, ese remanente ya
+    # quedó registrado arriba como un crédito NUEVO (saldo_favor_nuevo).
+    ids_creditos_aplicados = [c['id'] for c in creditos_para]
+
+    return cierres_filas, linea_nueva, asociaciones, ids_creditos_aplicados, saldo_favor_nuevo
+
+
+def _reconciliar_inscripcion(supabase_url, srk, doc, inscripcion_base, modo_objetivo, hoy,
+                              cuotas_insc, lineas_saldo, llaves_cerradas_manual,
+                              asociaciones_vigentes, creditos_rows, pagos_cruzados, llave_por_id,
+                              actualizaciones_cierre, lineas_nuevas, nuevas_asociaciones,
+                              saldos_favor_nuevos, creditos_a_marcar_aplicados):
+    """§4.4: resetea POR COMPLETO una inscripción (asociaciones automáticas,
+    créditos, líneas de saldo sintéticas, columnas de resultado de sus
+    cuotas) y la reprocesa desde cero con `modo_objetivo` (True=B, False=A)
+    — nunca reutiliza créditos ni asociaciones viejas, para no arrastrar
+    estado mixto entre los dos modos. Las cuotas con `cerrado_manual=true`
+    en overrides se dejan intactas (mismo criterio que en el flujo normal:
+    nunca entran a la cascada)."""
+    cuotas_normales = [
+        c for c in cuotas_insc
+        if c not in lineas_saldo and c.get('llave') not in llaves_cerradas_manual
+    ]
+    llaves_insc = {c['llave'] for c in cuotas_insc}
+
+    ids_asoc_borrar = [a['id'] for a in asociaciones_vigentes
+                        if a['llave'] in llaves_insc and a.get('origen') == 'automatico']
+    if ids_asoc_borrar:
+        delete_by_keys(supabase_url, srk, 'pago_asociaciones', 'id', ids_asoc_borrar)
+        asociaciones_vigentes[:] = [a for a in asociaciones_vigentes if a['id'] not in ids_asoc_borrar]
+
+    creditos_insc = [c for c in creditos_rows if _base_inscripcion(c.get('inscrip')) == inscripcion_base]
+    if creditos_insc:
+        delete_by_keys(supabase_url, srk, 'cartera_saldos_favor', 'id', [c['id'] for c in creditos_insc])
+        ids_creditos_borrar = {c['id'] for c in creditos_insc}
+        creditos_rows[:] = [c for c in creditos_rows if c['id'] not in ids_creditos_borrar]
+
+    if lineas_saldo:
+        delete_by_keys(supabase_url, srk, 'cartera_preventiva', 'id', [c['id'] for c in lineas_saldo])
+
+    reset_rows = [_fila_reset(c['id']) for c in cuotas_normales]
+    if reset_rows:
+        upsert_cartera_preventiva(supabase_url, srk, reset_rows)
+    for c in cuotas_normales:
+        c['fecha_pago'] = None
+        c['diferencia'] = None
+        c['notificacion'] = None
+
+    pagos_insc = [p for p in pagos_cruzados if _base_inscripcion(p.get('incp')) == inscripcion_base]
+
+    cierres_filas, linea_nueva, asociaciones, ids_creditos_ok, saldo_favor = _procesar_inscripcion(
+        cuotas_normales, pagos_insc, [], modo_objetivo, hoy)
+
+    actualizaciones_cierre.extend(cierres_filas)
+    if linea_nueva:
+        lineas_nuevas.append(linea_nueva)
+    for a in asociaciones:
+        nuevas_asociaciones.append({
+            'matching_key': a['matching_key'],
+            'llave':        llave_por_id[a['cuota_id']],
+            'monto':        a['monto'],
+            'origen':       'automatico',
+        })
+    if saldo_favor:
+        saldos_favor_nuevos.append(saldo_favor)
+    creditos_a_marcar_aplicados.extend(ids_creditos_ok)
+
+    log.info('Reconciliada inscripción %s (doc %s) -> modo %s: %d cierre(s), %d asociación(es).',
+              inscripcion_base, doc, 'B' if modo_objetivo else 'A', len(cierres_filas), len(asociaciones))
+
+
 def main():
     load_dotenv()
 
@@ -366,21 +537,38 @@ def main():
 
     log.info('Cargando overrides y asociaciones existentes...')
     overrides_rows = select_all(supabase_url, srk, 'cartera_preventiva_overrides',
-                                 select='llave,cerrado_manual')
+                                 select='llave,cerrado_manual,es_ultima_cuota')
     llaves_cerradas_manual = {r['llave'] for r in overrides_rows if r.get('cerrado_manual')}
+    es_ultima_llaves = {r['llave'] for r in overrides_rows if r.get('es_ultima_cuota')}
 
     asociaciones_rows = select_all(supabase_url, srk, 'pago_asociaciones',
-                                    select='id,matching_key,llave')
+                                    select='id,matching_key,llave,origen')
 
     log.info('Cargando cartera_preventiva...')
     cuotas_rows = select_all(
         supabase_url, srk, 'cartera_preventiva',
         select='id,llave,cruce_access,fecha_vencimiento,valor_cuota,valor_a_cobrar,inscrip,'
-               'cliente,sistema_financiero,moneda,programa,fecha_pago',
+               'cliente,sistema_financiero,moneda,programa,fecha_pago,diferencia,notificacion',
     )
     id_por_llave      = {c['llave']: c['id'] for c in cuotas_rows if c.get('llave')}
-    llave_por_id       = {c['id']: c['llave'] for c in cuotas_rows}
+    llave_por_id      = {c['id']: c['llave'] for c in cuotas_rows}
     cliente_por_llave = {c['llave']: c.get('cliente') for c in cuotas_rows if c.get('llave')}
+
+    cuotas_por_doc_todas: dict[str, list[dict]] = {}
+    for c in cuotas_rows:
+        doc = _normalizar_documento(c.get('cruce_access'))
+        if doc:
+            cuotas_por_doc_todas.setdefault(doc, []).append(c)
+    doc_por_inscripcion: dict[str, str] = {}
+    for doc, cuotas in cuotas_por_doc_todas.items():
+        for c in cuotas:
+            base = _base_inscripcion(c.get('inscrip'))
+            if base:
+                doc_por_inscripcion.setdefault(base, doc)
+
+    log.info('Cargando créditos a favor (cartera_saldos_favor)...')
+    creditos_rows = select_all(supabase_url, srk, 'cartera_saldos_favor',
+                                select='id,inscrip,cliente,monto,llave_origen,matching_key,fecha,aplicado')
 
     log.info('Cargando cruce_cartera (solo estado_cruce=cruzado)...')
     pagos_rows = select_all(
@@ -405,28 +593,90 @@ def main():
                 ids_a_borrar.append(r['id'])
 
         delete_by_keys(supabase_url, srk, 'pago_asociaciones', 'id', ids_a_borrar)
-        reset_rows = [
-            {'id': id_por_llave[llave], 'fecha_pago': None, 'medio_pago': None, 'valor_pago': None,
-             'codigo_transaccion_1': None, 'codigo_transaccion_2': None, 'correo_elec': None,
-             'diferencia': None, 'fecha_cruce': None, 'notificacion': None}
-            for llave in llaves_a_resetear if llave in id_por_llave
-        ]
+        reset_rows = [_fila_reset(id_por_llave[llave]) for llave in llaves_a_resetear if llave in id_por_llave]
         upsert_cartera_preventiva(supabase_url, srk, reset_rows)
         # Reflejar el reset en la copia local para que esta misma corrida
         # ya considere estas cuotas como pendientes.
         for c in cuotas_rows:
             if c.get('llave') in llaves_a_resetear:
                 c['fecha_pago'] = None
+                c['diferencia'] = None
+                c['notificacion'] = None
         log.info('%d asociación(es) huérfana(s) borradas, %d cuota(s) reseteada(s) para reproceso.',
                   len(ids_a_borrar), len(reset_rows))
 
     asociaciones_vigentes = [r for r in asociaciones_rows if r['id'] not in ids_a_borrar]
-    matching_keys_ya_asociados = {r['matching_key'] for r in asociaciones_vigentes}
-    llaves_por_pago: dict[str, list[str]] = {}
-    for r in asociaciones_vigentes:
-        llaves_por_pago.setdefault(r['matching_key'], []).append(r['llave'])
 
-    # 4.1/4.2: cuotas pendientes = sin pago identificado y sin cierre manual.
+    # §4.4 — Reconciliación de modo A/B (es_ultima_cuota), AL INICIO, antes
+    # de procesar pagos nuevos (ver docstring del módulo, "Sobrantes,
+    # Excedentes y Condonación"). Los outputs se acumulan en las mismas
+    # listas que usa el flujo normal §4.3, para escribirse juntos al final.
+    actualizaciones_cierre: list[dict] = []
+    lineas_nuevas: list[dict] = []
+    nuevas_asociaciones: list[dict] = []
+    saldos_favor_nuevos: list[dict] = []
+    creditos_a_marcar_aplicados: list[int] = []
+    docs_reconciliados: set[str] = set()
+
+    log.info('Reconciliando modo A/B (es_ultima_cuota)...')
+    for llave in es_ultima_llaves:
+        cuota_id = id_por_llave.get(llave)
+        if cuota_id is None:
+            continue
+        cuota_frontera = next((c for c in cuotas_rows if c['id'] == cuota_id), None)
+        if not cuota_frontera or cuota_frontera.get('fecha_pago') is None:
+            continue  # todavía no la toca ningún pago, nada que reconciliar
+        doc = _normalizar_documento(cuota_frontera.get('cruce_access'))
+        inscripcion_base = _base_inscripcion(cuota_frontera.get('inscrip'))
+        if not doc or not inscripcion_base or doc in docs_reconciliados:
+            continue
+        cuotas_insc = [c for c in cuotas_por_doc_todas.get(doc, [])
+                       if _base_inscripcion(c.get('inscrip')) == inscripcion_base]
+        lineas_saldo = [c for c in cuotas_insc if ' (saldo' in (c.get('llave') or '')]
+        if _mismatch_a_b(cuota_frontera, lineas_saldo):
+            _reconciliar_inscripcion(
+                supabase_url, srk, doc, inscripcion_base, True, hoy,
+                cuotas_insc, lineas_saldo, llaves_cerradas_manual,
+                asociaciones_vigentes, creditos_rows, pagos_cruzados, llave_por_id,
+                actualizaciones_cierre, lineas_nuevas, nuevas_asociaciones,
+                saldos_favor_nuevos, creditos_a_marcar_aplicados,
+            )
+            docs_reconciliados.add(doc)
+
+    for cuota in list(cuotas_rows):
+        llave = cuota.get('llave') or ''
+        if not llave or llave in es_ultima_llaves or ' (saldo' in llave:
+            continue
+        if not _mismatch_b_a(cuota):
+            continue
+        doc = _normalizar_documento(cuota.get('cruce_access'))
+        inscripcion_base = _base_inscripcion(cuota.get('inscrip'))
+        if not doc or not inscripcion_base or doc in docs_reconciliados:
+            continue
+        cuotas_insc = [c for c in cuotas_por_doc_todas.get(doc, [])
+                       if _base_inscripcion(c.get('inscrip')) == inscripcion_base]
+        lineas_saldo = [c for c in cuotas_insc if ' (saldo' in (c.get('llave') or '')]
+        _reconciliar_inscripcion(
+            supabase_url, srk, doc, inscripcion_base, False, hoy,
+            cuotas_insc, lineas_saldo, llaves_cerradas_manual,
+            asociaciones_vigentes, creditos_rows, pagos_cruzados, llave_por_id,
+            actualizaciones_cierre, lineas_nuevas, nuevas_asociaciones,
+            saldos_favor_nuevos, creditos_a_marcar_aplicados,
+        )
+        docs_reconciliados.add(doc)
+
+    if docs_reconciliados:
+        log.info('%d inscripción(es) reconciliadas (cambio de modo A/B).', len(docs_reconciliados))
+
+    # matching_keys "reclamados": lo que ya venía de antes MÁS lo que la
+    # reconciliación acaba de calcular (todavía no persistido en Supabase,
+    # pero sí en `nuevas_asociaciones`) — evita que el flujo normal §4.3
+    # vuelva a tocar esos mismos pagos con modo_final=False y deshaga lo
+    # que la reconciliación acaba de resolver.
+    matching_keys_ya_asociados = {r['matching_key'] for r in asociaciones_vigentes}
+    matching_keys_ya_asociados.update(a['matching_key'] for a in nuevas_asociaciones)
+
+    # §4.1/4.2: cuotas pendientes = sin pago identificado y sin cierre manual.
     cuotas_pendientes = [
         c for c in cuotas_rows
         if c.get('fecha_pago') is None and c.get('llave') not in llaves_cerradas_manual
@@ -453,13 +703,27 @@ def main():
         if doc and p.get('payment_amount'):
             pagos_nuevos_por_doc.setdefault(doc, []).append(p)
 
-    actualizaciones_cierre: list[dict] = []
-    lineas_nuevas: list[dict] = []
-    nuevas_asociaciones: list[dict] = []
+    # Créditos pendientes de consumir (excluye los que la reconciliación
+    # acaba de borrar/recrear más arriba) — se anteponen a los pagos nuevos
+    # de la misma inscripción como pagos sintéticos (§4.3), aunque ese
+    # documento no tenga NINGÚN pago nuevo esta corrida (el crédito puede
+    # estar esperando a que llegue una cuota nueva del próximo archivo de
+    # Cartera Preventiva).
+    creditos_pendientes = [c for c in creditos_rows if not c.get('aplicado')]
+    creditos_por_doc: dict[str, list[dict]] = {}
+    for cr in creditos_pendientes:
+        base = _base_inscripcion(cr.get('inscrip'))
+        doc = doc_por_inscripcion.get(base)
+        if doc:
+            creditos_por_doc.setdefault(doc, []).append(cr)
+
     docs_2_mas_inscripciones = 0
     docs_procesados = 0
+    docs_a_procesar = set(pagos_nuevos_por_doc) | set(creditos_por_doc)
 
-    for doc, pagos_doc in pagos_nuevos_por_doc.items():
+    for doc in docs_a_procesar:
+        if doc in docs_reconciliados:
+            continue
         inscripciones = inscripciones_por_doc.get(doc, set())
         if not inscripciones:
             continue  # el documento no tiene ninguna cuota pendiente conocida
@@ -476,46 +740,26 @@ def main():
             if _base_inscripcion(c.get('inscrip')) == inscripcion_objetivo
         ]
         pagos_para_inscripcion = [
-            p for p in pagos_doc
+            p for p in pagos_nuevos_por_doc.get(doc, [])
             if _base_inscripcion(p.get('incp')) == inscripcion_objetivo
         ]
-        if not pagos_para_inscripcion:
+        creditos_para_inscripcion = [
+            c for c in creditos_por_doc.get(doc, [])
+            if _base_inscripcion(c.get('inscrip')) == inscripcion_objetivo
+        ]
+        if not pagos_para_inscripcion and not creditos_para_inscripcion:
             continue
 
-        cierres, parcial, asociaciones, excedente = _aplicar_pagos_inscripcion(
-            cuotas_inscripcion, pagos_para_inscripcion)
+        # Flujo normal (§4.3): SIEMPRE modo A — el humano recién marca modo
+        # B después de ver el resultado; la reconciliación (§4.4, arriba) es
+        # la única que llama esto con modo_final=True.
+        cierres_filas, linea_nueva, asociaciones, ids_creditos_ok, saldo_favor = _procesar_inscripcion(
+            cuotas_inscripcion, pagos_para_inscripcion, creditos_para_inscripcion,
+            modo_final=False, hoy=hoy)
 
-        cierres_doc = [_fila_cierre(info, hoy) for info in cierres]
-        if parcial:
-            cierres_doc.append(_fila_cierre(parcial, hoy, cerrar_al_monto_recibido=True))
-            matching_key_parcial = parcial['ultimo_pago']['matching_key']
-            nueva_llave = _generar_llave_saldo(parcial['cuota']['llave'], matching_key_parcial)
-            lineas_nuevas.append(_fila_linea_saldo(parcial, nueva_llave))
-
-        if excedente > 0 and cierres_doc:
-            # 8.1: el excedente lo absorbe la ÚLTIMA cuota que toca el pago
-            # (nunca la parcial: excedente y parcial son mutuamente
-            # excluyentes dentro de una misma llamada a
-            # _aplicar_pagos_inscripcion — si sobra plata es porque TODAS
-            # las cuotas ya se cerraron). valor_pago pasa a ser lo que
-            # realmente llegó a esa cuota (su parte + el excedente) y
-            # diferencia queda positiva (saldo a favor) en vez de 0. Nada se
-            # redondea (8.3): la tolerancia ±100 solo decide si una cuota se
-            # cierra, nunca se aplica al excedente.
-            ultima_fila = cierres_doc[-1]
-            valor_cuota_ultima = float(cierres[-1]['cuota'].get('valor_cuota') or 0)
-            ultima_fila['valor_pago'] = round(ultima_fila['valor_pago'] + excedente, 2)
-            ultima_fila['diferencia'] = round(ultima_fila['valor_pago'] - valor_cuota_ultima, 2)
-            # La clave 'notificacion' ya existe en ultima_fila (default None,
-            # ver _fila_cierre) — asignar directo, sin guardia, mantiene el
-            # set de claves sin cambios sin importar si hay etiqueta o no.
-            ultima_fila['notificacion'] = _calcular_notificacion(valor_cuota_ultima, excedente)
-
-            monto_fmt = f'{excedente:,.0f}'.replace(',', '.')
-            correo_original = ultima_fila['correo_elec'] or ''
-            ultima_fila['correo_elec'] = f'{correo_original} | SOBRANTE ${monto_fmt} sin cuota registrada'.strip(' |')
-
-        actualizaciones_cierre.extend(cierres_doc)
+        actualizaciones_cierre.extend(cierres_filas)
+        if linea_nueva:
+            lineas_nuevas.append(linea_nueva)
         for a in asociaciones:
             nuevas_asociaciones.append({
                 'matching_key': a['matching_key'],
@@ -523,47 +767,41 @@ def main():
                 'monto':        a['monto'],
                 'origen':       'automatico',
             })
+        if saldo_favor:
+            saldos_favor_nuevos.append(saldo_favor)
+        creditos_a_marcar_aplicados.extend(ids_creditos_ok)
         docs_procesados += 1
 
     log.info('%d documento(s) procesados, %d con 2+ inscripciones debiendo (sin auto-aplicar).',
               docs_procesados, docs_2_mas_inscripciones)
 
-    # Orden de escritura — INVERTIDO el 16 de julio (tarde) tras un bug real
-    # en producción. El orden anterior (líneas -> cierres -> asociaciones)
-    # razonaba al revés: decía que escribir la asociación al final hacía que
-    # "un reintento reprocese limpio", pero pago_asociaciones es exactamente
-    # lo que le dice a la PRÓXIMA corrida "este pago ya se procesó, no lo
-    # toques de nuevo" (ver matching_keys_ya_asociados arriba). Si eso se
-    # escribe al final y algo falla ANTES (ej. el 400 de PGRST102, ver
-    # _fila_cierre), el reintento recalcula desde cero contra un
-    # cartera_preventiva que YA cambió por el intento anterior — el mismo
-    # pago se reaplica sobre una cuota distinta y genera OTRA línea de saldo
-    # en cada corrida (así se generaron las 74 filas basura "(saldo N)"
-    # encadenadas de la corrida real; pago_asociaciones se quedó en 0 filas
-    # todo ese tiempo).
-    #
-    # Ahora: asociaciones PRIMERO. En cuanto esa escritura confirma, el pago
-    # queda reclamado para siempre — un fallo posterior en líneas/cierres ya
-    # no se repite en cada corrida (deja como mucho UNA inconsistencia
-    # acotada entre pago_asociaciones y cartera_preventiva, detectable y
-    # reparable a mano, en vez de duplicación infinita). No es una
-    # transacción real — Supabase REST no soporta transacciones multi-tabla
-    # desde el cliente — así que sigue existiendo una ventana de fallo
-    # parcial; lo que cambia es que ya no se agrava solo con cada reintento.
+    # Orden de escritura (ver docstring del módulo, bug crítico 16/07):
+    # asociaciones y créditos "reclamados" PRIMERO — en cuanto esas
+    # escrituras confirman, el pago/crédito queda reclamado para siempre y
+    # un fallo posterior en líneas/cierres/saldos nuevos ya no se repite en
+    # cada corrida.
     if nuevas_asociaciones:
         upsert_pago_asociaciones(supabase_url, srk, nuevas_asociaciones)
+    if creditos_a_marcar_aplicados:
+        marcar_saldos_favor_aplicados(supabase_url, srk, creditos_a_marcar_aplicados)
     if lineas_nuevas:
         insert_cartera_preventiva_lineas(supabase_url, srk, lineas_nuevas)
     if actualizaciones_cierre:
         batch_size = 500
         for i in range(0, len(actualizaciones_cierre), batch_size):
             upsert_cartera_preventiva(supabase_url, srk, actualizaciones_cierre[i:i + batch_size])
+    if saldos_favor_nuevos:
+        upsert_cartera_saldos_favor(supabase_url, srk, saldos_favor_nuevos)
 
     log.info('cruzar_cartera_preventiva.py: %d cuota(s) cerradas, %d línea(s) de saldo nuevas, '
-              '%d asociación(es) nuevas.',
-              len(actualizaciones_cierre), len(lineas_nuevas), len(nuevas_asociaciones))
+              '%d asociación(es) nuevas, %d crédito(s) nuevo(s), %d crédito(s) consumido(s).',
+              len(actualizaciones_cierre), len(lineas_nuevas), len(nuevas_asociaciones),
+              len(saldos_favor_nuevos), len(creditos_a_marcar_aplicados))
 
     # Cruce a la inversa (informativo, ver docstring del módulo).
+    llaves_por_pago: dict[str, list[str]] = {}
+    for r in asociaciones_vigentes:
+        llaves_por_pago.setdefault(r['matching_key'], []).append(r['llave'])
     for a in nuevas_asociaciones:
         llaves_por_pago.setdefault(a['matching_key'], []).append(a['llave'])
 

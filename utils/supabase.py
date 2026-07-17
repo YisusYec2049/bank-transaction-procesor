@@ -172,8 +172,10 @@ def sync_cartera_preventiva(supabase_url: str, service_role_key: str, rows: list
     cruzar_cartera_preventiva.py (contienen " (saldo" en el texto, ver
     _generar_llave_saldo) — no existen en ningún Excel, así que sin esto se
     borrarían solas en el primer sync después de crearse; y llaves con
-    cerrado_manual=true en cartera_preventiva_overrides — una cuota cerrada
-    a mano no debe desaparecer si el Excel deja de traerla.
+    cerrado_manual=true o es_ultima_cuota=true en cartera_preventiva_overrides
+    — una cuota cerrada a mano, o marcada como la última de su inscripción
+    (Sobrantes/Excedentes, 17 de julio), no debe desaparecer ni perder su
+    badge/estado si el Excel deja de traerla.
     """
     vistas: set[str] = set()
     deduped = []
@@ -204,8 +206,9 @@ def sync_cartera_preventiva(supabase_url: str, service_role_key: str, rows: list
     llaves_actuales = {r['llave'] for r in existentes if r.get('llave')}
 
     overrides_cerrados = select_all(supabase_url, service_role_key, 'cartera_preventiva_overrides',
-                                     select='llave,cerrado_manual')
-    llaves_protegidas = {r['llave'] for r in overrides_cerrados if r.get('cerrado_manual')}
+                                     select='llave,cerrado_manual,es_ultima_cuota')
+    llaves_protegidas = {r['llave'] for r in overrides_cerrados
+                          if r.get('cerrado_manual') or r.get('es_ultima_cuota')}
 
     llaves_a_borrar = [
         k for k in (llaves_actuales - vistas)
@@ -330,6 +333,45 @@ def upsert_pagos_apartados(supabase_url: str, service_role_key: str, rows: list[
     )
     _raise_for_status(resp)
     log.info('Upsert pagos_apartados OK: %d registros, HTTP %s.', len(rows), resp.status_code)
+
+
+def upsert_cartera_saldos_favor(supabase_url: str, service_role_key: str, rows: list[dict]) -> None:
+    """Upsert por (matching_key, llave_origen) a cartera_saldos_favor
+    (Sobrantes/Excedentes, 17 de julio): crédito a favor de una inscripción
+    generado por un SOBRANTE (modo A) — se consumirá contra una cuota
+    futura de la MISMA inscripción, antepuesto como pago sintético en
+    cruzar_cartera_preventiva.py."""
+    if not rows:
+        return
+    hdrs = _headers(service_role_key, prefer='return=minimal,resolution=merge-duplicates')
+    resp = http.post(
+        f'{supabase_url}/rest/v1/cartera_saldos_favor?on_conflict=matching_key,llave_origen',
+        json=rows,
+        headers=hdrs,
+        timeout=30,
+    )
+    _raise_for_status(resp)
+    log.info('Upsert cartera_saldos_favor OK: %d registros.', len(rows))
+
+
+def marcar_saldos_favor_aplicados(supabase_url: str, service_role_key: str, ids: list[int]) -> None:
+    """PATCH por id: marca aplicado=true en cartera_saldos_favor — el
+    crédito ya entró a una cascada y se dio por completo consumido (si
+    sobró algo, ese remanente vive en una fila NUEVA, ver
+    upsert_cartera_saldos_favor)."""
+    if not ids:
+        return
+    hdrs = _headers(service_role_key, prefer='return=minimal')
+    valores = ','.join(str(i) for i in ids)
+    resp = http.patch(
+        f'{supabase_url}/rest/v1/cartera_saldos_favor',
+        params={'id': f'in.({valores})'},
+        json={'aplicado': True},
+        headers=hdrs,
+        timeout=30,
+    )
+    _raise_for_status(resp)
+    log.info('cartera_saldos_favor: %d crédito(s) marcados aplicado=true.', len(ids))
 
 
 def delete_by_keys(supabase_url: str, service_role_key: str, table: str,
