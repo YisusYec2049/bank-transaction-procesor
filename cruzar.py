@@ -105,32 +105,58 @@ Filas ya resueltas (estado_cruce = 'cruzado' o 'no_identificable') no se vuelven
 a tocar en corridas futuras, así una corrección manual o un "no identificable"
 marcado en financial-platform queda protegido.
 
-NOMBRE / MÉTODO DE PAGO / CI — WOMPI, todas las transacciones (13-14 de
-julio, corregido el 14): se lee ReportePagosWompi_*.xlsx directo de Drive en
-cada corrida (subcarpeta "wompi" dentro de Archivos Cruce,
-WOMPI_REPORTE_DRIVE_FOLDER_ID) — NO se sincroniza a ninguna tabla mirror, se
-arma el lookup en memoria y se descarta al terminar la corrida (decisión
-explícita del usuario: es un reporte de pagos del día para cruzar en el
-momento, no un dato de referencia que haga falta guardar).
+NOMBRE / MÉTODO DE PAGO / CI / VAL / PROGRAM — WOMPI LINK vs MANUAL (13-14 de
+julio, reescrito el 16 como Fase 9 del rediseño): se lee
+ReportePagosWompi_*.xlsx directo de Drive en cada corrida (subcarpeta "wompi"
+dentro de Archivos Cruce, WOMPI_REPORTE_DRIVE_FOLDER_ID) — NO se sincroniza a
+ninguna tabla mirror, se arma el lookup en memoria y se descarta al terminar
+la corrida (decisión explícita del usuario: es un reporte de pagos del día
+para cruzar en el momento, no un dato de referencia que haga falta guardar).
 
-Llave: `Documento` del reporte (prefijo "CC-"/"CEDULA_DE_EXTRANJERIA-" quitado)
-vs `identification`. Si hay match: NOMBRE ← Pagador, MÉTODO DE PAGO ← Método
-Pago (literal), CI ← Comprobante. Si no hay match: MÉTODO DE PAGO = "PAGOS
-MANUALES" (literal), NOMBRE/CI quedan vacíos.
+Llave: `Documento` del reporte (prefijo "CC-"/"CEDULA_DE_EXTRANJERIA-"
+quitado) vs `identification`. Si hay match (WOMPI LINK, 9.2): NOMBRE ←
+Pagador, MÉTODO DE PAGO = "WOMPI (Genera Link)" (literal, ya NO se lee del
+reporte), CI ← Comprobante, VAL ← Transaction Id (Wompi) (mismo formato que
+`id de la transaccion` del CSV de WOMPI), PROGRAM ← Proyecto — y el INCP del
+reporte (columna "Inscripción", casi siempre sin sufijo, ej. "3077") gana
+sobre el lookup por documento y por correo: se le busca la forma con sufijo
+en cartera_inscrip (ej. "3077PN", ver _resolver_incp_wompi_link) y, si
+resuelve sin ambigüedad, la fila cierra 'cruzado' directo — NO puede quedar
+'cruce_ambiguo'/'cruce_discrepante' por INCP. Si esa Inscripción no existe en
+Payu UC (o es ambigua entre PN/PJ), no se inventa nada: la fila queda
+'pendiente' con excepcion_motivo='pendiente_asignar_incp' (línea 25),
+_sin importar_ lo que el lookup normal (INCP/CORREO(2)/Fase 3.6) hubiera
+resuelto por su cuenta.
 
-**Puramente informativo — NO afecta estado_cruce/excepcion_motivo** (corregido
-14 de julio: el diseño original del 13 de julio decía que esto debía tener
-prioridad sobre INCP/CORREO(2) y bloquear el cierre; el usuario aclaró que no,
-que una fila solo sale de excepciones por INCP/CORREO(2), "PAGOS MANUALES" es
-solo un dato descriptivo). El excepcion_motivo 'sin_identificar_pagador' que
-se había agregado a la migración del CHECK constraint queda sin uso.
+Si NO hay match (WOMPI MANUAL, 9.3): se identifica por CORREO(2) contra la
+hoja WOMPI de "Ingresos PSE y PAYU" — comportamiento ya existente, sin
+cambios. MÉTODO DE PAGO = "PAGOS MANUALES" (literal), NOMBRE/CI/VAL quedan
+vacíos, PROGRAM queda vacío (el parser de WOMPI ya no lo llena, ver
+fuentes/wompi.py) — puramente informativo, no bloquea el cierre (sigue
+aplicando la asimetría del 14 de julio: CORREO(2) solo → cruce_unico).
+
+Re-evaluación de filas viejas (9.4, "línea 22"): las filas WOMPI que
+cruzaron ANTES del fix del 14 de julio (bug de "program vacío" que nunca
+dejaba correr la regla del reporte) quedaron cerradas 'cruzado' con
+"PAGOS MANUALES" siendo en realidad LINK. Al final de main() se recalculan
+los campos del reporte (val/nombre/metodo_de_pago/ci/program) + el INCP de
+9.2 sobre las filas WOMPI ya 'cruzado' cuyo documento SÍ aparece en el
+reporte de esta corrida — excepción acotada a "las filas terminales no se
+tocan": solo estos campos, nunca estado_cruce/excepcion_motivo, y solo si
+`corregido_manual=false` (si un humano la tocó desde financial-platform, no
+se pisa nunca). Limitación conocida y aceptada: el lookup solo cubre el
+período del reporte más reciente (no se rehace un histórico acumulado), así
+que esta re-evaluación solo alcanza filas viejas cuyo pago siga apareciendo
+en el archivo más reciente que se suba a Drive.
 
 Si el reporte no se pudo cargar en absoluto esta corrida (archivo no
 encontrado en Drive, o WOMPI_REPORTE_DRIVE_FOLDER_ID sin configurar), se
-omite esta regla por completo — NOMBRE/MÉTODO DE PAGO/CI quedan NULL para
-todas las transacciones WOMPI de esa corrida, sin afectar estado_cruce de
-ninguna forma (ya era informativo de por sí). El resto de bancos/pasarelas
-quedan fuera de alcance (diseño sin cerrar todavía).
+omite toda esta sección (LINK/MANUAL y la re-evaluación 9.4 por igual) —
+NOMBRE/MÉTODO DE PAGO/CI/VAL quedan NULL y PROGRAM vacío para todas las
+transacciones WOMPI de esa corrida, sin afectar estado_cruce de ninguna
+fila nueva (el resto de bancos/pasarelas quedan fuera de alcance, diseño sin
+cerrar todavía). El excepcion_motivo 'sin_identificar_pagador' de la
+migración del CHECK constraint sigue sin uso (ver cierre del 14 de julio).
 
 Stripe: cierre por doble señal correo+nombre, respaldo por nombre, excepción
 pendiente_asignar_incp (16 de julio, Fase 3.1-3.3 del rediseño):
@@ -179,7 +205,8 @@ from utils.drive import build_drive_service, find_latest_file, download_pdf as d
 from utils.excel_cartera import read_pagos_wompi_reporte
 from utils.parser import normalizar_nit as _normalizar_nit
 from utils.parser import normalizar_sufijo as _normalizar_sufijo
-from utils.supabase import select_all, upsert_cruce, upsert_pagos_apartados, delete_by_keys
+from utils.supabase import (select_all, upsert_cruce, upsert_pagos_apartados, delete_by_keys,
+                             update_cruce_valores)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -408,6 +435,7 @@ def _cruzar_stripe(card_name: str, email_lower: str, lookup_stripe: dict,
 
 WOMPI_REPORTE_PATTERN = 'ReportePagosWompi'
 PAGOS_MANUALES_LABEL  = 'PAGOS MANUALES'
+WOMPI_GENERA_LINK_LABEL = 'WOMPI (Genera Link)'
 _PREFIJOS_DOCUMENTO_WOMPI = ('CC-', 'CEDULA_DE_EXTRANJERIA-')
 
 
@@ -426,8 +454,9 @@ def _normalizar_documento_wompi(valor: str) -> str:
 
 def _cargar_lookup_wompi_reporte(sa_json: str, folder_id: str) -> tuple[dict[str, dict], bool]:
     """Lee el ReportePagosWompi_*.xlsx más reciente directo de Drive y arma
-    {documento_normalizado: {pagador, metodo_pago, comprobante}} en memoria —
-    no se guarda en ninguna tabla, se descarta al terminar la corrida.
+    {documento_normalizado: {pagador, comprobante, inscripcion, id_transaccion,
+    proyecto, fecha_pago}} en memoria — no se guarda en ninguna tabla, se
+    descarta al terminar la corrida.
     Primera coincidencia gana (mismo criterio BUSCARV que el resto del script).
 
     Devuelve (lookup, disponible). `disponible=False` significa que esta
@@ -456,6 +485,40 @@ def _cargar_lookup_wompi_reporte(sa_json: str, folder_id: str) -> tuple[dict[str
             lookup[doc] = fila
     log.info('ReportePagosWompi: %d documentos indexados (de %d filas).', len(lookup), len(filas))
     return lookup, True
+
+
+def _build_id_inscripcion_por_base(inscrip_rows: list[dict]) -> dict[str, set[str]]:
+    """Índice inverso de cartera_inscrip.id_inscripcion: número base (sin
+    sufijo PN/PJ) -> conjunto de valores completos vistos con esa base.
+    Usado por WOMPI LINK (Fase 9.2) para encontrar la forma con sufijo del
+    número de "Inscripción" que trae ReportePagosWompi (ej. "3077" ->
+    "3077PN")."""
+    resultado: dict[str, set[str]] = {}
+    for row in inscrip_rows:
+        val = str(row.get('id_inscripcion') or '').strip()
+        if not val:
+            continue
+        base = _normalizar_sufijo(val) or val
+        resultado.setdefault(base, set()).add(val)
+    return resultado
+
+
+def _resolver_incp_wompi_link(inscripcion_reporte: str,
+                               id_inscripcion_por_base: dict[str, set[str]]) -> str | None:
+    """Fase 9.2: dado el número de "Inscripción" que trae ReportePagosWompi
+    (ej. "3077", normalmente sin sufijo), busca su forma con sufijo en
+    cartera_inscrip (ej. "3077PN"). Si esa base no aparece en absoluto, o
+    aparece con 2+ valores reales distintos (ej. "3077PN" y "3077PJ", ambos
+    inscritos — ambigüedad real que el reporte no confirma), no se inventa
+    nada: devuelve None (línea 25 — queda pendiente_asignar_incp, no se
+    cierra)."""
+    base = _normalizar_sufijo(str(inscripcion_reporte or '').strip())
+    if not base:
+        return None
+    candidatos = id_inscripcion_por_base.get(base)
+    if candidatos and len(candidatos) == 1:
+        return next(iter(candidatos))
+    return None
 
 
 def _build_lookup(rows: list[dict], key_field: str, value_field: str,
@@ -595,6 +658,7 @@ def main():
 
     lookup_inscrip, ambiguos_inscrip, _, valores_inscrip       = _build_lookup(
         inscrip_rows, 'numero_id', 'id_inscripcion', preferir_sufijo_financiero=True)
+    id_inscripcion_por_base = _build_id_inscripcion_por_base(inscrip_rows)
     lookup_bc2576, ambiguos_bc2576, historial_bc2576, valores_bc2576 = _build_lookup(
         bc2576_rows, 'referencia_1', 'incp', fecha_field='fecha')
     lookup_wompi, ambiguos_wompi, historial_wompi, valores_wompi     = _build_lookup(
@@ -643,7 +707,10 @@ def main():
         sa_json, wompi_reporte_folder_id)
 
     log.info('Cargando estado_cruce existente...')
-    existentes = select_all(supabase_url, srk, 'cruce_cartera', select='matching_key,estado_cruce')
+    existentes = select_all(
+        supabase_url, srk, 'cruce_cartera',
+        select='matching_key,identification,payment_method,estado_cruce,corregido_manual',
+    )
     llaves_terminadas = {
         r['matching_key'] for r in existentes
         if r.get('estado_cruce') in ('cruzado', 'no_identificable')
@@ -747,6 +814,7 @@ def main():
             'program':            t.get('program'),
             'phone':              t.get('phone'),
             'payment_amount':     t.get('payment_amount'),
+            'val':                None,
             'incp':               reintegrar_con_incp[t.get('matching_key')],
             'correo_2':           None,
             'nombre':             None,
@@ -803,26 +871,34 @@ def main():
             elif _tiene_sufijo_financiero(correo_2) and not _tiene_sufijo_financiero(incp):
                 incp = correo_2
 
-        # NOMBRE / MÉTODO DE PAGO / CI — todas las transacciones WOMPI.
-        # (No se filtra por `program`: ese campo siempre trae el nombre del
-        # pagador para Wompi desde el 26 de junio, nunca está vacío, así que
-        # no sirve para distinguir "automático" de "manual" como asumía el
-        # diseño original del 13 de julio. El propio cruce contra el reporte
-        # ya hace esa distinción: si el documento aparece reportado, era
-        # automático; si no, puede ser manual o simplemente no reportado
-        # todavía — en ambos casos queda pendiente para revisión.)
-        # Puramente informativo (corregido 14 de julio): NOMBRE/MÉTODO DE
-        # PAGO/CI nunca bloquean el cruce. Una fila sale de excepciones
-        # únicamente por INCP/CORREO(2) — "PAGOS MANUALES" es solo un dato
-        # descriptivo, no una excepción.
-        nombre, metodo_de_pago, ci = None, None, None
+        # WOMPI LINK vs MANUAL (Fase 9.1-9.3, 16 de julio). El documento del
+        # pago está en ReportePagosWompi -> LINK: "el reporte manda" (9.2),
+        # su INCP gana sobre el lookup por documento y por correo, y la fila
+        # no puede quedar ambigua/discrepante por INCP (se fuerza más abajo
+        # antes de la Fase 3.6, para que ni siquiera se dispare el árbitro).
+        # Si no está -> MANUAL, se identifica por correo — comportamiento ya
+        # existente, sin cambios (9.3). NOMBRE/CI/`val`/`program` son
+        # puramente informativos en ambos casos; el único campo que puede
+        # bloquear el cierre es el INCP de una fila LINK sin resolver
+        # (9.2, línea 25).
+        val, nombre, metodo_de_pago, ci = None, None, None, None
+        program = t.get('program')
+        wompi_link_resuelto, wompi_link_pendiente = False, False
         if wompi_reporte_disponible and payment_method.startswith('WOMPI'):
             doc = _normalizar_documento_wompi(identification) if identification else ''
             match = lookup_wompi_reporte.get(doc) if doc else None
             if match:
+                val            = match.get('id_transaccion') or None
                 nombre         = match.get('pagador') or None
-                metodo_de_pago = match.get('metodo_pago') or None
+                metodo_de_pago = WOMPI_GENERA_LINK_LABEL
                 ci             = match.get('comprobante') or None
+                program        = match.get('proyecto') or None
+                incp_link = _resolver_incp_wompi_link(match.get('inscripcion'), id_inscripcion_por_base)
+                if incp_link:
+                    incp, incp_ambiguo, correo_2_ambiguo = incp_link, False, False
+                    wompi_link_resuelto = True
+                else:
+                    wompi_link_pendiente = True
             else:
                 metodo_de_pago = PAGOS_MANUALES_LABEL
 
@@ -855,7 +931,17 @@ def main():
             # 2+ o 0 candidatos con deuda: sin cambio, sigue cruce_ambiguo
             # (ya lo era) — ver puntos 4 y 5 de la regla.
 
-        if incp_ambiguo or correo_2_ambiguo:
+        if wompi_link_pendiente:
+            # Fase 9.2, línea 25: es LINK pero el "Inscripción" del reporte
+            # no se pudo resolver contra Payu UC (no existe, o ambiguo entre
+            # PN/PJ) — no se inventa el sufijo ni se cierra, sin importar lo
+            # que haya resuelto el lookup normal (incluida la Fase 3.6).
+            excepcion_motivo, estado_cruce = 'pendiente_asignar_incp', 'pendiente'
+        elif wompi_link_resuelto:
+            # El reporte manda (9.2): gana sobre INCP/CORREO(2) del lookup
+            # normal, cierra directo sin pasar por ambigüedad/discrepancia.
+            excepcion_motivo, estado_cruce = None, 'cruzado'
+        elif incp_ambiguo or correo_2_ambiguo:
             excepcion_motivo, estado_cruce = 'cruce_ambiguo', 'pendiente'
         elif (incp and correo_2
               and _normalizar_sufijo(incp) != _normalizar_sufijo(correo_2)):
@@ -892,9 +978,10 @@ def main():
             'transaction_code_2': t.get('transaction_code_2'),
             'email':              t.get('email'),
             'payment_method':     t.get('payment_method'),
-            'program':            t.get('program'),
+            'program':            program,
             'phone':              t.get('phone'),
             'payment_amount':     t.get('payment_amount'),
+            'val':                val,
             'incp':               incp or None,
             'correo_2':           correo_2 or None,
             'nombre':             nombre,
@@ -903,6 +990,52 @@ def main():
             'excepcion_motivo':   excepcion_motivo,
             'estado_cruce':       estado_cruce,
         })
+
+    # Fase 9.4 (línea 22, "Opción B"): filas WOMPI que cerraron 'cruzado'
+    # ANTES del fix del 14 de julio (bug de "program vacío" que nunca dejaba
+    # correr la regla del reporte) quedaron marcadas "PAGOS MANUALES" siendo
+    # en realidad LINK. Se recalculan los campos del reporte (val/nombre/
+    # metodo_de_pago/ci/program) + el incp de 9.2 — pero SOLO si el
+    # documento del pago aparece en el reporte de ESTA corrida (el lookup no
+    # se rehace para cubrir períodos históricos, solo el más reciente, ver
+    # _cargar_lookup_wompi_reporte) y SOLO si nadie lo corrigió a mano
+    # (corregido_manual=false) — si un humano lo tocó, no se pisa nunca,
+    # aunque el reporte diga otra cosa. Es una excepción acotada a "las
+    # filas terminales no se vuelven a tocar": esta sí re-evalúa filas ya
+    # 'cruzado', pero solo estos campos — nunca estado_cruce/
+    # excepcion_motivo, y nunca filas 'no_identificable'. Se corre siempre
+    # que el reporte esté disponible, sin importar si hubo transacciones
+    # nuevas para cruzar esta corrida.
+    if wompi_reporte_disponible:
+        log.info('Fase 9.4: re-evaluando filas WOMPI ya cruzadas (corregido_manual=false)...')
+        actualizaciones_9_4 = []
+        for r in existentes:
+            if r.get('estado_cruce') != 'cruzado' or r.get('corregido_manual'):
+                continue
+            payment_method = str(r.get('payment_method') or '').upper()
+            if not payment_method.startswith('WOMPI'):
+                continue
+            identification = str(r.get('identification') or '').strip()
+            doc = _normalizar_documento_wompi(identification) if identification else ''
+            match = lookup_wompi_reporte.get(doc) if doc else None
+            if not match:
+                continue
+            update = {
+                'matching_key':   r['matching_key'],
+                'val':            match.get('id_transaccion') or None,
+                'nombre':         match.get('pagador') or None,
+                'metodo_de_pago': WOMPI_GENERA_LINK_LABEL,
+                'ci':             match.get('comprobante') or None,
+                'program':        match.get('proyecto') or None,
+            }
+            incp_link = _resolver_incp_wompi_link(match.get('inscripcion'), id_inscripcion_por_base)
+            if incp_link:
+                update['incp'] = incp_link
+            actualizaciones_9_4.append(update)
+
+        if actualizaciones_9_4:
+            update_cruce_valores(supabase_url, srk, actualizaciones_9_4)
+        log.info('Fase 9.4: %d fila(s) WOMPI re-evaluadas contra el reporte.', len(actualizaciones_9_4))
 
     if not resultado:
         log.info('Sin transacciones para cruzar.')

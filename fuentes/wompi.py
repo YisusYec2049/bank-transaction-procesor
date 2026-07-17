@@ -13,10 +13,23 @@ Columnas esperadas (headers en minúsculas):
   [4] transaction_code_2  ← id conciliacion
   [5] email               ← email del pagador
   [6] payment_method      ← 'WOMPI {medio de pago}'
-  [7] program             ← nombre del pagador
-  [8] phone               ← ref. 2
+  [7] program             ← vacío (Fase 9.5, 16 de julio; antes: nombre del
+                              pagador — bug desde el 26 de junio, ver más
+                              abajo). Solo cruzar.py lo llena, con el
+                              "Proyecto" de ReportePagosWompi, y solo para
+                              filas WOMPI LINK (9.2) — el resto queda vacío.
+  [8] phone               ← nombre del pagador (Fase 9.5; antes: ref. 2)
   [9] payment_amount      ← float
   [10] matching_key       ← id de la transaccion
+
+Fase 9.5 del rediseño (16 de julio): `program` y `phone` estaban
+intercambiados desde el 26 de junio (línea 1 de "Cambios para Consolidado"):
+`program` traía el nombre del pagador en vez del programa, y de paso eso fue
+lo que rompió la regla original del 13 de julio de WOMPI automático/manual
+(asumía "program vacío = automático", pero nunca estaba vacío). `program`
+queda vacío a propósito hasta que cruzar.py lo llena desde el reporte —
+`ref. 2` deja de usarse (no tenía otro destino en el diseño de columnas
+15-25).
 """
 
 import csv
@@ -71,7 +84,6 @@ def parse_file(buf: io.BytesIO, filename: str = '') -> list[dict]:
             'email':           r.get('email del pagador', ''),
             'medio':           medio,
             'nombre':          r.get('nombre del pagador', ''),
-            'ref2':            r.get('ref. 2', '') or r.get('ref 2', ''),
             'documento':       r.get('documento del pagador', ''),
             'monto':           monto,
         })
@@ -90,8 +102,8 @@ def normalize(raw_rows: list[dict]) -> list[list]:
             r['id_conciliacion'],              # [4]  transaction_code_2
             r['email'],                        # [5]
             f"WOMPI {r['medio']}".strip(),     # [6]  payment_method
-            r['nombre'],                       # [7]  program
-            r['ref2'],                         # [8]  phone
+            '',                                # [7]  program (Fase 9.5: lo llena cruzar.py)
+            r['nombre'],                       # [8]  phone (Fase 9.5: nombre del pagador)
             r['monto'],                        # [9]  payment_amount
             r['id_tx'],                        # [10] matching_key
         ]

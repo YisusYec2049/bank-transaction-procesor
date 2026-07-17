@@ -236,16 +236,26 @@ def read_pagos_wompi_reporte(path: str | BinaryIO) -> list[dict]:
     (algunas entregas traen 2-3 filas de título/período antes), por eso se
     usa _find_header_row con un rango de escaneo más amplio.
 
-    Solo se leen las columnas que ya tiene cerrado el diseño de NOMBRE/CI/
-    MÉTODO DE PAGO (columnas 12-19 de cruce_cartera, 13 de julio, sin
-    implementar todavía en cruzar.py): `comprobante` es la llave única del
-    reporte, `documento` es la llave de cruce contra `identification` (trae
-    prefijo tipo "CC-"/"CEDULA_DE_EXTRANJERIA-", sin normalizar aquí)."""
+    `comprobante` es la llave única del reporte, `documento` es la llave de
+    cruce contra `identification` (trae prefijo tipo
+    "CC-"/"CEDULA_DE_EXTRANJERIA-", sin normalizar aquí). `inscripcion`,
+    `id_transaccion` y `proyecto` (Fase 9, 16 de julio) alimentan el cruce de
+    WOMPI LINK en cruzar.py: `inscripcion` (columna "Inscripción", ej.
+    "3077") es el número de INCP sin el sufijo del sistema financiero — se
+    le busca la forma con sufijo (ej. "3077PN") contra cartera_inscrip antes
+    de usarlo; `id_transaccion` (columna "Transaction Id (Wompi)") tiene el
+    mismo formato que `id de la transaccion` del CSV de WOMPI y llena
+    `cruce_cartera.val`; `proyecto` llena `cruce_cartera.program` (que el
+    parser de WOMPI deja vacío a propósito desde Fase 9.5, ver
+    fuentes/wompi.py). No se lee "Método Pago" del reporte para
+    `metodo_de_pago` — ese campo pasa a ser un literal fijo (9.2), no un dato
+    del Excel."""
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
     try:
         ws = wb['Pagos Wompi']
         header_row, cols = _find_header_row(
-            ws, ['Comprobante', 'Documento', 'Pagador', 'Método Pago', 'Fecha Pago'],
+            ws, ['Comprobante', 'Documento', 'Pagador', 'Fecha Pago',
+                 'Inscripción', 'Transaction Id (Wompi)', 'Proyecto'],
             max_scan=10,
         )
 
@@ -255,11 +265,13 @@ def read_pagos_wompi_reporte(path: str | BinaryIO) -> list[dict]:
             if not comprobante:
                 continue
             rows.append({
-                'comprobante': comprobante,
-                'documento':   _cell_str(row[cols['documento']]),
-                'pagador':     _cell_str(row[cols['pagador']]),
-                'metodo_pago': _cell_str(row[cols['método pago']]),
-                'fecha_pago':  _cell_date(row[cols['fecha pago']]),
+                'comprobante':    comprobante,
+                'documento':      _cell_str(row[cols['documento']]),
+                'pagador':        _cell_str(row[cols['pagador']]),
+                'fecha_pago':     _cell_date(row[cols['fecha pago']]),
+                'inscripcion':    _cell_str(row[cols['inscripción']]),
+                'id_transaccion': _cell_str(row[cols['transaction id (wompi)']]),
+                'proyecto':       _cell_str(row[cols['proyecto']]),
             })
         log.info('ReportePagosWompi (Pagos Wompi): %d filas leídas.', len(rows))
         return rows

@@ -68,6 +68,26 @@ de esa cuota. Se recalcula sobre TODOS los pagos cruzados en cada corrida
 (no solo los nuevos) porque es barato y así siempre refleja el estado
 completo, incluidas asociaciones de corridas anteriores. Puramente
 informativo — no toca estado_cruce/excepcion_motivo de cruce_cartera.
+
+Fase 8 del rediseño (bloque G "Montos", 16 de julio) — montos exactos del
+excedente, sobre la línea de cierre ya existente (4.4/8.1 no son la misma
+cosa: 4.4 es SALDO, cuando falta plata; 8.1 es EXCEDENTE, cuando sobra):
+  - `valor_pago` de la ÚLTIMA cuota que un pago toca deja de ser solo el
+    monto de esa cuota — pasa a ser lo que realmente llegó (su parte +
+    el excedente sin cuota registrada), para que la suma de `valor_pago`
+    de todas las cuotas que tocó un pago sea igual al monto de la
+    transacción (nada se pierde ni se duplica).
+  - `diferencia` puede ser positiva ahora (antes solo 0 o negativa): saldo
+    a favor cuando sobró plata.
+  - `notificacion` (columna nueva, `sql/014`): etiqueta de excedente
+    ('1 CUOTA + ABONO', '2 CUOTAS + ABONO', 'PAGA DOS CUOTAS', ...) o NULL
+    si el excedente es ruido de redondeo (< $50.000, ver
+    `_calcular_notificacion`). Campo aparte, no reemplaza nada —
+    `correo_elec` y su texto SOBRANTE siguen igual, así que el filtro de
+    financial-platform (`correo_elec ilike '%SOBRANTE%'`) no se toca.
+  - Nada se redondea (8.3): la tolerancia ±100 sigue aplicando solo al
+    SALDO (4.4), nunca al excedente — un excedente de $1 da
+    `diferencia = +1`, no 0 (la etiqueta ya filtra ese ruido).
 """
 
 import logging
@@ -96,6 +116,33 @@ TOLERANCIA_REDONDEO = 100
 WOMPI_LINK_LABEL = 'WOMPI (Automático Genera Link)'
 PAGOS_MANUALES_LABEL = 'PAGOS MANUALES'
 _FECHA_MAX = '9999-12-31'
+
+# Fase 8 (bloque G, 16 de julio): umbral de excedente "real" vs. ruido de
+# redondeo, validado contra los 26 excedentes de producción — el mayor por
+# debajo es $45.000, el menor por encima es $192.349, no hay nada en el
+# medio.
+UMBRAL_NOTIFICACION = 50000
+_NUMEROS_LETRAS = {2: 'DOS', 3: 'TRES', 4: 'CUATRO', 5: 'CINCO', 6: 'SEIS'}
+
+
+def _calcular_notificacion(valor_cuota: float, excedente: float) -> str | None:
+    """Fase 8.2: etiqueta de excedente para la última cuota que lo absorbe.
+    `n` = cuántas cuotas ENTERAS MÁS cubre el excedente (además de la que se
+    está cerrando, que ya cuenta por su cuenta); `resto` = lo que sobra
+    después de esas. Ninguna de las dos variables se redondea (8.3) — el
+    ruido de redondeo lo filtra el umbral, no un round()."""
+    if valor_cuota <= 0 or excedente <= 0:
+        return None
+    n = int(excedente // valor_cuota)
+    resto = round(excedente - (n * valor_cuota), 2)
+    if n >= 1 and resto >= UMBRAL_NOTIFICACION:
+        return f'{n + 1} CUOTAS + ABONO'
+    if n >= 1:
+        cuotas = n + 1
+        return f'PAGA {_NUMEROS_LETRAS.get(cuotas, cuotas)} CUOTAS'
+    if excedente >= UMBRAL_NOTIFICACION:
+        return '1 CUOTA + ABONO'
+    return None
 
 
 def _normalizar_documento(valor) -> str:
@@ -392,9 +439,26 @@ def main():
             lineas_nuevas.append(_fila_linea_saldo(parcial, nueva_llave))
 
         if excedente > 0 and cierres_doc:
+            # 8.1: el excedente lo absorbe la ÚLTIMA cuota que toca el pago
+            # (nunca la parcial: excedente y parcial son mutuamente
+            # excluyentes dentro de una misma llamada a
+            # _aplicar_pagos_inscripcion — si sobra plata es porque TODAS
+            # las cuotas ya se cerraron). valor_pago pasa a ser lo que
+            # realmente llegó a esa cuota (su parte + el excedente) y
+            # diferencia queda positiva (saldo a favor) en vez de 0. Nada se
+            # redondea (8.3): la tolerancia ±100 solo decide si una cuota se
+            # cierra, nunca se aplica al excedente.
+            ultima_fila = cierres_doc[-1]
+            valor_cuota_ultima = float(cierres[-1]['cuota'].get('valor_cuota') or 0)
+            ultima_fila['valor_pago'] = round(ultima_fila['valor_pago'] + excedente, 2)
+            ultima_fila['diferencia'] = round(ultima_fila['valor_pago'] - valor_cuota_ultima, 2)
+            notificacion = _calcular_notificacion(valor_cuota_ultima, excedente)
+            if notificacion:
+                ultima_fila['notificacion'] = notificacion
+
             monto_fmt = f'{excedente:,.0f}'.replace(',', '.')
-            correo_original = cierres_doc[-1]['correo_elec'] or ''
-            cierres_doc[-1]['correo_elec'] = f'{correo_original} | SOBRANTE ${monto_fmt} sin cuota registrada'.strip(' |')
+            correo_original = ultima_fila['correo_elec'] or ''
+            ultima_fila['correo_elec'] = f'{correo_original} | SOBRANTE ${monto_fmt} sin cuota registrada'.strip(' |')
 
         actualizaciones_cierre.extend(cierres_doc)
         for a in asociaciones:
