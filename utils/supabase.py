@@ -12,6 +12,21 @@ _ENDPOINT = '/rest/v1/consolidated_transactions?on_conflict=matching_key'
 _PREFER   = 'return=minimal,resolution=merge-duplicates'
 
 
+def _raise_for_status(resp: http.Response) -> None:
+    """Como resp.raise_for_status(), pero logueando resp.text ANTES de
+    lanzar la excepción. El mensaje default de requests.HTTPError no
+    incluye el cuerpo de la respuesta — y ahí es donde PostgREST pone el
+    detalle real (ej. `{"code":"PGRST102","message":"All object keys must
+    match"}`). Bug real (16 de julio): un 400 en upsert_cartera_preventiva
+    quedó invisible en el log del cron durante horas porque solo se veía
+    "HTTPError: 400 Client Error", sin ninguna pista de la causa. Usar esto
+    en vez de resp.raise_for_status() directo en cualquier llamada nueva."""
+    if not resp.ok:
+        log.error('Supabase %s %s -> %s: %s', resp.request.method if resp.request else '?',
+                   resp.url, resp.status_code, resp.text)
+    resp.raise_for_status()
+
+
 def upsert(supabase_url: str, service_role_key: str, rows: list[list]) -> None:
     """
     rows: filas normalizadas [identification, payment_date(DD-MM-YYYY), ...]
@@ -49,7 +64,7 @@ def upsert(supabase_url: str, service_role_key: str, rows: list[list]) -> None:
         headers=hdrs,
         timeout=30,
     )
-    resp.raise_for_status()
+    _raise_for_status(resp)
     log.info('Upsert Supabase OK: %d registros, HTTP %s.', len(payload), resp.status_code)
 
 
@@ -73,7 +88,7 @@ def existing_matching_keys(supabase_url: str, service_role_key: str, keys: list[
             headers=_headers(service_role_key),
             timeout=30,
         )
-        resp.raise_for_status()
+        _raise_for_status(resp)
         encontrados.update(r['matching_key'] for r in resp.json())
     return encontrados
 
@@ -104,7 +119,7 @@ def select_all(supabase_url: str, service_role_key: str, table: str,
             headers=hdrs,
             timeout=30,
         )
-        resp.raise_for_status()
+        _raise_for_status(resp)
         page = resp.json()
         rows.extend(page)
         if len(page) < page_size:
@@ -123,7 +138,7 @@ def replace_table(supabase_url: str, service_role_key: str, table: str,
         headers=hdrs,
         timeout=30,
     )
-    resp.raise_for_status()
+    _raise_for_status(resp)
 
     for i in range(0, len(rows), batch_size):
         batch = rows[i:i + batch_size]
@@ -133,7 +148,7 @@ def replace_table(supabase_url: str, service_role_key: str, table: str,
             headers=hdrs,
             timeout=30,
         )
-        resp.raise_for_status()
+        _raise_for_status(resp)
 
     log.info('Tabla "%s" reemplazada: %d filas.', table, len(rows))
 
@@ -183,7 +198,7 @@ def sync_cartera_preventiva(supabase_url: str, service_role_key: str, rows: list
             headers=hdrs_upsert,
             timeout=30,
         )
-        resp.raise_for_status()
+        _raise_for_status(resp)
 
     existentes = select_all(supabase_url, service_role_key, 'cartera_preventiva', select='llave')
     llaves_actuales = {r['llave'] for r in existentes if r.get('llave')}
@@ -208,7 +223,7 @@ def sync_cartera_preventiva(supabase_url: str, service_role_key: str, rows: list
                 headers=hdrs_delete,
                 timeout=30,
             )
-            resp.raise_for_status()
+            _raise_for_status(resp)
 
     log.info('cartera_preventiva sincronizada: %d filas actualizadas/insertadas, %d borradas (ya no están en el Excel).',
               len(deduped), len(llaves_a_borrar))
@@ -226,7 +241,7 @@ def upsert_cruce(supabase_url: str, service_role_key: str, rows: list[dict]) -> 
         headers=hdrs,
         timeout=30,
     )
-    resp.raise_for_status()
+    _raise_for_status(resp)
     log.info('Upsert cruce_cartera OK: %d registros, HTTP %s.', len(rows), resp.status_code)
 
 
@@ -242,7 +257,7 @@ def upsert_cartera_preventiva(supabase_url: str, service_role_key: str, rows: li
         headers=hdrs,
         timeout=30,
     )
-    resp.raise_for_status()
+    _raise_for_status(resp)
     log.info('Upsert cartera_preventiva OK: %d registros, HTTP %s.', len(rows), resp.status_code)
 
 
@@ -260,7 +275,7 @@ def insert_cartera_preventiva_lineas(supabase_url: str, service_role_key: str, r
         headers=hdrs,
         timeout=30,
     )
-    resp.raise_for_status()
+    _raise_for_status(resp)
     log.info('Líneas de saldo nuevas insertadas en cartera_preventiva: %d.', len(rows))
 
 
@@ -276,7 +291,7 @@ def upsert_pago_asociaciones(supabase_url: str, service_role_key: str, rows: lis
         headers=hdrs,
         timeout=30,
     )
-    resp.raise_for_status()
+    _raise_for_status(resp)
     log.info('Upsert pago_asociaciones OK: %d registros.', len(rows))
 
 
@@ -297,7 +312,7 @@ def update_cruce_valores(supabase_url: str, service_role_key: str, updates: list
             headers=hdrs,
             timeout=30,
         )
-        resp.raise_for_status()
+        _raise_for_status(resp)
     log.info('Update cruce_cartera (cruce inverso) OK: %d filas.', len(updates))
 
 
@@ -313,7 +328,7 @@ def upsert_pagos_apartados(supabase_url: str, service_role_key: str, rows: list[
         headers=hdrs,
         timeout=30,
     )
-    resp.raise_for_status()
+    _raise_for_status(resp)
     log.info('Upsert pagos_apartados OK: %d registros, HTTP %s.', len(rows), resp.status_code)
 
 
@@ -332,5 +347,5 @@ def delete_by_keys(supabase_url: str, service_role_key: str, table: str,
             headers=hdrs,
             timeout=30,
         )
-        resp.raise_for_status()
+        _raise_for_status(resp)
     log.info('Borradas de "%s" (por %s): %d llave(s).', table, key_column, len(keys))

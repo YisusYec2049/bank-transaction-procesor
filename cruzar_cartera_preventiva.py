@@ -88,6 +88,36 @@ cosa: 4.4 es SALDO, cuando falta plata; 8.1 es EXCEDENTE, cuando sobra):
   - Nada se redondea (8.3): la tolerancia ±100 sigue aplicando solo al
     SALDO (4.4), nunca al excedente — un excedente de $1 da
     `diferencia = +1`, no 0 (la etiqueta ya filtra ese ruido).
+
+BUG CRÍTICO corregido (16 de julio, tarde) — Fase 4 nunca había aplicado un
+pago en producción desde su deploy: `pago_asociaciones` en 0 filas,
+`fecha_cruce` en 0 filas, y 74 filas basura en `cartera_preventiva` con
+llaves encadenadas tipo `2619PN46206 (saldo 9) (saldo 32) (saldo 15)`. Tres
+bugs combinados, los tres corregidos:
+  1. `actualizaciones_cierre` mezclaba filas de `_fila_cierre()` con
+     distinto set de claves (9 claves en un cierre normal, 11 en uno con
+     `cerrar_al_monto_recibido=True`, +1 con `notificacion` de Fase 8) en un
+     mismo POST — PostgREST exige el mismo set de claves en todo el array
+     (`PGRST102: All object keys must match`) y respondía 400. `_fila_cierre`
+     ahora siempre devuelve el mismo set; los campos que no cambian de
+     verdad se rellenan con el valor QUE YA TIENE la cuota, nunca `None`
+     (mandar `None` los habría borrado de verdad). `utils/supabase.py`
+     ahora loguea `resp.text` en cada `raise_for_status` — este 400 quedó
+     invisible en el log durante horas, solo se veía "HTTPError: 400".
+  2. Orden de escritura invertido: `pago_asociaciones` (el marcador de "este
+     pago ya se procesó") pasa a escribirse PRIMERO, no al final — antes,
+     si algo fallaba después de crear la línea de saldo pero antes de
+     escribir la asociación, el reintento recalculaba desde cero contra un
+     `cartera_preventiva` que ya había cambiado, reaplicando el mismo pago
+     una y otra vez.
+  3. `_generar_llave_saldo` dejó de "buscar el primer sufijo libre" (nunca
+     estable entre corridas: cada reintento del mismo pago encontraba el
+     slot anterior ocupado y generaba uno nuevo) y ahora deriva la llave del
+     `matching_key` del pago que la origina — determinística, y el upsert
+     por `llave` ya existente la actualiza en vez de duplicarla en cualquier
+     reproceso.
+Limpieza de las 74 filas basura: ver `sql/015_limpieza_lineas_saldo_bug.sql`
+(entregado al usuario, no corrido desde acá).
 """
 
 import logging
@@ -166,16 +196,23 @@ def _correo_elec_para(pago: dict) -> str:
     return pago.get('email') or ''
 
 
-def _generar_llave_saldo(llave_base: str, llaves_existentes: set[str]) -> str:
-    """Llave nueva para la línea de saldo pendiente de un pago parcial
-    (Fase 4.4) — mismo patrón "(duplicado)"/"(duplicado N)" de Fase 1.2,
-    con la etiqueta "(saldo)"."""
-    n = 1
-    candidato = f'{llave_base} (saldo)'
-    while candidato in llaves_existentes:
-        n += 1
-        candidato = f'{llave_base} (saldo {n})'
-    return candidato
+def _generar_llave_saldo(llave_base: str, matching_key: str) -> str:
+    """Llave DETERMINÍSTICA para la línea de saldo pendiente de un pago
+    parcial (Fase 4.4), derivada del `matching_key` del pago que la origina
+    — no de "buscar el primer sufijo libre" (bug crítico corregido el 16 de
+    julio, tarde: esa búsqueda nunca era estable entre corridas. Si el
+    mismo pago se reprocesaba tras un fallo a mitad de la escritura —ver
+    docstring de "Orden de escritura" en main()—, el sufijo "(saldo)" ya
+    estaba ocupado por el intento anterior y se generaba uno nuevo cada
+    vez, produciendo una línea de saldo distinta por cada reintento en vez
+    de reusar la misma — así se generaron las 74 filas basura encadenadas
+    "(saldo 9)"/"(saldo 32)"/"(saldo 15)" de la corrida real). Con la llave
+    derivada del pago, reprocesar el MISMO pago siempre calcula la MISMA
+    llave, y el upsert por `llave` en insert_cartera_preventiva_lineas
+    actualiza esa fila en vez de crear una nueva — colisión estructuralmente
+    imposible entre pagos distintos, porque matching_key ya es único por
+    diseño en todo el sistema."""
+    return f'{llave_base} (saldo {matching_key})'
 
 
 def _aplicar_pagos_inscripcion(cuotas_abiertas: list[dict], pagos_nuevos: list[dict],
@@ -245,6 +282,21 @@ def _aplicar_pagos_inscripcion(cuotas_abiertas: list[dict], pagos_nuevos: list[d
 
 
 def _fila_cierre(info: dict, hoy: str, cerrar_al_monto_recibido: bool = False) -> dict:
+    """Bug crítico corregido (16 de julio, tarde): TODAS las filas que
+    terminan en `actualizaciones_cierre` se postean juntas en un solo POST
+    (`upsert_cartera_preventiva`, un array JSON) — y PostgREST exige que
+    cada objeto de ese array tenga exactamente el mismo set de claves, o
+    responde 400 (`PGRST102: All object keys must match`). Antes, un cierre
+    normal devolvía 9 claves, uno con `cerrar_al_monto_recibido=True` (el de
+    un pago parcial) devolvía 11 (agregaba valor_cuota/valor_a_cobrar), y el
+    bloque de excedente (Fase 8) le agregaba `notificacion` a una sola fila
+    — cualquier corrida que mezclara dos de estas formas en el mismo batch
+    rompía TODO el batch (ninguna cuota se cerraba, aunque el log dijera
+    "actualizado"). Ahora esta función siempre devuelve el mismo set de
+    claves; para las que no cambian de verdad (`valor_cuota`/
+    `valor_a_cobrar` en un cierre normal), se manda el valor QUE YA TIENE la
+    cuota — nunca None, porque None SÍ los borraría (es un upsert real, no
+    un no-op)."""
     cuota = info['cuota']
     ultimo_pago = info['ultimo_pago']
     monto = round(info['monto_aplicado'], 2)
@@ -257,6 +309,7 @@ def _fila_cierre(info: dict, hoy: str, cerrar_al_monto_recibido: bool = False) -
         'codigo_transaccion_2': ultimo_pago.get('transaction_code_2'),
         'correo_elec':          _correo_elec_para(ultimo_pago),
         'fecha_cruce':          hoy,
+        'notificacion':         None,
     }
     if cerrar_al_monto_recibido:
         # 4.4: la cuota ORIGINAL de un pago parcial se ajusta a lo
@@ -267,7 +320,9 @@ def _fila_cierre(info: dict, hoy: str, cerrar_al_monto_recibido: bool = False) -
         fila['diferencia']     = 0
     else:
         valor_cuota = float(cuota.get('valor_cuota') or 0)
-        fila['diferencia'] = round(monto - valor_cuota, 2)
+        fila['diferencia']     = round(monto - valor_cuota, 2)
+        fila['valor_cuota']    = cuota.get('valor_cuota')
+        fila['valor_a_cobrar'] = cuota.get('valor_a_cobrar')
     return fila
 
 
@@ -320,13 +375,12 @@ def main():
     log.info('Cargando cartera_preventiva...')
     cuotas_rows = select_all(
         supabase_url, srk, 'cartera_preventiva',
-        select='id,llave,cruce_access,fecha_vencimiento,valor_cuota,inscrip,cliente,'
-               'sistema_financiero,moneda,programa,fecha_pago',
+        select='id,llave,cruce_access,fecha_vencimiento,valor_cuota,valor_a_cobrar,inscrip,'
+               'cliente,sistema_financiero,moneda,programa,fecha_pago',
     )
     id_por_llave      = {c['llave']: c['id'] for c in cuotas_rows if c.get('llave')}
     llave_por_id       = {c['id']: c['llave'] for c in cuotas_rows}
     cliente_por_llave = {c['llave']: c.get('cliente') for c in cuotas_rows if c.get('llave')}
-    llaves_existentes  = set(llave_por_id.values())
 
     log.info('Cargando cruce_cartera (solo estado_cruce=cruzado)...')
     pagos_rows = select_all(
@@ -354,7 +408,7 @@ def main():
         reset_rows = [
             {'id': id_por_llave[llave], 'fecha_pago': None, 'medio_pago': None, 'valor_pago': None,
              'codigo_transaccion_1': None, 'codigo_transaccion_2': None, 'correo_elec': None,
-             'diferencia': None, 'fecha_cruce': None}
+             'diferencia': None, 'fecha_cruce': None, 'notificacion': None}
             for llave in llaves_a_resetear if llave in id_por_llave
         ]
         upsert_cartera_preventiva(supabase_url, srk, reset_rows)
@@ -434,8 +488,8 @@ def main():
         cierres_doc = [_fila_cierre(info, hoy) for info in cierres]
         if parcial:
             cierres_doc.append(_fila_cierre(parcial, hoy, cerrar_al_monto_recibido=True))
-            nueva_llave = _generar_llave_saldo(parcial['cuota']['llave'], llaves_existentes)
-            llaves_existentes.add(nueva_llave)
+            matching_key_parcial = parcial['ultimo_pago']['matching_key']
+            nueva_llave = _generar_llave_saldo(parcial['cuota']['llave'], matching_key_parcial)
             lineas_nuevas.append(_fila_linea_saldo(parcial, nueva_llave))
 
         if excedente > 0 and cierres_doc:
@@ -452,9 +506,10 @@ def main():
             valor_cuota_ultima = float(cierres[-1]['cuota'].get('valor_cuota') or 0)
             ultima_fila['valor_pago'] = round(ultima_fila['valor_pago'] + excedente, 2)
             ultima_fila['diferencia'] = round(ultima_fila['valor_pago'] - valor_cuota_ultima, 2)
-            notificacion = _calcular_notificacion(valor_cuota_ultima, excedente)
-            if notificacion:
-                ultima_fila['notificacion'] = notificacion
+            # La clave 'notificacion' ya existe en ultima_fila (default None,
+            # ver _fila_cierre) — asignar directo, sin guardia, mantiene el
+            # set de claves sin cambios sin importar si hay etiqueta o no.
+            ultima_fila['notificacion'] = _calcular_notificacion(valor_cuota_ultima, excedente)
 
             monto_fmt = f'{excedente:,.0f}'.replace(',', '.')
             correo_original = ultima_fila['correo_elec'] or ''
@@ -473,18 +528,36 @@ def main():
     log.info('%d documento(s) procesados, %d con 2+ inscripciones debiendo (sin auto-aplicar).',
               docs_procesados, docs_2_mas_inscripciones)
 
-    # Orden de escritura: líneas nuevas -> cierres -> asociaciones. Si algo
-    # falla a mitad de camino, la asociación (que marca el pago como "ya
-    # procesado") es lo ÚLTIMO en escribirse, así un reintento reprocesa
-    # limpio en vez de dejar una línea de saldo huérfana sin su cierre.
+    # Orden de escritura — INVERTIDO el 16 de julio (tarde) tras un bug real
+    # en producción. El orden anterior (líneas -> cierres -> asociaciones)
+    # razonaba al revés: decía que escribir la asociación al final hacía que
+    # "un reintento reprocese limpio", pero pago_asociaciones es exactamente
+    # lo que le dice a la PRÓXIMA corrida "este pago ya se procesó, no lo
+    # toques de nuevo" (ver matching_keys_ya_asociados arriba). Si eso se
+    # escribe al final y algo falla ANTES (ej. el 400 de PGRST102, ver
+    # _fila_cierre), el reintento recalcula desde cero contra un
+    # cartera_preventiva que YA cambió por el intento anterior — el mismo
+    # pago se reaplica sobre una cuota distinta y genera OTRA línea de saldo
+    # en cada corrida (así se generaron las 74 filas basura "(saldo N)"
+    # encadenadas de la corrida real; pago_asociaciones se quedó en 0 filas
+    # todo ese tiempo).
+    #
+    # Ahora: asociaciones PRIMERO. En cuanto esa escritura confirma, el pago
+    # queda reclamado para siempre — un fallo posterior en líneas/cierres ya
+    # no se repite en cada corrida (deja como mucho UNA inconsistencia
+    # acotada entre pago_asociaciones y cartera_preventiva, detectable y
+    # reparable a mano, en vez de duplicación infinita). No es una
+    # transacción real — Supabase REST no soporta transacciones multi-tabla
+    # desde el cliente — así que sigue existiendo una ventana de fallo
+    # parcial; lo que cambia es que ya no se agrava solo con cada reintento.
+    if nuevas_asociaciones:
+        upsert_pago_asociaciones(supabase_url, srk, nuevas_asociaciones)
     if lineas_nuevas:
         insert_cartera_preventiva_lineas(supabase_url, srk, lineas_nuevas)
     if actualizaciones_cierre:
         batch_size = 500
         for i in range(0, len(actualizaciones_cierre), batch_size):
             upsert_cartera_preventiva(supabase_url, srk, actualizaciones_cierre[i:i + batch_size])
-    if nuevas_asociaciones:
-        upsert_pago_asociaciones(supabase_url, srk, nuevas_asociaciones)
 
     log.info('cruzar_cartera_preventiva.py: %d cuota(s) cerradas, %d línea(s) de saldo nuevas, '
               '%d asociación(es) nuevas.',
