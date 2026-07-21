@@ -181,7 +181,8 @@ def _fila_reset(cuota_id) -> dict:
     `upsert_cartera_preventiva` — escribirlas en una lista/POST aparte."""
     return {'id': cuota_id, 'fecha_pago': None, 'medio_pago': None, 'valor_pago': None,
             'codigo_transaccion_1': None, 'codigo_transaccion_2': None, 'correo_elec': None,
-            'diferencia': None, 'fecha_cruce': None, 'notificacion': None}
+            'diferencia': None, 'fecha_cruce': None, 'notificacion': None,
+            'es_wompi_automatico': None}
 
 
 def _fila_cierre_cartera(cuota: dict, fecha_pago_manual: str, hoy: str) -> dict:
@@ -206,6 +207,7 @@ def _fila_cierre_cartera(cuota: dict, fecha_pago_manual: str, hoy: str) -> dict:
         'diferencia':           0,
         'valor_cuota':          cuota.get('valor_cuota'),
         'valor_a_cobrar':       valor_a_cobrar,
+        'es_wompi_automatico':  None,
     }
 
 
@@ -298,6 +300,7 @@ def _fila_cierre(info: dict, hoy: str, cerrar_al_monto_recibido: bool = False) -
         'correo_elec':          _correo_elec_para(ultimo_pago),
         'fecha_cruce':          hoy,
         'notificacion':         None,
+        'es_wompi_automatico':  _es_wompi_automatico(ultimo_pago),
     }
     if cerrar_al_monto_recibido:
         # La cuota ORIGINAL de un faltante >= $50.000 se ajusta a lo
@@ -340,6 +343,7 @@ def _fila_linea_saldo(parcial: dict, nueva_llave: str, notificacion: str | None 
         'correo_elec':         None,
         'diferencia':          None,
         'notificacion':        notificacion,
+        'es_wompi_automatico': None,
     }
 
 
