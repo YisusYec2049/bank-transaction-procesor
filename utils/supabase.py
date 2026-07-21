@@ -153,83 +153,78 @@ def replace_table(supabase_url: str, service_role_key: str, table: str,
     log.info('Tabla "%s" reemplazada: %d filas.', table, len(rows))
 
 
-def sync_cartera_preventiva(supabase_url: str, service_role_key: str, rows: list[dict],
-                             batch_size: int = 500) -> None:
-    """Sincroniza cartera_preventiva por 'llave', sin borrar la tabla completa.
+def replace_cartera_preventiva_staging(supabase_url: str, service_role_key: str,
+                                        rows: list[dict]) -> bool:
+    """Reemplaza POR COMPLETO `cartera_preventiva_staging` con las filas del
+    Excel de Cartera Preventiva más reciente (Spec C — versión de carga, 21
+    de julio). A diferencia de la vieja `sync_cartera_preventiva` (que
+    protegía las columnas de resultado del cruce en la tabla VIVA), staging
+    no tiene ningún estado que proteger — es solo el espejo del Excel, se
+    resincroniza completo en cada corrida igual que Payu UC / Ingresos. La
+    tabla VIVA (`cartera_preventiva`) ya NO la toca el sync; solo el swap
+    (`activar_cartera.py`, disparado por el botón "Cargar Cartera") y
+    `cruzar_cartera_preventiva.py` (columnas de resultado).
 
-    A diferencia de replace_table (DELETE + INSERT), esto hace upsert por
-    'llave' — solo toca las columnas que vienen del Excel. No pisa
-    fecha_pago/medio_pago/valor_pago/codigo_transaccion_1/2/correo_elec/
-    diferencia, que llena aparte cruzar_cartera_preventiva.py: antes, cada
-    replace_table las dejaba en NULL hasta que ese script volvía a correr
-    (~1 min después), dejando la vista de "resueltas" vacía en cada ciclo de
-    sync_cartera.py. Requiere índice único en cartera_preventiva.llave
-    (sql/007_cartera_preventiva_llave_unique.sql).
+    Si la lectura del Excel vino vacía, no se toca staging (misma
+    salvaguarda del 15 de julio: "0 filas nuevas" no es "borrar todo lo
+    viejo"). Devuelve True si reemplazó, False si se omitió."""
+    if not rows:
+        log.warning('cartera_preventiva_staging: 0 filas leídas del Excel, se omite '
+                    '(no se toca la tabla existente).')
+        return False
+    replace_table(supabase_url, service_role_key, 'cartera_preventiva_staging', rows)
+    return True
 
-    Las llaves que ya no aparecen en el Excel nuevo (cuota que salió de
-    cartera pendiente) se borran aparte, al final — EXCEPTO (Fase 4, 16 de
-    julio): llaves de "línea de saldo" generadas por
-    cruzar_cartera_preventiva.py (contienen " (saldo" en el texto, ver
-    _generar_llave_saldo) — no existen en ningún Excel, así que sin esto se
-    borrarían solas en el primer sync después de crearse; y llaves con
-    cerrado_manual=true o es_ultima_cuota=true en cartera_preventiva_overrides
-    — una cuota cerrada a mano, o marcada como la última de su inscripción
-    (Sobrantes/Excedentes, 17 de julio), no debe desaparecer ni perder su
-    badge/estado si el Excel deja de traerla.
-    """
-    vistas: set[str] = set()
-    deduped = []
-    for r in rows:
-        llave = r.get('llave')
-        if not llave or llave in vistas:
-            continue
-        vistas.add(llave)
-        deduped.append(r)
 
-    if not deduped:
-        log.warning('cartera_preventiva: 0 filas leídas del Excel, se omite la sincronización '
-                     '(no se borra ni se toca la tabla existente).')
+def insert_rows(supabase_url: str, service_role_key: str, table: str,
+                 rows: list[dict], batch_size: int = 500) -> None:
+    """INSERT plano (sin upsert) de `rows` en `table`, en lotes. Usado por el
+    swap de versión de cartera (Spec C) para archivar filas hacia las tablas
+    `_archivo` — nunca pisa nada existente, siempre agrega."""
+    if not rows:
         return
-
-    hdrs_upsert = _headers(service_role_key, prefer='return=minimal,resolution=merge-duplicates')
-    for i in range(0, len(deduped), batch_size):
-        batch = deduped[i:i + batch_size]
-        resp = http.post(
-            f'{supabase_url}/rest/v1/cartera_preventiva?on_conflict=llave',
-            json=batch,
-            headers=hdrs_upsert,
-            timeout=30,
-        )
+    hdrs = _headers(service_role_key, prefer='return=minimal')
+    for i in range(0, len(rows), batch_size):
+        batch = rows[i:i + batch_size]
+        resp = http.post(f'{supabase_url}/rest/v1/{table}', json=batch, headers=hdrs, timeout=60)
         _raise_for_status(resp)
+    log.info('Insertadas en "%s": %d fila(s).', table, len(rows))
 
-    existentes = select_all(supabase_url, service_role_key, 'cartera_preventiva', select='llave')
-    llaves_actuales = {r['llave'] for r in existentes if r.get('llave')}
 
-    overrides_cerrados = select_all(supabase_url, service_role_key, 'cartera_preventiva_overrides',
-                                     select='llave,cerrado_manual,es_ultima_cuota')
-    llaves_protegidas = {r['llave'] for r in overrides_cerrados
-                          if r.get('cerrado_manual') or r.get('es_ultima_cuota')}
+def delete_all_rows(supabase_url: str, service_role_key: str, table: str,
+                     pk_column: str = 'id') -> None:
+    """Borra TODAS las filas de `table` — equivalente a TRUNCATE, que la API
+    REST de PostgREST no expone directamente. Filtra por `pk_column is not
+    null`, cierto para toda fila real (es su primary key). Usado por el swap
+    de versión de cartera (Spec C) para vaciar las tablas vivas tras
+    archivarlas."""
+    hdrs = _headers(service_role_key, prefer='return=minimal')
+    resp = http.delete(
+        f'{supabase_url}/rest/v1/{table}',
+        params={pk_column: 'not.is.null'},
+        headers=hdrs,
+        timeout=60,
+    )
+    _raise_for_status(resp)
+    log.info('Tabla "%s" vaciada por completo.', table)
 
-    llaves_a_borrar = [
-        k for k in (llaves_actuales - vistas)
-        if ' (saldo' not in k and k not in llaves_protegidas
-    ]
 
-    if llaves_a_borrar:
-        hdrs_delete = _headers(service_role_key, prefer='return=minimal')
-        for i in range(0, len(llaves_a_borrar), batch_size):
-            batch = llaves_a_borrar[i:i + batch_size]
-            valores = ','.join(f'"{v}"' for v in batch)
-            resp = http.delete(
-                f'{supabase_url}/rest/v1/cartera_preventiva',
-                params={'llave': f'in.({valores})'},
-                headers=hdrs_delete,
-                timeout=30,
-            )
-            _raise_for_status(resp)
-
-    log.info('cartera_preventiva sincronizada: %d filas actualizadas/insertadas, %d borradas (ya no están en el Excel).',
-              len(deduped), len(llaves_a_borrar))
+def upsert_cartera_cargas(supabase_url: str, service_role_key: str, rows: list[dict]) -> None:
+    """Upsert por `carga_id` a `cartera_cargas` — marcador de control de
+    versiones de cartera (Spec C): `estado` en ('staged','activa','archivada').
+    fin-platform prende el banner "hay cartera pendiente" cuando existe una
+    fila `staged`."""
+    if not rows:
+        return
+    hdrs = _headers(service_role_key, prefer='return=minimal,resolution=merge-duplicates')
+    resp = http.post(
+        f'{supabase_url}/rest/v1/cartera_cargas?on_conflict=carga_id',
+        json=rows,
+        headers=hdrs,
+        timeout=30,
+    )
+    _raise_for_status(resp)
+    log.info('Upsert cartera_cargas OK: %d registro(s).', len(rows))
 
 
 def upsert_cruce(supabase_url: str, service_role_key: str, rows: list[dict]) -> None:

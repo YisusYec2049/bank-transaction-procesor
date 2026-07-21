@@ -1,11 +1,17 @@
 #!/opt/matching-test/venv/bin/python3
 """
-trigger_server.py — dispara sync_cartera.py + cruzar.py bajo demanda vía HTTP.
+trigger_server.py — dispara operaciones bajo demanda vía HTTP.
+
+  - POST /trigger/cruce                    → sync_cartera.py && cruzar.py
+  - POST /trigger/cartera/activar          → activar_cartera.py (Spec C, el
+    swap manual de versión de Cartera Preventiva, botón "Cargar Cartera")
 
 Pensado para que `financial-platform` lo llame justo después de escribir una
 corrección manual (ej. upsert a cruce_incp_exclusiones) y así no esperar al
-próximo tick del cron. Corre en background (la corrida real toma ~1 minuto)
-y expone un endpoint de status para hacer polling desde el frontend.
+próximo tick del cron, o para disparar el swap de cartera al apretar el
+botón. Cada operación corre en background con su propio lock/estado (no se
+bloquean entre sí) y expone su propio endpoint de status para polling desde
+el frontend.
 
 Protegido por token compartido (TRIGGER_TOKEN en .env) — no hay otra
 autenticación, así que este servicio NUNCA debe quedar expuesto sin proxy/
@@ -29,6 +35,18 @@ app = Flask(__name__)
 
 _lock = threading.Lock()
 _state = {
+    "status": "idle",  # idle | running | done | error
+    "started_at": None,
+    "finished_at": None,
+    "exit_code": None,
+    "log_tail": "",
+}
+
+# Swap de versión de cartera (Spec C, 21 de julio) — endpoint y estado
+# separados del cruce de arriba: son operaciones independientes, no deben
+# bloquearse entre sí ni compartir el mismo _lock/_state.
+_lock_cartera = threading.Lock()
+_state_cartera = {
     "status": "idle",  # idle | running | done | error
     "started_at": None,
     "finished_at": None,
@@ -78,8 +96,63 @@ def _run_cruce():
             )
 
 
+def _run_activar_cartera():
+    """Corre activar_cartera.py (el swap de versión, Spec C) en background.
+    Deliberadamente NO encadena sync_cartera.py ni cruzar.py antes/después:
+    el botón "Cargar Cartera" solo dispara el swap — es responsabilidad del
+    usuario haber revisado staging antes de apretarlo, y el próximo tick del
+    cron (o un POST /trigger/cruce aparte) ya recalcula lo que siga."""
+    with _lock_cartera:
+        _state_cartera.update(
+            status="running",
+            started_at=datetime.now(timezone.utc).isoformat(),
+            finished_at=None,
+            exit_code=None,
+            log_tail="",
+        )
+    try:
+        result = subprocess.run(
+            [PYTHON, "activar_cartera.py"],
+            cwd=REPO_DIR, capture_output=True, text=True, timeout=600,
+        )
+        with _lock_cartera:
+            _state_cartera.update(
+                status="done" if result.returncode == 0 else "error",
+                finished_at=datetime.now(timezone.utc).isoformat(),
+                exit_code=result.returncode,
+                log_tail=(result.stdout + result.stderr)[-4000:],
+            )
+    except Exception as exc:
+        with _lock_cartera:
+            _state_cartera.update(
+                status="error",
+                finished_at=datetime.now(timezone.utc).isoformat(),
+                exit_code=-1,
+                log_tail=str(exc),
+            )
+
+
 def _autorizado() -> bool:
     return request.headers.get("Authorization") == f"Bearer {TRIGGER_TOKEN}"
+
+
+@app.post("/trigger/cartera/activar")
+def trigger_activar_cartera():
+    if not _autorizado():
+        return jsonify(error="unauthorized"), 401
+    with _lock_cartera:
+        if _state_cartera["status"] == "running":
+            return jsonify(status="already_running", **_state_cartera), 409
+    threading.Thread(target=_run_activar_cartera, daemon=True).start()
+    return jsonify(status="started"), 202
+
+
+@app.get("/trigger/cartera/activar/status")
+def trigger_activar_cartera_status():
+    if not _autorizado():
+        return jsonify(error="unauthorized"), 401
+    with _lock_cartera:
+        return jsonify(**_state_cartera)
 
 
 @app.post("/trigger/cruce")
