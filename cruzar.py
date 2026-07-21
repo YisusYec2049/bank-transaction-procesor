@@ -436,28 +436,24 @@ def _cruzar_stripe(card_name: str, email_lower: str, lookup_stripe: dict,
 WOMPI_REPORTE_PATTERN = 'ReportePagosWompi'
 PAGOS_MANUALES_LABEL  = 'PAGOS MANUALES'
 WOMPI_GENERA_LINK_LABEL = 'WOMPI (Genera Link)'
-_PREFIJOS_DOCUMENTO_WOMPI = ('CC-', 'CEDULA_DE_EXTRANJERIA-')
-
-
-def _normalizar_documento_wompi(valor: str) -> str:
-    """Quita el prefijo de tipo de documento que trae la columna `Documento`
-    de ReportePagosWompi (ej. "CC-1143335891" -> "1143335891"), para poder
-    comparar contra `identification` (que nunca trae este prefijo). También
-    limpia espacios sueltos alrededor del número (vistos en datos reales,
-    ej. "CC- 35412765 ")."""
-    v = valor.strip().upper()
-    for pref in _PREFIJOS_DOCUMENTO_WOMPI:
-        if v.startswith(pref):
-            return v[len(pref):].strip()
-    return v
 
 
 def _cargar_lookup_wompi_reporte(sa_json: str, folder_id: str) -> tuple[dict[str, dict], bool]:
     """Lee el ReportePagosWompi_*.xlsx más reciente directo de Drive y arma
-    {documento_normalizado: {pagador, comprobante, inscripcion, id_transaccion,
+    {id_transaccion: {pagador, comprobante, inscripcion, id_transaccion,
     proyecto, fecha_pago}} en memoria — no se guarda en ninguna tabla, se
     descarta al terminar la corrida.
-    Primera coincidencia gana (mismo criterio BUSCARV que el resto del script).
+
+    Indexado por `id_transaccion` (columna "Transaction Id (Wompi)"), NO por
+    documento (21 de julio, regla #2 de "Automatización de Cartera"): el
+    match anterior por `Documento` vs `identification` fallaba cuando la
+    cédula no calzaba limpio, clasificando pagos que SÍ fueron por link como
+    "PAGOS MANUALES". El id de transacción es único — WOMPI lo guarda como
+    `matching_key` en `consolidated_transactions` (ver `fuentes/wompi.py`,
+    `VAL` = id de la transacción), así que cruzar código contra código es
+    exacto. Filas del reporte sin `id_transaccion` se omiten (no hay con qué
+    cruzarlas). Primera coincidencia gana (mismo criterio BUSCARV que el
+    resto del script).
 
     Devuelve (lookup, disponible). `disponible=False` significa que esta
     corrida no pudo cargar el reporte en absoluto (config faltante o archivo
@@ -480,10 +476,10 @@ def _cargar_lookup_wompi_reporte(sa_json: str, folder_id: str) -> tuple[dict[str
     filas = read_pagos_wompi_reporte(download_file(drive, file_id))
     lookup = {}
     for fila in filas:
-        doc = _normalizar_documento_wompi(fila.get('documento') or '')
-        if doc and doc not in lookup:
-            lookup[doc] = fila
-    log.info('ReportePagosWompi: %d documentos indexados (de %d filas).', len(lookup), len(filas))
+        tx_id = str(fila.get('id_transaccion') or '').strip()
+        if tx_id and tx_id not in lookup:
+            lookup[tx_id] = fila
+    log.info('ReportePagosWompi: %d id(s) de transacción indexados (de %d filas).', len(lookup), len(filas))
     return lookup, True
 
 
@@ -885,8 +881,8 @@ def main():
         program = t.get('program')
         wompi_link_resuelto, wompi_link_pendiente = False, False
         if wompi_reporte_disponible and payment_method.startswith('WOMPI'):
-            doc = _normalizar_documento_wompi(identification) if identification else ''
-            match = lookup_wompi_reporte.get(doc) if doc else None
+            tx_id = str(t.get('matching_key') or '').strip()
+            match = lookup_wompi_reporte.get(tx_id) if tx_id else None
             if match:
                 val            = match.get('id_transaccion') or None
                 nombre         = match.get('pagador') or None
@@ -1015,9 +1011,8 @@ def main():
             payment_method = str(r.get('payment_method') or '').upper()
             if not payment_method.startswith('WOMPI'):
                 continue
-            identification = str(r.get('identification') or '').strip()
-            doc = _normalizar_documento_wompi(identification) if identification else ''
-            match = lookup_wompi_reporte.get(doc) if doc else None
+            tx_id = str(r.get('matching_key') or '').strip()
+            match = lookup_wompi_reporte.get(tx_id) if tx_id else None
             if not match:
                 continue
             update = {
