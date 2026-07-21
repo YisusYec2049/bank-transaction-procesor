@@ -336,11 +336,12 @@ def upsert_pagos_apartados(supabase_url: str, service_role_key: str, rows: list[
 
 
 def upsert_cartera_saldos_favor(supabase_url: str, service_role_key: str, rows: list[dict]) -> None:
-    """Upsert por (matching_key, llave_origen) a cartera_saldos_favor
-    (Sobrantes/Excedentes, 17 de julio): crédito a favor de una inscripción
-    generado por un SOBRANTE (modo A) — se consumirá contra una cuota
-    futura de la MISMA inscripción, antepuesto como pago sintético en
-    cruzar_cartera_preventiva.py."""
+    """Upsert por (matching_key, llave_origen) a cartera_saldos_favor: el
+    ledger de saldo a favor asociable por cliente (modelo "Saldo a Favor
+    Manual", 21 de julio). El pipeline solo escribe filas `origen='sobrante'`
+    (plata que sobró tras cubrir todas las cuotas conocidas de una
+    inscripción) — nunca las consume ni las marca `aplicado`; eso lo hace
+    `financial-platform` al asociar/descartar a mano."""
     if not rows:
         return
     hdrs = _headers(service_role_key, prefer='return=minimal,resolution=merge-duplicates')
@@ -352,26 +353,6 @@ def upsert_cartera_saldos_favor(supabase_url: str, service_role_key: str, rows: 
     )
     _raise_for_status(resp)
     log.info('Upsert cartera_saldos_favor OK: %d registros.', len(rows))
-
-
-def marcar_saldos_favor_aplicados(supabase_url: str, service_role_key: str, ids: list[int]) -> None:
-    """PATCH por id: marca aplicado=true en cartera_saldos_favor — el
-    crédito ya entró a una cascada y se dio por completo consumido (si
-    sobró algo, ese remanente vive en una fila NUEVA, ver
-    upsert_cartera_saldos_favor)."""
-    if not ids:
-        return
-    hdrs = _headers(service_role_key, prefer='return=minimal')
-    valores = ','.join(str(i) for i in ids)
-    resp = http.patch(
-        f'{supabase_url}/rest/v1/cartera_saldos_favor',
-        params={'id': f'in.({valores})'},
-        json={'aplicado': True},
-        headers=hdrs,
-        timeout=30,
-    )
-    _raise_for_status(resp)
-    log.info('cartera_saldos_favor: %d crédito(s) marcados aplicado=true.', len(ids))
 
 
 def delete_by_keys(supabase_url: str, service_role_key: str, table: str,
