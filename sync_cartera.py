@@ -46,7 +46,7 @@ from datetime import datetime
 import pytz
 from dotenv import load_dotenv
 
-from utils.drive import build_drive_service, find_file_id, find_latest_file, download_pdf as download_file, move_file
+from utils.drive import build_drive_service, find_latest_any_file, download_pdf as download_file, move_file
 from utils.excel_cartera import (
     read_inscrip, read_bancolombia_2576, read_wompi, read_stripe_usa,
     read_cartera_preventiva,
@@ -180,14 +180,17 @@ def main():
                       len(rows), carga_id)
         return ok
 
+    # Cada carpeta es dedicada a un tipo: se toma el archivo más reciente que
+    # haya en ella, sin importar el nombre (find_latest_any_file). El `nombre`
+    # que se pasa es solo la etiqueta para los logs.
     _procesar_opcional(drive, PAYU_UC_FILENAME, payu_uc_folder_id, payu_uc_hist_folder_id,
-                       lambda d, f: find_file_id(d, f, PAYU_UC_FILENAME), _cargar_payu_uc)
+                       lambda d, f: find_latest_any_file(d, f), _cargar_payu_uc)
 
     _procesar_opcional(drive, INGRESOS_FILENAME, ingresos_folder_id, ingresos_hist_folder_id,
-                       lambda d, f: find_file_id(d, f, INGRESOS_FILENAME), _cargar_ingresos)
+                       lambda d, f: find_latest_any_file(d, f), _cargar_ingresos)
 
     _procesar_opcional(drive, CARTERA_PREV_PATTERN, cartera_prev_folder_id, cartera_prev_hist_folder_id,
-                       lambda d, f: find_latest_file(d, f, CARTERA_PREV_PATTERN), _cargar_cartera_prev)
+                       lambda d, f: find_latest_any_file(d, f), _cargar_cartera_prev)
 
     log.info('sync_cartera.py completado.')
 

@@ -37,6 +37,18 @@ def find_latest_file(drive, folder_id: str, contains: str) -> str | None:
     return matches[-1]['id'] if matches else None
 
 
+def find_latest_any_file(drive, folder_id: str) -> str | None:
+    """Devuelve el id del archivo más reciente (por createdTime) en la carpeta,
+    SIN importar el nombre. Cada carpeta de cruce es dedicada a un solo tipo de
+    archivo (Payu UC, Ingresos, Cartera Preventiva), así que CUALQUIER archivo
+    que entre ahí ES ese tipo — no se exige un nombre concreto (decisión del
+    usuario, 2026-07-21: "todo archivo que entre a la carpeta se lee como el
+    tipo de esa carpeta"). list_files ya excluye subcarpetas y archivos nativos
+    de Google, y ordena por createdTime, así que [-1] es el más reciente."""
+    archivos = list_files(drive, folder_id)
+    return archivos[-1]['id'] if archivos else None
+
+
 def list_files(drive, folder_id: str) -> list[dict]:
     """Lista todos los archivos (no carpetas, no nativos de Google) en la carpeta."""
     result = drive.files().list(
