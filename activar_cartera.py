@@ -68,6 +68,24 @@ def _sin_id(rows: list[dict]) -> list[dict]:
     return [{k: v for k, v in r.items() if k != 'id'} for r in rows]
 
 
+def _dedup_por_llave(rows: list[dict]) -> list[dict]:
+    """Se queda con UNA fila por 'llave' (primera coincidencia gana) — el
+    Excel de cartera trae llaves repetidas, pero cartera_preventiva.llave es
+    único (idx_cartera_preventiva_llave_unique). Sin esto, el INSERT hacia la
+    tabla viva falla con 23505 (duplicate key) y el swap se cae a mitad,
+    dejando la cartera viva vacía. Mismo criterio de dedup que
+    sync_cartera_preventiva."""
+    vistas: set = set()
+    out: list[dict] = []
+    for r in rows:
+        llave = r.get('llave')
+        if not llave or llave in vistas:
+            continue
+        vistas.add(llave)
+        out.append(r)
+    return out
+
+
 def main():
     load_dotenv()
     supabase_url = os.environ.get('SUPABASE_URL', '')
@@ -122,12 +140,14 @@ def main():
     delete_all_rows(supabase_url, srk, 'cartera_saldos_favor', 'id')
     delete_all_rows(supabase_url, srk, 'cartera_preventiva_overrides', 'llave')
 
-    log.info('Activando la versión staged (%d fila(s))...', len(staging_rows))
-    insert_rows(supabase_url, srk, 'cartera_preventiva', _sin_id(staging_rows))
+    staging_unicas = _dedup_por_llave(staging_rows)
+    log.info('Activando la versión staged (%d fila(s) del Excel, %d únicas por llave)...',
+             len(staging_rows), len(staging_unicas))
+    insert_rows(supabase_url, srk, 'cartera_preventiva', _sin_id(staging_unicas))
     delete_all_rows(supabase_url, srk, 'cartera_preventiva_staging', 'id')
 
     log.info('Actualizando cartera_cargas...')
-    cargas_a_upsert = [{'carga_id': carga_entrante_id, 'estado': 'activa', 'filas': len(staging_rows)}]
+    cargas_a_upsert = [{'carga_id': carga_entrante_id, 'estado': 'activa', 'filas': len(staging_unicas)}]
     if activa_rows or carga_activa:
         filas_saliente = carga_activa['filas'] if carga_activa else len(activa_rows)
         cargas_a_upsert.insert(0, {'carga_id': carga_saliente_id, 'estado': 'archivada',
@@ -135,7 +155,7 @@ def main():
     upsert_cartera_cargas(supabase_url, srk, cargas_a_upsert)
 
     log.info('activar_cartera.py completado: versión %s archivada, versión %s activada (%d cuotas).',
-              carga_saliente_id, carga_entrante_id, len(staging_rows))
+              carga_saliente_id, carga_entrante_id, len(staging_unicas))
 
 
 if __name__ == '__main__':

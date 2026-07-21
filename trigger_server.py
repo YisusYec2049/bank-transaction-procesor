@@ -142,7 +142,7 @@ def trigger_activar_cartera():
         return jsonify(error="unauthorized"), 401
     with _lock_cartera:
         if _state_cartera["status"] == "running":
-            return jsonify(status="already_running", **_state_cartera), 409
+            return jsonify({**_state_cartera, "status": "already_running"}), 409
     threading.Thread(target=_run_activar_cartera, daemon=True).start()
     return jsonify(status="started"), 202
 
@@ -161,7 +161,7 @@ def trigger_cruce():
         return jsonify(error="unauthorized"), 401
     with _lock:
         if _state["status"] == "running":
-            return jsonify(status="already_running", **_state), 409
+            return jsonify({**_state, "status": "already_running"}), 409
     threading.Thread(target=_run_cruce, daemon=True).start()
     return jsonify(status="started"), 202
 
