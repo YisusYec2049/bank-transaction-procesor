@@ -171,10 +171,42 @@ def _generar_llave_saldo(llave_base: str, matching_key: str) -> str:
 def _fila_reset(cuota_id) -> dict:
     """Dict de reset a NULL de las columnas de resultado del cruce para una
     cuota — usado tanto por el reset de asociaciones huérfanas como por el
-    reset de cuotas que perdieron todas sus asociaciones por un descarte."""
+    reset de cuotas que perdieron todas sus asociaciones por un descarte, o
+    que se reabren al apagar `cerrado_manual`.
+
+    ADVERTENCIA (bug PGRST102, ver `_fila_cierre`): este dict tiene un set de
+    claves DISTINTO al de `_fila_cierre` (no incluye `valor_cuota`/
+    `valor_a_cobrar`). Nunca mezclar filas de `_fila_reset` en el mismo array
+    que filas de `_fila_cierre` en una misma llamada a
+    `upsert_cartera_preventiva` — escribirlas en una lista/POST aparte."""
     return {'id': cuota_id, 'fecha_pago': None, 'medio_pago': None, 'valor_pago': None,
             'codigo_transaccion_1': None, 'codigo_transaccion_2': None, 'correo_elec': None,
             'diferencia': None, 'fecha_cruce': None, 'notificacion': None}
+
+
+def _fila_cierre_cartera(cuota: dict, fecha_pago_manual: str, hoy: str) -> dict:
+    """Cierre MANUAL de una cuota puntual (regla #8, "Cerrar cartera") — la
+    persona la marca desde financial-platform y elige la fecha. No viene de
+    un pago real: `valor_pago` = `valor_a_cobrar` (el saldo pendiente actual
+    de la cuota, confirmado por el usuario — no `valor_cuota`), `medio_pago`
+    literal `'Cartera'`, `notificacion='CARTERA'`. Mismo set de claves que
+    `_fila_cierre` (12), para poder mezclarse en el mismo array/POST sin
+    disparar PGRST102."""
+    valor_a_cobrar = cuota.get('valor_a_cobrar')
+    return {
+        'id':                   cuota['id'],
+        'fecha_pago':           fecha_pago_manual,
+        'medio_pago':           'Cartera',
+        'valor_pago':           valor_a_cobrar,
+        'codigo_transaccion_1': None,
+        'codigo_transaccion_2': None,
+        'correo_elec':          None,
+        'fecha_cruce':          hoy,
+        'notificacion':         'CARTERA',
+        'diferencia':           0,
+        'valor_cuota':          cuota.get('valor_cuota'),
+        'valor_a_cobrar':       valor_a_cobrar,
+    }
 
 
 def _aplicar_pagos_inscripcion(cuotas_abiertas: list[dict], pagos_nuevos: list[dict]):
@@ -402,8 +434,9 @@ def main():
 
     log.info('Cargando overrides y asociaciones existentes...')
     overrides_rows = select_all(supabase_url, srk, 'cartera_preventiva_overrides',
-                                 select='llave,cerrado_manual')
+                                 select='llave,cerrado_manual,fecha_pago_manual')
     llaves_cerradas_manual = {r['llave'] for r in overrides_rows if r.get('cerrado_manual')}
+    cerrados_manual_por_llave = {r['llave']: r for r in overrides_rows if r.get('cerrado_manual')}
 
     asociaciones_rows = select_all(supabase_url, srk, 'pago_asociaciones',
                                     select='id,matching_key,llave,monto,origen')
@@ -418,6 +451,56 @@ def main():
     id_por_llave      = {c['llave']: c['id'] for c in cuotas_rows if c.get('llave')}
     llave_por_id      = {c['id']: c['llave'] for c in cuotas_rows}
     cliente_por_llave = {c['llave']: c.get('cliente') for c in cuotas_rows if c.get('llave')}
+
+    # Regla #8 — "Cerrar cartera": cierre MANUAL de una cuota puntual, fuera
+    # del proceso (fin-platform escribe cerrado_manual=true +
+    # fecha_pago_manual). Estas filas van en listas propias porque
+    # `_fila_cierre_cartera` y `_fila_reset` no comparten el mismo set de
+    # claves entre sí (ver docstrings) — cada una se postea en su propio
+    # array más abajo.
+    cierres_cartera: list[dict] = []
+    resets_varios: list[dict] = []
+    cerrados_cartera = 0
+    reabiertos_cartera = 0
+    for cuota in cuotas_rows:
+        llave = cuota.get('llave') or ''
+        if not llave:
+            continue
+        override = cerrados_manual_por_llave.get(llave)
+        fecha_manual = override.get('fecha_pago_manual') if override else None
+        if fecha_manual:
+            valor_a_cobrar = cuota.get('valor_a_cobrar')
+            ya_reflejado = (
+                cuota.get('notificacion') == 'CARTERA'
+                and cuota.get('fecha_pago') == fecha_manual
+                and cuota.get('valor_pago') is not None
+                and valor_a_cobrar is not None
+                and round(float(cuota['valor_pago']), 2) == round(float(valor_a_cobrar), 2)
+            )
+            if ya_reflejado:
+                continue
+            fila = _fila_cierre_cartera(cuota, fecha_manual, hoy)
+            cierres_cartera.append(fila)
+            cuota['fecha_pago']    = fecha_manual
+            cuota['valor_pago']    = valor_a_cobrar
+            cuota['diferencia']    = 0
+            cuota['notificacion']  = 'CARTERA'
+            cuota['fecha_cruce']   = hoy
+            cerrados_cartera += 1
+        elif cuota.get('notificacion') == 'CARTERA':
+            # cerrado_manual se apagó (reabrir) o nunca tuvo fecha puesta —
+            # sin fecha no se cierra (P1), así que si quedó marcada CARTERA
+            # de una corrida anterior, se resetea a pendiente.
+            resets_varios.append(_fila_reset(cuota['id']))
+            cuota['fecha_pago']   = None
+            cuota['valor_pago']   = None
+            cuota['diferencia']   = None
+            cuota['fecha_cruce']  = None
+            cuota['notificacion'] = None
+            reabiertos_cartera += 1
+    if cerrados_cartera or reabiertos_cartera:
+        log.info('Cartera manual (regla #8): %d cuota(s) cerradas, %d reabierta(s).',
+                  cerrados_cartera, reabiertos_cartera)
 
     log.info('Cargando ledger de saldo a favor (cartera_saldos_favor)...')
     saldos_favor_rows = select_all(
@@ -466,7 +549,7 @@ def main():
     for a in asociaciones_vigentes:
         asociaciones_por_llave.setdefault(a['llave'], []).append(a)
 
-    actualizaciones_cierre: list[dict] = []
+    actualizaciones_cierre: list[dict] = list(cierres_cartera)
     lineas_nuevas: list[dict] = []
     nuevas_asociaciones: list[dict] = []
     saldos_favor_nuevos: list[dict] = []
@@ -517,7 +600,7 @@ def main():
             continue
         if llave in asociaciones_por_llave:
             continue  # todavía tiene asociación(es) vigente(s)
-        actualizaciones_cierre.append(_fila_reset(cuota['id']))
+        resets_varios.append(_fila_reset(cuota['id']))
         cuota['fecha_pago'] = None
         cuota['valor_pago'] = None
         cuota['diferencia'] = None
@@ -627,11 +710,16 @@ def main():
         batch_size = 500
         for i in range(0, len(actualizaciones_cierre), batch_size):
             upsert_cartera_preventiva(supabase_url, srk, actualizaciones_cierre[i:i + batch_size])
+    if resets_varios:
+        # Set de claves distinto al de `_fila_cierre` (ver docstring de
+        # `_fila_reset`) — SIEMPRE en su propio POST, nunca mezclado con
+        # `actualizaciones_cierre`.
+        upsert_cartera_preventiva(supabase_url, srk, resets_varios)
 
-    log.info('cruzar_cartera_preventiva.py: %d cuota(s) actualizadas, %d línea(s) nueva(s), '
-              '%d asociación(es) nueva(s), %d saldo(s) a favor nuevo(s).',
-              len(actualizaciones_cierre), len(lineas_nuevas), len(nuevas_asociaciones),
-              len(saldos_favor_nuevos))
+    log.info('cruzar_cartera_preventiva.py: %d cuota(s) actualizadas, %d reseteada(s), '
+              '%d línea(s) nueva(s), %d asociación(es) nueva(s), %d saldo(s) a favor nuevo(s).',
+              len(actualizaciones_cierre), len(resets_varios), len(lineas_nuevas),
+              len(nuevas_asociaciones), len(saldos_favor_nuevos))
 
     # §3.3.2 (P3): sincronizar la diferencia positiva de la cuota ORIGEN de
     # cada saldo a favor tipo 'sobrante' con su `disponible` restante.
