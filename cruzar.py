@@ -261,6 +261,56 @@ def _es_pago_llave(identification: str, email: str) -> bool:
     return identification in ID_CANAL_PAGO_LLAVE or email in ID_CANAL_PAGO_LLAVE
 
 
+def _cargar_correcciones_documento(supabase_url: str, srk: str) -> dict[str, str]:
+    """Mapa documento_original -> documento_corregido (tabla que llena
+    financial-platform cuando alguien edita un documento a mano)."""
+    rows = select_all(supabase_url, srk, 'documento_correcciones',
+                       select='documento_original,documento_corregido')
+    return {
+        str(r['documento_original']).strip(): str(r['documento_corregido']).strip()
+        for r in rows
+        if str(r.get('documento_original') or '').strip()
+        and str(r.get('documento_corregido') or '').strip()
+    }
+
+
+def _aplicar_correcciones_documento(transacciones: list[dict],
+                                     correcciones: dict[str, str]) -> list[dict]:
+    """Aplica las correcciones de documento al leer el consolidado, para que
+    INCP y CORREO(2) busquen con el número bueno.
+
+    procesar_todos.py ya las aplica al ingresar cada archivo, pero eso solo
+    cubre los pagos que entran DESPUÉS de la corrección. Las transacciones ya
+    guardadas las corrige financial-platform escribiendo `identification`
+    directo en la tabla — y ahí estaba el hueco: en Bancolombia 2576/2833
+    `email` es una copia literal del documento (ver normalize() de cada
+    módulo), y esa app no lo sabe ni tiene por qué saberlo, así que solo
+    corregía `identification`. CORREO(2) seguía buscando con el número viejo.
+
+    Acá se corrigen los dos campos. `email` solo se toca cuando su valor ES
+    el documento original (nunca un correo de verdad), así que aplicarlo a
+    todos los bancos es inofensivo: en los demás `email` trae un correo y no
+    coincide con la llave. `matching_key` no se recalcula a propósito — la
+    fila ya existe con esa llave en las 3 tablas y renombrarla la duplicaría.
+    """
+    if not correcciones:
+        return transacciones
+    corregidas = 0
+    for t in transacciones:
+        documento = str(t.get('identification') or '').strip()
+        email     = str(t.get('email') or '').strip()
+        nuevo_doc = correcciones.get(documento)
+        if nuevo_doc:
+            t['identification'] = nuevo_doc
+            corregidas += 1
+        nuevo_email = correcciones.get(email)
+        if nuevo_email:
+            t['email'] = nuevo_email
+    if corregidas:
+        log.info('%d transacción(es) con documento corregido a mano.', corregidas)
+    return transacciones
+
+
 def _es_valor_relleno(valor: str) -> bool:
     """True si el valor es basura de captura del Excel de referencia, no un
     cruce real: un punto solo (".") o un sufijo (PN/PJ) sin ningún dígito
@@ -717,16 +767,22 @@ def main():
     lookup_wompi_reporte, wompi_reporte_disponible = _cargar_lookup_wompi_reporte(
         sa_json, wompi_reporte_folder_id)
 
+    correcciones_documento = _cargar_correcciones_documento(supabase_url, srk)
+    log.info('%d corrección(es) de documento cargadas.', len(correcciones_documento))
+
     log.info('Cargando estado_cruce existente...')
     existentes = select_all(
         supabase_url, srk, 'cruce_cartera',
         select='matching_key,identification,payment_method,estado_cruce,corregido_manual',
     )
-    llaves_terminadas = {
+    identificacion_cruzada = {
+        r['matching_key']: str(r.get('identification') or '').strip()
+        for r in existentes
+    }
+    terminadas = {
         r['matching_key'] for r in existentes
         if r.get('estado_cruce') in ('cruzado', 'no_identificable')
     }
-    log.info('%d filas ya resueltas (cruzado/no_identificable), se saltan.', len(llaves_terminadas))
 
     log.info('Cargando consolidated_transactions...')
     transacciones = select_all(
@@ -735,6 +791,31 @@ def main():
                'email,payment_method,program,phone,payment_amount,matching_key,'
                'registration_date',
     )
+    transacciones = _aplicar_correcciones_documento(transacciones, correcciones_documento)
+
+    # Una fila terminal se salta, SALVO que el documento con el que se cruzó ya
+    # no sea el documento que tiene hoy: eso significa que alguien lo corrigió
+    # a mano después de haberla cruzado, y la identidad con la que se resolvió
+    # dejó de ser válida. Se reabre para que INCP y CORREO(2) vuelvan a correr
+    # con el documento bueno.
+    #
+    # No se cicla: al re-cruzarla se reescribe `identification` en
+    # cruce_cartera (es passthrough del consolidado), así que en la corrida
+    # siguiente los dos valores coinciden y la fila vuelve a saltarse. Y un
+    # "no se logra identificar" marcado a mano no reabre nada, porque ahí el
+    # documento no cambia.
+    reabiertas = [
+        t['matching_key'] for t in transacciones
+        if t.get('matching_key') in terminadas
+        and str(t.get('identification') or '').strip()
+            != identificacion_cruzada.get(t['matching_key'], '')
+    ]
+    if reabiertas:
+        log.info('%d fila(s) terminales reabiertas por corrección de documento: %s',
+                 len(reabiertas), ', '.join(reabiertas[:5]))
+    llaves_terminadas = terminadas - set(reabiertas)
+    log.info('%d filas ya resueltas (cruzado/no_identificable), se saltan.', len(llaves_terminadas))
+
     transacciones = [t for t in transacciones if t.get('matching_key') not in llaves_terminadas]
     log.info('%d transacciones a cruzar.', len(transacciones))
 
