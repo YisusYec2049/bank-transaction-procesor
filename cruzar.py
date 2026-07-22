@@ -18,12 +18,10 @@ mirror estén al día.
 
 Excepciones (requieren revisión humana en financial-platform, no se resuelven
 solas aquí):
-  - sin_cruce:        ni INCP ni CORREO(2) encontraron resultado. Excepción
-                      (22 de julio): en WOMPI esto cierra 'no_identificable'
-                      en vez de 'pendiente' — no entra al panel de Excepciones
-                      porque no hay nada que corregir a mano (ver el bloque de
-                      clasificación para el detalle). El motivo se conserva
-                      para poder filtrarlos; lo que cambia es el estado.
+  - sin_cruce:        ni INCP ni CORREO(2) encontraron resultado. Va al panel
+                      de Excepciones para TODOS los bancos, sin distinción —
+                      el pipeline nunca cierra una fila por su cuenta, cerrar
+                      es siempre decisión de una persona.
   - cruce_ambiguo:    la llave de búsqueda (identification o email) aparece en
                       la hoja de referencia con más de un valor distinto (ej.
                       una pareja que paga dos inscripciones con el mismo
@@ -108,7 +106,9 @@ la revisión manual en financial-platform sigue siendo quien decide.
 
 Filas ya resueltas (estado_cruce = 'cruzado' o 'no_identificable') no se vuelven
 a tocar en corridas futuras, así una corrección manual o un "no identificable"
-marcado en financial-platform queda protegido.
+marcado en financial-platform queda protegido. Ambos estados los pone siempre
+una persona desde la UI: este script solo produce 'cruzado' (cuando el cruce
+resuelve limpio) y 'pendiente' — nunca cierra un 'no_identificable' solo.
 
 NOMBRE / MÉTODO DE PAGO / CI / VAL / PROGRAM — WOMPI LINK vs MANUAL (13-14 de
 julio, reescrito el 16 como Fase 9 del rediseño): se lee
@@ -1004,23 +1004,24 @@ def main():
             # Excel. Motivo propio, no 'sin_cruce'.
             if stripe_pendiente_incp:
                 excepcion_motivo, estado_cruce = 'pendiente_asignar_incp', 'pendiente'
-            elif payment_method.startswith('WOMPI'):
-                # WOMPI sin cruce alguno se cierra 'no_identificable' en vez
-                # de quedar 'pendiente' (22 de julio, pedido del usuario).
-                # Motivo: no hay nada que una persona pueda corregir a mano —
-                # el documento y el correo vienen bien, simplemente no existen
-                # en cartera_inscrip ni en la hoja WOMPI de Ingresos, así que
-                # no hay INCP con qué cruzar. Medido ese día: 65 de 65 casos
-                # son 'PAGOS MANUALES' y todos traen documento y correo.
-                # A diferencia de 'cruce_ambiguo'/'cruce_discrepante' (donde
-                # la persona elige entre candidatos reales), acá el panel de
-                # Excepciones solo acumulaba ruido.
-                # 'no_identificable' es TERMINAL a propósito (decisión
-                # explícita del usuario): si el equipo registra ese documento
-                # más adelante, el pago NO se recupera solo. Los demás bancos
-                # siguen yendo a 'sin_cruce'/'pendiente' como siempre.
-                excepcion_motivo, estado_cruce = 'sin_cruce', 'no_identificable'
             else:
+                # Sin cruce por ninguna vía: queda 'pendiente' y va al panel de
+                # Excepciones, para TODOS los bancos sin distinción.
+                #
+                # El 22 de julio (mañana) WOMPI se cerraba acá mismo como
+                # 'no_identificable', con el argumento de que nadie podía
+                # resolverlo a mano. Revertido esa misma tarde: cerrar es una
+                # decisión de una persona, no del pipeline. Cerrarlo solo lo
+                # volvía terminal, y terminal significa que si el equipo
+                # registra ese documento más adelante el pago YA NO se
+                # recupera (cruzar.py se salta las filas resueltas). Eran 109
+                # pagos / $97M cerrados sin que nadie lo decidiera.
+                #
+                # Quién cierra ahora: una persona, con el botón "No se logra
+                # identificar" de Excepciones. Y solo entonces la fila sale de
+                # Excepciones — si es WOMPI pasa a verse en la pestaña Todas,
+                # el resto se queda en Excepciones marcada como cerrada (el
+                # filtrado de las dos vistas vive en financial-platform).
                 excepcion_motivo, estado_cruce = 'sin_cruce', 'pendiente'
         elif not incp and correo_2:
             # Solo CORREO(2) identificó, sin confirmación de INCP — señal más
@@ -1114,16 +1115,9 @@ def main():
     cruzados    = sum(1 for r in resultado if r['estado_cruce'] == 'cruzado')
     sin_cruce   = sum(1 for r in resultado if r['excepcion_motivo'] == 'sin_cruce')
     ambiguos    = sum(1 for r in resultado if r['excepcion_motivo'] == 'cruce_ambiguo')
-    # De los 'sin_cruce', cuántos son WOMPI cerrados como no identificables
-    # (22 de julio) — se separan en el log porque NO entran a Excepciones.
-    wompi_cerrados = sum(
-        1 for r in resultado
-        if r['excepcion_motivo'] == 'sin_cruce'
-        and r['estado_cruce'] == 'no_identificable'
-    )
-    log.info('cruzar.py completado: %d filas | cruzadas=%d | sin_cruce=%d '
-             '(de esos, %d WOMPI cerrados no_identificable) | cruce_ambiguo=%d',
-              len(resultado), cruzados, sin_cruce, wompi_cerrados, ambiguos)
+    log.info('cruzar.py completado: %d filas | cruzadas=%d | sin_cruce=%d | '
+             'cruce_ambiguo=%d',
+              len(resultado), cruzados, sin_cruce, ambiguos)
 
 
 if __name__ == '__main__':
