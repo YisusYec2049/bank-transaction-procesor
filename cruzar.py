@@ -18,7 +18,12 @@ mirror estén al día.
 
 Excepciones (requieren revisión humana en financial-platform, no se resuelven
 solas aquí):
-  - sin_cruce:        ni INCP ni CORREO(2) encontraron resultado.
+  - sin_cruce:        ni INCP ni CORREO(2) encontraron resultado. Excepción
+                      (22 de julio): en WOMPI esto cierra 'no_identificable'
+                      en vez de 'pendiente' — no entra al panel de Excepciones
+                      porque no hay nada que corregir a mano (ver el bloque de
+                      clasificación para el detalle). El motivo se conserva
+                      para poder filtrarlos; lo que cambia es el estado.
   - cruce_ambiguo:    la llave de búsqueda (identification o email) aparece en
                       la hoja de referencia con más de un valor distinto (ej.
                       una pareja que paga dos inscripciones con el mismo
@@ -687,15 +692,25 @@ def main():
     # cartera_preventiva ni requiere que cruzar_cartera_preventiva.py haya
     # corrido en este mismo ciclo (usa el estado tal cual está ahora mismo).
     preventiva_rows_arbitro = select_all(supabase_url, srk, 'cartera_preventiva',
-                                          select='inscrip,fecha_pago')
+                                          select='inscrip,cruce_access,fecha_pago')
     bases_con_deuda: set[str] = set()
+    # Documento del deudor -> inscripciones (valor tal cual, con sufijo) que le
+    # pertenecen en cartera preventiva. Se usa para desempatar por IDENTIDAD
+    # antes que por deuda (22 de julio) — ver el bloque de la Fase 3.6.
+    # A diferencia de bases_con_deuda, acá NO se filtra por fecha_pago: a quién
+    # pertenece una inscripción no cambia porque la cuota ya se haya pagado.
+    inscripciones_por_documento: dict[str, set[str]] = {}
     for r in preventiva_rows_arbitro:
-        if r.get('fecha_pago') is not None:
-            continue
         insc = str(r.get('inscrip') or '').strip()
-        if insc:
+        if not insc:
+            continue
+        if r.get('fecha_pago') is None:
             bases_con_deuda.add(_normalizar_sufijo(insc) or insc)
+        doc = _normalizar_nit(str(r.get('cruce_access') or '').strip())
+        if doc:
+            inscripciones_por_documento.setdefault(doc, set()).add(insc)
     log.info('%d inscripciones (base) con al menos una cuota sin pago identificado.', len(bases_con_deuda))
+    log.info('%d documentos con inscripción conocida en cartera preventiva.', len(inscripciones_por_documento))
 
     sa_json = os.environ.get('GOOGLE_SA_JSON', '')
     wompi_reporte_folder_id = os.environ.get('WOMPI_REPORTE_DRIVE_FOLDER_ID', '')
@@ -918,14 +933,54 @@ def main():
                 candidatos_correo = set()
 
             candidatos = _normalizar_candidatos(candidatos_doc | candidatos_correo)
-            candidatos_con_deuda = {c for c in candidatos if _tiene_deuda_pendiente(c, bases_con_deuda)}
 
-            if len(candidatos_con_deuda) == 1:
-                ganador = next(iter(candidatos_con_deuda))
+            # (a) Desempate por IDENTIDAD (22 de julio): de los candidatos,
+            # ¿cuáles le pertenecen en cartera preventiva al mismo documento
+            # que hizo el pago? Va ANTES del filtro por deuda porque es una
+            # señal estable: a quién pertenece una inscripción no cambia
+            # cuando la cuota se paga. El filtro por deuda sí es volátil —
+            # cuando un pago acierta, su cuota deja de estar pendiente y la
+            # evidencia que lo justificaba desaparece (caso real medido:
+            # doc 52905431, candidatos 4643PN/4641PN, ninguno con deuda ya,
+            # así que el filtro por deuda daba 0 y la fila seguía ambigua
+            # aunque 4641PN sea de OTRO documento, el 19427520).
+            #
+            # Solo puede resolver filas que hoy ya son cruce_ambiguo; si no
+            # concluye, se cae al filtro por deuda de siempre. No rompe el
+            # caso legítimo de un tercero pagando por otro (papá por hijo,
+            # empresa por empleado): ahí el documento del pagador no está en
+            # cartera preventiva, el conjunto queda vacío y no se toca nada.
+            ganador = None
+            if identification:
+                del_documento = inscripciones_por_documento.get(
+                    _normalizar_nit(identification), set())
+                # Se compara por número base (mismo criterio que el resto del
+                # archivo: "4643" y "4643PN" son la misma inscripción). El
+                # `or d` replica _tiene_deuda_pendiente, y el descarte de
+                # vacíos evita que dos valores basura (ej. "." o "PN" suelto)
+                # colapsen ambos a "" y se den por iguales.
+                bases_del_documento = {
+                    b for b in ((_normalizar_sufijo(d) or d) for d in del_documento) if b
+                }
+                propios = {
+                    c for c in candidatos
+                    if (_normalizar_sufijo(c) or c) in bases_del_documento
+                }
+                if len(propios) == 1:
+                    ganador = next(iter(propios))
+
+            # (b) Desempate por DEUDA (Fase 3.6 original), si (a) no concluyó.
+            if ganador is None:
+                candidatos_con_deuda = {c for c in candidatos
+                                        if _tiene_deuda_pendiente(c, bases_con_deuda)}
+                if len(candidatos_con_deuda) == 1:
+                    ganador = next(iter(candidatos_con_deuda))
+                # 2+ o 0 candidatos con deuda: sin cambio, sigue cruce_ambiguo
+                # (ya lo era) — ver puntos 4 y 5 de la regla.
+
+            if ganador is not None:
                 incp, correo_2 = ganador, ganador
                 incp_ambiguo, correo_2_ambiguo = False, False
-            # 2+ o 0 candidatos con deuda: sin cambio, sigue cruce_ambiguo
-            # (ya lo era) — ver puntos 4 y 5 de la regla.
 
         if wompi_link_pendiente:
             # Fase 9.2, línea 25: es LINK pero el "Inscripción" del reporte
@@ -949,6 +1004,22 @@ def main():
             # Excel. Motivo propio, no 'sin_cruce'.
             if stripe_pendiente_incp:
                 excepcion_motivo, estado_cruce = 'pendiente_asignar_incp', 'pendiente'
+            elif payment_method.startswith('WOMPI'):
+                # WOMPI sin cruce alguno se cierra 'no_identificable' en vez
+                # de quedar 'pendiente' (22 de julio, pedido del usuario).
+                # Motivo: no hay nada que una persona pueda corregir a mano —
+                # el documento y el correo vienen bien, simplemente no existen
+                # en cartera_inscrip ni en la hoja WOMPI de Ingresos, así que
+                # no hay INCP con qué cruzar. Medido ese día: 65 de 65 casos
+                # son 'PAGOS MANUALES' y todos traen documento y correo.
+                # A diferencia de 'cruce_ambiguo'/'cruce_discrepante' (donde
+                # la persona elige entre candidatos reales), acá el panel de
+                # Excepciones solo acumulaba ruido.
+                # 'no_identificable' es TERMINAL a propósito (decisión
+                # explícita del usuario): si el equipo registra ese documento
+                # más adelante, el pago NO se recupera solo. Los demás bancos
+                # siguen yendo a 'sin_cruce'/'pendiente' como siempre.
+                excepcion_motivo, estado_cruce = 'sin_cruce', 'no_identificable'
             else:
                 excepcion_motivo, estado_cruce = 'sin_cruce', 'pendiente'
         elif not incp and correo_2:
@@ -1043,8 +1114,16 @@ def main():
     cruzados    = sum(1 for r in resultado if r['estado_cruce'] == 'cruzado')
     sin_cruce   = sum(1 for r in resultado if r['excepcion_motivo'] == 'sin_cruce')
     ambiguos    = sum(1 for r in resultado if r['excepcion_motivo'] == 'cruce_ambiguo')
-    log.info('cruzar.py completado: %d filas | cruzadas=%d | sin_cruce=%d | cruce_ambiguo=%d',
-              len(resultado), cruzados, sin_cruce, ambiguos)
+    # De los 'sin_cruce', cuántos son WOMPI cerrados como no identificables
+    # (22 de julio) — se separan en el log porque NO entran a Excepciones.
+    wompi_cerrados = sum(
+        1 for r in resultado
+        if r['excepcion_motivo'] == 'sin_cruce'
+        and r['estado_cruce'] == 'no_identificable'
+    )
+    log.info('cruzar.py completado: %d filas | cruzadas=%d | sin_cruce=%d '
+             '(de esos, %d WOMPI cerrados no_identificable) | cruce_ambiguo=%d',
+              len(resultado), cruzados, sin_cruce, wompi_cerrados, ambiguos)
 
 
 if __name__ == '__main__':
