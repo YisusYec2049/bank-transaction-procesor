@@ -227,15 +227,12 @@ def parse_pdf(pdf_bytes: io.BytesIO) -> list[dict]:
         and f['valor'] >= 0
     ]
 
-    seen, resultado = set(), []
-    for f in validas:
-        key = f'{f["fecha"]}_{f["descripcion"]}_{f["valor"]}'
-        if key not in seen:
-            seen.add(key)
-            resultado.append(f)
-
-    log.info('parse_pdf 2833: %d brutas → %d tras filtros y dedup', len(filas), len(resultado))
-    return resultado
+    # Sin dedup por (fecha, descripción, valor): dos pagos reales del mismo día,
+    # con la misma descripción y el mismo monto, son un caso legítimo y aquí se
+    # perdía el segundo en silencio. Las colisiones de matching_key que esto
+    # genera las numera _asignar_sufijos_duplicados() en procesar_todos.py.
+    log.info('parse_pdf 2833: %d brutas → %d tras filtros', len(filas), len(validas))
+    return validas
 
 
 def normalize(raw_rows: list[dict]) -> list[list]:

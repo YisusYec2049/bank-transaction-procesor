@@ -105,11 +105,15 @@ def _build_services():
 
 def _asignar_sufijos_duplicados(rows: list[tuple], banco: str) -> list[tuple]:
     """Numera colisiones de matching_key por POSICIÓN dentro del lote (un
-    mismo archivo) en vez de descartarlas. Dos pagos reales con la misma
-    llave (mismo día, mismo documento, mismo monto) antes se perdían: el
-    segundo pisaba al primero en el upsert. El sufijo se asigna por posición
-    (1ra ocurrencia sin sufijo, 2da " (duplicado)", 3ra " (duplicado 2)", …)
-    para que reprocesar el mismo archivo dé siempre el mismo resultado."""
+    mismo archivo) en vez de descartarlas. La llave de Bancolombia es
+    fecha+documento+monto, así que una persona que paga 2 o 3 veces el mismo
+    día por el mismo monto genera la misma llave y antes solo sobrevivía el
+    último: el upsert pisaba a los anteriores y la plata desaparecía.
+
+    El sufijo dice cuántas veces pagó, no que la fila esté repetida — el 1er
+    pago va sin sufijo, el 2do " (pago 2)", el 3ro " (pago 3)", … Se asigna
+    por posición para que reprocesar el mismo archivo dé siempre las mismas
+    llaves (idempotente)."""
     contador: dict[str, int] = {}
     resultado = []
     for row in rows:
@@ -119,10 +123,10 @@ def _asignar_sufijos_duplicados(rows: list[tuple], banco: str) -> list[tuple]:
         if n == 0:
             resultado.append(row)
             continue
-        sufijo = ' (duplicado)' if n == 1 else f' (duplicado {n})'
         row = list(row)
-        row[10] = base + sufijo
-        log.warning('[%s] matching_key duplicado dentro del lote: %s -> %s', banco, base, row[10])
+        row[10] = f'{base} (pago {n + 1})'
+        log.warning('[%s] %sº pago igual del día (mismo documento y monto): %s -> %s',
+                    banco, n + 1, base, row[10])
         resultado.append(tuple(row))
     return resultado
 
@@ -131,8 +135,9 @@ def _filtrar_duplicados(candidatos: list[tuple], yesterday_keys: set[str],
                          banco: str, usar_sufijos: bool) -> list[tuple]:
     """Descarta filas cuya llave ya está en el tab de ayer (Sheets, sin
     cambios). Dentro del lote de hoy: si usar_sufijos, no descarta
-    colisiones — las numera (ver _asignar_sufijos_duplicados); si no,
-    mantiene el comportamiento viejo de quedarse solo con la 1ra ocurrencia."""
+    colisiones — son pagos distintos de la misma persona y se numeran (ver
+    _asignar_sufijos_duplicados); si no, mantiene el comportamiento viejo de
+    quedarse solo con la 1ra ocurrencia."""
     sin_ayer = [row for row in candidatos if row[10] not in yesterday_keys]
     omitidos = len(candidatos) - len(sin_ayer)
     if omitidos:
