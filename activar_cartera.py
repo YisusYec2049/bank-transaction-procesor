@@ -45,6 +45,7 @@ versión anterior a la nueva, por diseño explícito del usuario.
 import logging
 import os
 import sys
+from collections import Counter
 from datetime import datetime
 
 import pytz
@@ -68,22 +69,73 @@ def _sin_id(rows: list[dict]) -> list[dict]:
     return [{k: v for k, v in r.items() if k != 'id'} for r in rows]
 
 
-def _dedup_por_llave(rows: list[dict]) -> list[dict]:
-    """Se queda con UNA fila por 'llave' (primera coincidencia gana) — el
-    Excel de cartera trae llaves repetidas, pero cartera_preventiva.llave es
-    único (idx_cartera_preventiva_llave_unique). Sin esto, el INSERT hacia la
-    tabla viva falla con 23505 (duplicate key) y el swap se cae a mitad,
-    dejando la cartera viva vacía. Mismo criterio de dedup que
-    sync_cartera_preventiva."""
-    vistas: set = set()
+def _desambiguar_llaves(rows: list[dict]) -> tuple[list[dict], int]:
+    """El Excel de cartera repite la misma `llave` cuando el proceso manual
+    parte una cuota en abonos: en vez de modificar la línea original, agrega
+    una línea nueva con el resto. Caso real (21 de julio, llave
+    3680PN46220):
+
+        cuota 873.636  pago 500.000  falta 373.636   <- la original
+        cuota 373.636  pago —        falta 373.636
+        cuota  73.636  pago —        falta  73.636
+
+    Son el HISTORIAL de una misma cuota, no tres deudas distintas: sumarlas
+    triplicaría lo que debe esa persona.
+
+    `cartera_preventiva.llave` es único (idx_cartera_preventiva_llave_unique)
+    y de él cuelgan los joins de pago_asociaciones / overrides /
+    saldos_favor, así que las repetidas no se pueden insertar tal cual (el
+    INSERT falla con 23505 y el swap se cae a mitad, dejando la cartera viva
+    vacía). Hasta el 21 de julio esto se resolvía DESCARTÁNDOLAS — se
+    perdían 31 filas de 28 llaves en cada carga, y el usuario no veía de
+    dónde salía el abono que ya tenía registrado.
+
+    Se guardan TODAS, respetando lo que el Excel ya resolvió:
+
+      * Las que traen `fecha_pago` ya están COBRADAS (el Excel anota el pago
+        que las cerró, con su `codigo_transaccion_1` = nuestro
+        `matching_key`). Se les agrega la fecha de pago entre paréntesis
+        para desambiguar la llave — formato pedido por el usuario.
+      * La que NO trae `fecha_pago` es la que se debe hoy, y conserva la
+        llave desnuda: así los joins de pago_asociaciones / overrides /
+        saldos_favor siguen apuntando a la línea viva.
+
+    Si por lo que sea quedaran dos líneas repetidas sin fecha de pago (o dos
+    con la misma fecha), se numeran para no chocar contra el índice único.
+
+    Devuelve (filas, cuántas venían ya cobradas del Excel)."""
     out: list[dict] = []
+    usadas: set = set()
+    cobradas = 0
+
+    repetidas = {ll for ll, n in Counter(
+        r.get('llave') for r in rows if r.get('llave')).items() if n > 1}
+
     for r in rows:
         llave = r.get('llave')
-        if not llave or llave in vistas:
+        if not llave:
             continue
-        vistas.add(llave)
-        out.append(r)
-    return out
+        if llave not in repetidas:
+            out.append(r)
+            usadas.add(llave)
+            continue
+
+        fecha = r.get('fecha_pago')
+        if not fecha:
+            # La línea viva de la cadena: se queda con la llave limpia.
+            candidata = llave
+        else:
+            cobradas += 1
+            candidata = f'{llave} ({fecha})'
+
+        final, n = candidata, 2
+        while final in usadas:
+            final = f'{candidata} {n}'
+            n += 1
+        usadas.add(final)
+        out.append(r if final == llave else {**r, 'llave': final})
+
+    return out, cobradas
 
 
 def main():
@@ -140,9 +192,9 @@ def main():
     delete_all_rows(supabase_url, srk, 'cartera_saldos_favor', 'id')
     delete_all_rows(supabase_url, srk, 'cartera_preventiva_overrides', 'llave')
 
-    staging_unicas = _dedup_por_llave(staging_rows)
-    log.info('Activando la versión staged (%d fila(s) del Excel, %d únicas por llave)...',
-             len(staging_rows), len(staging_unicas))
+    staging_unicas, cobradas = _desambiguar_llaves(staging_rows)
+    log.info('Activando la versión staged (%d fila(s) del Excel, %d ya cobradas '
+             'según el propio Excel)...', len(staging_unicas), cobradas)
     insert_rows(supabase_url, srk, 'cartera_preventiva', _sin_id(staging_unicas))
     delete_all_rows(supabase_url, srk, 'cartera_preventiva_staging', 'id')
 

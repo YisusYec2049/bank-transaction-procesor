@@ -296,8 +296,18 @@ def read_cartera_preventiva(path: str | BinaryIO) -> list[dict]:
     cual, la normalización se hace en el cruce (normalizar_nit).
 
     `pago` (columna PAGO, aparece duplicada en el Excel real — se toma la
-    primera aparición, ver _find_header_row) es un campo de marca/estado del
-    proceso manual, se guarda tal cual sin interpretarla."""
+    primera aparición, ver _find_header_row) NO es un campo de marca como se
+    creyó hasta el 21 de julio: es plata ya abonada, y se cumple
+    `Valor a cobrar` = `Valor cuota` - `PAGO`.
+
+    Desde el 21 de julio también se leen las columnas de PAGO YA APLICADO
+    (Fecha pago / medio pago / Valor PAGO / CODIGO TRANSACCION1 y 2 / CORREO
+    ELEC / Diferencia). El Excel las trae llenas para las cuotas que ya se
+    cobraron, y `CODIGO TRANSACCION1` es exactamente nuestro `matching_key`
+    (verificado: el pago 7614 de $300.000 en cruce_cartera es el mismo 7614
+    del Excel). Sin leerlas, el pipeline no tenía forma de saber qué pagos ya
+    estaban aplicados y los volvía a aplicar, duplicando la plata y la línea
+    de saldo."""
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
     try:
         ws = wb['Hoja1']
@@ -306,6 +316,8 @@ def read_cartera_preventiva(path: str | BinaryIO) -> list[dict]:
             'correo', 'telefono 1', 'telefono 2', 'F. Vencimiento',
             'DIAS EN CARTERA', 'Valor cuota', 'PAGO', 'Valor a cobrar',
             'Programa', 'CRUCEACCES',
+            'Fecha pago', 'medio pago', 'Valor PAGO', 'CODIGO TRANSACCION1',
+            'CODIGO TRANSACCION2', 'CORREO ELEC', 'Diferencia',
         ])
 
         rows = []
@@ -329,6 +341,15 @@ def read_cartera_preventiva(path: str | BinaryIO) -> list[dict]:
                 'valor_a_cobrar':     _cell_float(row[cols['valor a cobrar']]),
                 'programa':           _cell_str(row[cols['programa']]),
                 'cruce_access':       _cell_str(row[cols['cruceacces']]),
+                # Pago ya aplicado según el Excel (vacío en las cuotas que
+                # siguen pendientes).
+                'fecha_pago':            _cell_date(row[cols['fecha pago']]),
+                'medio_pago':            _cell_str(row[cols['medio pago']]),
+                'valor_pago':            _cell_float(row[cols['valor pago']]),
+                'codigo_transaccion_1':  _cell_str(row[cols['codigo transaccion1']]),
+                'codigo_transaccion_2':  _cell_str(row[cols['codigo transaccion2']]),
+                'correo_elec':           _cell_str(row[cols['correo elec']]),
+                'diferencia':            _cell_float(row[cols['diferencia']]),
             })
         log.info('CARTERA PREVENTIVA: %d filas leídas.', len(rows))
         return rows

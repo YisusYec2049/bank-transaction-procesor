@@ -177,15 +177,37 @@ def _correo_elec_para(pago: dict) -> str:
     return pago.get('email') or ''
 
 
-def _generar_llave_saldo(llave_base: str, matching_key: str) -> str:
+def _generar_llave_saldo(llave_base: str, pago: dict,
+                          llaves_cobradas: frozenset = frozenset()) -> str:
     """Llave DETERMINÍSTICA para la cuota nueva de "FALTA DE PAGO" (o del
-    saldo pendiente de un pago parcial), derivada del `matching_key` del pago
-    que la origina — no de "buscar el primer sufijo libre" (bug crítico
-    corregido el 16 de julio: esa búsqueda nunca era estable entre corridas,
-    ver git history). Reprocesar el MISMO pago siempre calcula la MISMA
-    llave, y el upsert por `llave` en insert_cartera_preventiva_lineas
-    actualiza esa fila en vez de crear una nueva."""
-    return f'{llave_base} (saldo {matching_key})'
+    saldo pendiente de un pago parcial), derivada del pago que la origina —
+    no de "buscar el primer sufijo libre" (bug crítico corregido el 16 de
+    julio: esa búsqueda nunca era estable entre corridas, ver git history).
+    Reprocesar el MISMO pago siempre calcula la MISMA llave, y el upsert por
+    `llave` en insert_cartera_preventiva_lineas actualiza esa fila en vez de
+    crear una nueva.
+
+    Lleva la FECHA del pago entre paréntesis (formato pedido por el usuario
+    el 21 de julio, igual al que usa el Excel de cartera para sus propias
+    líneas partidas). Cae al `matching_key` si el pago no trae fecha, que es
+    el único caso donde la fecha no serviría para identificar nada.
+
+    `llaves_cobradas` son las llaves que YA corresponden a una cuota cobrada
+    (las líneas partidas que el Excel trae con su pago anotado, ver
+    `_desambiguar_llaves` en activar_cartera.py). Usan el mismo formato
+    `llave (fecha)`, así que un pago nuevo fechado el mismo día que uno
+    viejo de la misma cuota generaría una llave idéntica — y como la
+    escritura es un upsert por llave, PISARÍA esa línea cobrada y se
+    perdería el registro del abono. Cuando eso pasa se agrega el
+    `matching_key` detrás. La comparación es solo contra cuotas COBRADAS a
+    propósito: una línea de saldo previa nuestra (sin pago todavía) tiene
+    que seguir dando la MISMA llave, o el reproceso del mismo pago crearía
+    una fila nueva en vez de actualizar la suya."""
+    marca = pago.get('payment_date') or pago.get('matching_key')
+    candidata = f'{llave_base} ({marca})'
+    if candidata in llaves_cobradas:
+        return f'{llave_base} ({marca} {pago.get("matching_key")})'
+    return candidata
 
 
 def _fila_reset(cuota_id) -> dict:
@@ -322,12 +344,17 @@ def _fila_cierre(info: dict, hoy: str, cerrar_al_monto_recibido: bool = False) -
         'es_wompi_automatico':  _es_wompi_automatico(ultimo_pago),
     }
     if cerrar_al_monto_recibido:
-        # La cuota ORIGINAL de un faltante >= $50.000 se ajusta a lo
-        # realmente recibido (no al monto original) y queda cerrada con
+        # La cuota ORIGINAL de un faltante >= $50.000 queda cerrada con
         # diferencia=0 — el faltante real pasa a la cuota nueva "FALTA DE
         # PAGO".
-        fila['valor_cuota']    = monto
-        fila['valor_a_cobrar'] = monto
+        #
+        # `valor_cuota`/`valor_a_cobrar` NO se pisan con lo recibido (21 de
+        # julio): son el espejo del Excel, y sobrescribirlos hacía ilegible
+        # la fila — el caso real mostraba "Valor Cuota 300.000 / Pago
+        # 500.000" cuando la cuota de verdad era de 873.636. Lo recibido ya
+        # se ve en `valor_pago`.
+        fila['valor_cuota']    = cuota.get('valor_cuota')
+        fila['valor_a_cobrar'] = cuota.get('valor_a_cobrar')
         fila['diferencia']     = 0
     else:
         fila['diferencia']     = round(monto - _saldo_a_cobrar(cuota), 2)
@@ -364,7 +391,8 @@ def _fila_linea_saldo(parcial: dict, nueva_llave: str, notificacion: str | None 
     }
 
 
-def _cerrar_o_faltante(info: dict, hoy: str) -> tuple[dict, dict | None]:
+def _cerrar_o_faltante(info: dict, hoy: str,
+                        llaves_cobradas: frozenset = frozenset()) -> tuple[dict, dict | None]:
     """A partir de un cierre exacto o parcial (`info` con 'cuota',
     'monto_aplicado', 'ultimo_pago'), arma (fila_cierre, linea_nueva_o_None)
     aplicando el umbral único de FALTA DE PAGO (`>= UMBRAL_LINEA_NUEVA`).
@@ -377,13 +405,14 @@ def _cerrar_o_faltante(info: dict, hoy: str) -> tuple[dict, dict | None]:
         return _fila_cierre(info, hoy), None
     if s >= UMBRAL_LINEA_NUEVA:
         fila = _fila_cierre(info, hoy, cerrar_al_monto_recibido=True)
-        nueva_llave = _generar_llave_saldo(cuota['llave'], info['ultimo_pago']['matching_key'])
+        nueva_llave = _generar_llave_saldo(cuota['llave'], info['ultimo_pago'], llaves_cobradas)
         linea_nueva = _fila_linea_saldo(info, nueva_llave, notificacion='FALTA DE PAGO')
         return fila, linea_nueva
     return _fila_cierre(info, hoy, cerrar_al_monto_recibido=False), None
 
 
-def _procesar_inscripcion(cuotas_inscripcion: list[dict], pagos_para: list[dict], hoy: str):
+def _procesar_inscripcion(cuotas_inscripcion: list[dict], pagos_para: list[dict], hoy: str,
+                           llaves_cobradas: frozenset = frozenset()):
     """Corre el FIFO de UNA inscripción y arma las filas de escritura según
     el modelo "Saldo a Favor Manual + FALTA DE PAGO" (21 de julio).
 
@@ -395,7 +424,7 @@ def _procesar_inscripcion(cuotas_inscripcion: list[dict], pagos_para: list[dict]
     cierres_filas = [_fila_cierre(info, hoy) for info in cierres]
     linea_nueva = None
     if parcial:
-        fila, linea_nueva = _cerrar_o_faltante(parcial, hoy)
+        fila, linea_nueva = _cerrar_o_faltante(parcial, hoy, llaves_cobradas)
         cierres_filas.append(fila)
 
     saldo_favor_nuevo = None
@@ -466,8 +495,16 @@ def main():
         supabase_url, srk, 'cartera_preventiva',
         select='id,llave,cruce_access,correo,fecha_vencimiento,valor_cuota,valor_a_cobrar,inscrip,'
                'cliente,sistema_financiero,moneda,programa,fecha_pago,valor_pago,fecha_cruce,'
-               'diferencia,notificacion',
+               'diferencia,notificacion,codigo_transaccion_1',
     )
+    # Llaves que ya pertenecen a una cuota COBRADA (incluidas las líneas
+    # partidas que el Excel trae cerradas con su pago anotado).
+    # `_generar_llave_saldo` las esquiva para no pisarlas con una línea de
+    # saldo nueva que caiga en la misma llave base + misma fecha.
+    llaves_cobradas = frozenset(
+        c['llave'] for c in cuotas_rows if c.get('llave') and c.get('fecha_pago')
+    )
+
     id_por_llave      = {c['llave']: c['id'] for c in cuotas_rows if c.get('llave')}
     llave_por_id      = {c['id']: c['llave'] for c in cuotas_rows}
     cliente_por_llave = {c['llave']: c.get('cliente') for c in cuotas_rows if c.get('llave')}
@@ -600,7 +637,7 @@ def main():
 
         ultimo_pago = _pago_mas_reciente(asociaciones_cuota, pagos_por_matching_key)
         info = {'cuota': cuota, 'monto_aplicado': suma, 'ultimo_pago': ultimo_pago}
-        fila, linea = _cerrar_o_faltante(info, hoy)
+        fila, linea = _cerrar_o_faltante(info, hoy, llaves_cobradas)
         actualizaciones_cierre.append(fila)
         if linea:
             lineas_nuevas.append(linea)
@@ -638,10 +675,22 @@ def main():
     # se vuelva a cruzar en el próximo cron.
     matching_keys_asociados = {a['matching_key'] for a in asociaciones_vigentes}
     matching_keys_en_ledger = {c['matching_key'] for c in saldos_favor_rows if c.get('matching_key')}
+
+    # Pagos que el Excel de cartera YA trae aplicados: su
+    # `codigo_transaccion_1` es nuestro `matching_key` (verificado el 21 de
+    # julio con el pago 7614). Sin esto el pipeline los volvía a aplicar
+    # encima del saldo que ya venía neto, duplicando la plata y generando
+    # una segunda línea de saldo por la misma deuda.
+    matching_keys_en_excel = {
+        str(c['codigo_transaccion_1']).strip() for c in cuotas_rows
+        if c.get('codigo_transaccion_1')
+    }
+
     pagos_nuevos = [
         p for p in pagos_cruzados
         if p['matching_key'] not in matching_keys_asociados
         and p['matching_key'] not in matching_keys_en_ledger
+        and p['matching_key'] not in matching_keys_en_excel
     ]
     log.info('%d pagos cruzados totales, %d nuevos (sin asociación/ledger previo).',
               len(pagos_cruzados), len(pagos_nuevos))
@@ -654,6 +703,10 @@ def main():
     # entera). Sin este filtro entran a la cascada por su `valor_cuota`
     # completo y se comen plata que le tocaba a la cuota siguiente —
     # medido el 21 de julio: 899 de 2.628 cuotas estaban en esa situación.
+    #
+    # Las líneas que el Excel ya trae cobradas (una cuota partida en abonos
+    # por el proceso manual) llegan con `fecha_pago` puesto desde el propio
+    # Excel, así que este mismo filtro las deja fuera sin regla aparte.
     cuotas_pendientes = [
         c for c in cuotas_rows
         if c.get('fecha_pago') is None
@@ -705,7 +758,7 @@ def main():
             continue
 
         cierres_filas, linea_nueva, asociaciones, saldo_favor = _procesar_inscripcion(
-            cuotas_inscripcion, pagos_para_inscripcion, hoy)
+            cuotas_inscripcion, pagos_para_inscripcion, hoy, llaves_cobradas)
 
         actualizaciones_cierre.extend(cierres_filas)
         if linea_nueva:

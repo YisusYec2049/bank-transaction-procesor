@@ -5,6 +5,7 @@ import re
 _RE_DV_NIT = re.compile(r'-\d$')
 
 
+
 def normalizar_nit(valor: str) -> str:
     """Quita el dígito de verificación de un NIT (ej. "860004922-4" ->
     "860004922"), si lo tiene. Los NIT de empresas (Persona Jurídica) en las
