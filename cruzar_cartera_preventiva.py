@@ -44,9 +44,11 @@ mixto) y resetea la cuota a "sin pago identificado" para que se reprocese
 con lo que quede vigente.
 
 CRUCE (columna cruce_cartera.cruce) — "cruce a la inversa": para cada pago
-`cruzado`, confirma si tiene al menos una asociación real en
-`pago_asociaciones` (vigente, no huérfana) y, si la tiene, trae el cliente
-de esa cuota. Se recalcula sobre TODOS los pagos cruzados en cada corrida.
+`cruzado`, confirma si terminó aplicado a una cuota y, si sí, trae el cliente
+de esa cuota. Cuentan dos fuentes: una asociación real en `pago_asociaciones`
+(vigente, no huérfana) o el propio Excel de cartera, que desde el 21 de julio
+trae en `codigo_transaccion_1` el `matching_key` de los pagos que el proceso
+manual ya cobró. Se recalcula sobre TODOS los pagos cruzados en cada corrida.
 Puramente informativo — no toca estado_cruce/excepcion_motivo.
 
 ────────────────────────────────────────────────────────────────────────────
@@ -846,6 +848,18 @@ def main():
         llaves_por_pago.setdefault(r['matching_key'], []).append(r['llave'])
     for a in nuevas_asociaciones:
         llaves_por_pago.setdefault(a['matching_key'], []).append(a['llave'])
+
+    # El Excel de cartera también registra pagos ya cobrados (columna CODIGO
+    # TRANSACCION1 = nuestro `matching_key`). Cuentan como identificados: el
+    # pago está aplicado, solo que su registro vive en el Excel y no en
+    # `pago_asociaciones`. Sin esto la columna pasó a decir "sin identificar"
+    # en 326 de 335 pagos (21 de julio, al empezar a respetar lo que el Excel
+    # trae cobrado). Va DESPUÉS de las asociaciones propias a propósito:
+    # `setdefault` deja ganar la nuestra cuando existen las dos.
+    for c in cuotas_rows:
+        codigo = str(c.get('codigo_transaccion_1') or '').strip()
+        if codigo and c.get('llave'):
+            llaves_por_pago.setdefault(codigo, []).append(c['llave'])
 
     log.info('Calculando cruce a la inversa...')
     cruce_updates = []
