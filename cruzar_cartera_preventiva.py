@@ -655,6 +655,20 @@ def main():
             continue
         if cuota.get('fecha_pago') is None:
             continue
+        if cuota.get('fecha_cruce') is None:
+            # El pago NO lo aplicó este pipeline: viene del propio Excel de
+            # cartera, que desde el 21 de julio trae sus columnas de pago
+            # (una cuota partida en abonos ya cobrada). Esas filas nunca
+            # tuvieron `pago_asociaciones`, así que sin esta guarda la regla
+            # de abajo las leía como "asociación descartada" y las borraba.
+            #
+            # Pasó en producción el 21/07: una corrida barrió las 1.409
+            # filas que el Excel traía cobradas, y como eso destruyó la
+            # lista de pagos ya aplicados, la corrida siguiente del cron
+            # volvió a aplicar esos pagos sobre cuotas que ya estaban
+            # cerradas. `fecha_cruce` es la marca de "esto lo tocó el
+            # pipeline" — el Excel no la trae.
+            continue
         if llave in asociaciones_por_llave:
             continue  # todavía tiene asociación(es) vigente(s)
         resets_varios.append(_fila_reset(cuota['id']))
