@@ -145,6 +145,26 @@ def _base_inscripcion(valor) -> str:
     return normalizar_sufijo(v) or v
 
 
+def _saldo_a_cobrar(cuota: dict) -> float:
+    """Monto que la cuota debe HOY de verdad.
+
+    El Excel de cartera trae la columna `PAGO` — abonos que el proceso
+    manual ya registró en el Sistema Financiero — y `valor_a_cobrar` =
+    `valor_cuota` - `pago`. Cobrar contra `valor_cuota` ignora ese abono:
+    se cobra de más y el saldo que queda sale inflado exactamente por lo
+    ya pagado (caso real 21 de julio, llave 3680PN46220: cuota 873.636 con
+    500.000 abonados; un pago de 300.000 dejó saldo de 573.636 en vez de
+    73.636).
+
+    `_fila_cierre_cartera` (cierre manual) ya usaba `valor_a_cobrar` por
+    esta misma razón; acá se unifica el criterio para el FIFO automático.
+    Cae a `valor_cuota` solo si `valor_a_cobrar` viene NULL."""
+    valor = cuota.get('valor_a_cobrar')
+    if valor is None:
+        valor = cuota.get('valor_cuota')
+    return float(valor or 0)
+
+
 def _es_wompi_automatico(pago: dict) -> bool:
     payment_method = str(pago.get('payment_method') or '').upper()
     metodo = str(pago.get('metodo_de_pago') or '')
@@ -247,9 +267,9 @@ def _aplicar_pagos_inscripcion(cuotas_abiertas: list[dict], pagos_nuevos: list[d
         while restante > 0 and idx < len(cuotas_ordenadas):
             cuota = cuotas_ordenadas[idx]
             cuota_id = cuota['id']
-            valor_cuota = float(cuota.get('valor_cuota') or 0)
+            saldo_cuota = _saldo_a_cobrar(cuota)
             ya = acumulado.get(cuota_id, 0.0)
-            saldo = valor_cuota - ya
+            saldo = saldo_cuota - ya
             if saldo <= 0:
                 idx += 1
                 continue
@@ -258,7 +278,7 @@ def _aplicar_pagos_inscripcion(cuotas_abiertas: list[dict], pagos_nuevos: list[d
             ultimo_pago_por_cuota[cuota_id] = pago
             asociaciones.append({'matching_key': matching_key, 'cuota_id': cuota_id, 'monto': round(aplicar, 2)})
             restante -= aplicar
-            if valor_cuota - acumulado[cuota_id] <= 0:
+            if saldo_cuota - acumulado[cuota_id] <= 0:
                 idx += 1
         if restante > 0:
             excedente += restante
@@ -269,9 +289,8 @@ def _aplicar_pagos_inscripcion(cuotas_abiertas: list[dict], pagos_nuevos: list[d
         if cuota_id not in acumulado:
             continue
         monto = acumulado[cuota_id]
-        valor_cuota = float(cuota.get('valor_cuota') or 0)
         info = {'cuota': cuota, 'monto_aplicado': monto, 'ultimo_pago': ultimo_pago_por_cuota[cuota_id]}
-        if valor_cuota - monto <= 0:
+        if _saldo_a_cobrar(cuota) - monto <= 0:
             cierres.append(info)
         else:
             parcial = info
@@ -311,8 +330,7 @@ def _fila_cierre(info: dict, hoy: str, cerrar_al_monto_recibido: bool = False) -
         fila['valor_a_cobrar'] = monto
         fila['diferencia']     = 0
     else:
-        valor_cuota = float(cuota.get('valor_cuota') or 0)
-        fila['diferencia']     = round(monto - valor_cuota, 2)
+        fila['diferencia']     = round(monto - _saldo_a_cobrar(cuota), 2)
         fila['valor_cuota']    = cuota.get('valor_cuota')
         fila['valor_a_cobrar'] = cuota.get('valor_a_cobrar')
     return fila
@@ -320,8 +338,7 @@ def _fila_cierre(info: dict, hoy: str, cerrar_al_monto_recibido: bool = False) -
 
 def _fila_linea_saldo(parcial: dict, nueva_llave: str, notificacion: str | None = None) -> dict:
     cuota = parcial['cuota']
-    valor_cuota_original = float(cuota.get('valor_cuota') or 0)
-    saldo = round(valor_cuota_original - parcial['monto_aplicado'], 2)
+    saldo = round(_saldo_a_cobrar(cuota) - parcial['monto_aplicado'], 2)
     return {
         'llave':               nueva_llave,
         'sistema_financiero':  cuota.get('sistema_financiero'),
@@ -354,9 +371,8 @@ def _cerrar_o_faltante(info: dict, hoy: str) -> tuple[dict, dict | None]:
     Usado tanto por el FIFO automático como por el pase de reconciliación
     manual (§3.5) — ambos deben comportarse igual ante un faltante."""
     cuota = info['cuota']
-    valor_cuota = float(cuota.get('valor_cuota') or 0)
     monto = info['monto_aplicado']
-    s = round(valor_cuota - monto, 2)
+    s = round(_saldo_a_cobrar(cuota) - monto, 2)
     if s <= 0:
         return _fila_cierre(info, hoy), None
     if s >= UMBRAL_LINEA_NUEVA:
@@ -630,10 +646,19 @@ def main():
     log.info('%d pagos cruzados totales, %d nuevos (sin asociación/ledger previo).',
               len(pagos_cruzados), len(pagos_nuevos))
 
-    # §4.1/4.2: cuotas pendientes = sin pago identificado y sin cierre manual.
+    # §4.1/4.2: cuotas pendientes = sin pago identificado, sin cierre manual
+    # y con saldo real por cobrar.
+    #
+    # `_saldo_a_cobrar(c) > 0` saca las cuotas que el proceso manual ya
+    # dejó en cero (`valor_a_cobrar` = 0 porque `PAGO` cubrió la cuota
+    # entera). Sin este filtro entran a la cascada por su `valor_cuota`
+    # completo y se comen plata que le tocaba a la cuota siguiente —
+    # medido el 21 de julio: 899 de 2.628 cuotas estaban en esa situación.
     cuotas_pendientes = [
         c for c in cuotas_rows
-        if c.get('fecha_pago') is None and c.get('llave') not in llaves_cerradas_manual
+        if c.get('fecha_pago') is None
+        and c.get('llave') not in llaves_cerradas_manual
+        and _saldo_a_cobrar(c) > 0
     ]
     cuotas_por_doc: dict[str, list[dict]] = {}
     for c in cuotas_pendientes:
