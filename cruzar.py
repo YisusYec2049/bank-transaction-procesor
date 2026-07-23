@@ -261,6 +261,23 @@ def _es_pago_llave(identification: str, email: str) -> bool:
     return identification in ID_CANAL_PAGO_LLAVE or email in ID_CANAL_PAGO_LLAVE
 
 
+def _inscripciones_en_valor(valor: str) -> list[str]:
+    """Parte un valor de inscripción por sus separadores de 'pago compartido'
+    ('-' y '/') y devuelve solo los pedazos que parecen una inscripción (traen
+    al menos un dígito). Descarta guiones sueltos y basura: '37927-' o
+    '-41711' dan 1 pedazo (una sola inscripción), '--' da 0."""
+    partes = re.split(r'[-/]', str(valor or ''))
+    return [p.strip() for p in partes if p.strip() and any(c.isdigit() for c in p)]
+
+
+def _es_pago_compartido(valor: str) -> bool:
+    """True si el valor trae 2+ inscripciones en una sola celda — cartera a
+    veces anota así un pago que cubrió varias inscripciones (ej.
+    '3765-3766-3767', o literal 'Pago Compartido 37794-120061 /37793-118245').
+    Solo aplica al lado CORREO(2): cartera_inscrip (INCP) no tiene ninguno."""
+    return len(_inscripciones_en_valor(valor)) >= 2
+
+
 def _cargar_correcciones_documento(supabase_url: str, srk: str) -> dict[str, str]:
     """Mapa documento_original -> documento_corregido (tabla que llena
     financial-platform cuando alguien edita un documento a mano)."""
@@ -945,7 +962,17 @@ def main():
                 nombre_cliente_por_email_stripe, emails_stripe, candidatos_nombre_stripe)
             correo_2_historial = historial_stripe.get(email_lower, {})
 
-        if correo_2_ambiguo:
+        # Pago compartido: si CORREO(2) trae 2+ inscripciones en una sola celda
+        # (cartera lo anota así cuando un pago cubrió varias inscripciones), no
+        # es un cruce limpio — se manda a cruce_ambiguo para revisión manual.
+        # A diferencia del resto de ambigüedades, NO se vacía el campo ni se le
+        # busca sugerencia: se conserva el valor ('3765-3766-3767') visible
+        # para que quien revisa vea cuáles inscripciones cubre.
+        correo_2_compartido = _es_pago_compartido(correo_2)
+        if correo_2_compartido:
+            correo_2_ambiguo = True
+
+        if correo_2_ambiguo and not correo_2_compartido:
             sugerido = _sugerir_por_cadencia(correo_2_historial, _parse_fecha(t.get('payment_date')))
             if sugerido:
                 correo_2 = sugerido
@@ -1001,8 +1028,12 @@ def main():
         # = unión de lo que trajo el lookup por documento (INCP) y por correo
         # (CORREO(2)), filtrados a los que tienen cuota pendiente; si queda
         # exactamente uno, gana — aunque contradiga el valor que había en
-        # incp/correo_2 (ver "caso conflicto" en la spec).
-        if incp_ambiguo or correo_2_ambiguo:
+        # incp/correo_2 (ver "caso conflicto" en la spec). Un pago compartido
+        # queda fuera: su CORREO(2) es un solo string con varias inscripciones
+        # pegadas, no candidatos reales que el árbitro pueda desempatar, y
+        # además debe conservarse visible — resolverlo a una sola inscripción
+        # perdería las demás.
+        if (incp_ambiguo or correo_2_ambiguo) and not correo_2_compartido:
             candidatos_doc = valores_inscrip.get(identification, set())
             if payment_method == 'BANCOLOMBIA':
                 candidatos_correo = valores_bc2576.get(email, set())
