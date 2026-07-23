@@ -13,7 +13,7 @@ Columnas esperadas:
   [4] transaction_code_2  ← '{Converted Amount} {Converted Currency}'
   [5] email               ← Customer Email
   [6] payment_method      ← 'STRIPE_USA'
-  [7] program             ← Card Name
+  [7] program             ← Checkout Custom Field 1 Value ("nombredelapersonaquetomaeldiplomado" = el estudiante)
   [8] phone               ← Checkout Custom Field 3 Value
   [9] payment_amount      ← Converted Amount (monto en COP)
   [10] matching_key       ← {Card Name}_{YYYY-MM-DD}_{valor_js}
@@ -63,6 +63,10 @@ def parse_file(buf: io.BytesIO, filename: str = '') -> list[dict]:
         card_name       = r.get('Card Name') or r.get('card name') or ''
         email           = r.get('Customer Email') or r.get('customer email') or ''
         currency        = r.get('Converted Currency') or r.get('converted currency') or ''
+        # Custom Field 1 = estudiante ("nombredelapersonaquetomaeldiplomado"),
+        # que puede diferir del Card Name (el pagador) cuando alguien paga por otro.
+        custom_field1   = (r.get('Checkout Custom Field 1 Value')
+                           or r.get('checkout custom field 1 value') or '')
         custom_field3   = (r.get('Checkout Custom Field 3 Value')
                            or r.get('checkout custom field 3 value') or '')
 
@@ -76,6 +80,7 @@ def parse_file(buf: io.BytesIO, filename: str = '') -> list[dict]:
             'email':         email,
             'converted':     converted,
             'currency':      currency,
+            'custom_field1': custom_field1,
             'custom_field3': custom_field3,
             'matching_key':  matching_key,
         })
@@ -94,7 +99,7 @@ def normalize(raw_rows: list[dict]) -> list[list]:
             f"{r['converted']} {r['currency']}".strip(), # [4]  transaction_code_2
             r['email'],                                  # [5]
             'STRIPE_USA',                                # [6]
-            r['card_name'],                              # [7]  program
+            r['custom_field1'],                          # [7]  program (estudiante = Custom Field 1)
             r['custom_field3'],                          # [8]  phone
             r['converted'],                              # [9]
             r['matching_key'],                           # [10]
