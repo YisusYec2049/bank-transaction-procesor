@@ -46,6 +46,14 @@ def _cell_float(v) -> float | None:
     return parse_valor(str(v))
 
 
+def _cell_monto(v) -> int | None:
+    """Como _cell_float pero TRUNCA a entero — la cartera no maneja centavos
+    (los decimales de las cuotas en USD se descartan, no se redondean:
+    588314.99 -> 588314)."""
+    f = _cell_float(v)
+    return None if f is None else int(f)
+
+
 def _cell_int(v) -> int | None:
     if v is None:
         return None
@@ -336,20 +344,20 @@ def read_cartera_preventiva(path: str | BinaryIO) -> list[dict]:
                 'telefono_2':         _cell_str(row[cols['telefono 2']]),
                 'fecha_vencimiento':  _cell_date(row[cols['f. vencimiento']]),
                 'dias_en_cartera':    _cell_int(row[cols['dias en cartera']]),
-                'valor_cuota':        _cell_float(row[cols['valor cuota']]),
+                'valor_cuota':        _cell_monto(row[cols['valor cuota']]),
                 'pago':               _cell_str(row[cols['pago']]),
-                'valor_a_cobrar':     _cell_float(row[cols['valor a cobrar']]),
+                'valor_a_cobrar':     _cell_monto(row[cols['valor a cobrar']]),
                 'programa':           _cell_str(row[cols['programa']]),
                 'cruce_access':       _cell_str(row[cols['cruceacces']]),
                 # Pago ya aplicado según el Excel (vacío en las cuotas que
                 # siguen pendientes).
                 'fecha_pago':            _cell_date(row[cols['fecha pago']]),
                 'medio_pago':            _cell_str(row[cols['medio pago']]),
-                'valor_pago':            _cell_float(row[cols['valor pago']]),
+                'valor_pago':            _cell_monto(row[cols['valor pago']]),
                 'codigo_transaccion_1':  _cell_str(row[cols['codigo transaccion1']]),
                 'codigo_transaccion_2':  _cell_str(row[cols['codigo transaccion2']]),
                 'correo_elec':           _cell_str(row[cols['correo elec']]),
-                'diferencia':            _cell_float(row[cols['diferencia']]),
+                'diferencia':            _cell_monto(row[cols['diferencia']]),
             })
         log.info('CARTERA PREVENTIVA: %d filas leídas.', len(rows))
         return rows
