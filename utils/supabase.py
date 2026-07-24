@@ -319,23 +319,26 @@ def update_consolidated_metodo(supabase_url: str, service_role_key: str,
     """Escribe `metodo_de_pago` (link/manual de WOMPI) en consolidated_
     transactions. Cada dict trae `matching_key` + `metodo_de_pago`.
 
-    Va por upsert con `on_conflict=matching_key` y `merge-duplicates`, igual
-    que `upsert()`: la tabla tiene esa llave única, así que PostgREST hace un
-    UPDATE de solo esas columnas sobre las filas que ya existen. Todas las
-    llaves salen de un SELECT de la misma tabla, así que ninguna inserta.
+    PATCH individual por `matching_key` (mismo patrón que `update_cruce_valores`
+    / `update_cruce_inverso`): NO usa upsert/POST. `consolidated_transactions`
+    tiene columnas `NOT NULL` sin default (ej. `registration_date`), y un POST
+    con `on_conflict` pero payload parcial viola ese `NOT NULL` al construir la
+    tupla de INSERT — Postgres valida `NOT NULL` ANTES de que el `ON CONFLICT`
+    pueda redirigir al UPDATE, así que revienta con 23502 aunque la fila exista.
+    Un PATCH real solo toca `metodo_de_pago` sobre las filas que ya existen; si
+    una llave no está, es no-op.
 
     La etiqueta vive acá, y no solo en cruce_cartera, porque un pago apartado
     (matrícula, cesantías…) se borra del cruce y el reporte de métricas WOMPI
     igual tiene que poder contarlo (punto #8, 23 de julio)."""
     if not updates:
         return
-    hdrs = _headers(service_role_key, prefer='return=minimal,resolution=merge-duplicates')
-    batch = 500
-    for i in range(0, len(updates), batch):
-        resp = http.post(
+    hdrs = _headers(service_role_key, prefer='return=minimal')
+    for u in updates:
+        resp = http.patch(
             f'{supabase_url}/rest/v1/consolidated_transactions',
-            params={'on_conflict': 'matching_key'},
-            json=updates[i:i + batch],
+            params={'matching_key': f"eq.{u['matching_key']}"},
+            json={'metodo_de_pago': u['metodo_de_pago']},
             headers=hdrs,
             timeout=30,
         )
