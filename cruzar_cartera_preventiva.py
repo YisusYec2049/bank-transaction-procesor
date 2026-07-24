@@ -66,9 +66,12 @@ Reglas nuevas:
 - **Falta `< $50.000`** (UMBRAL_LINEA_NUEVA): la cuota cierra con lo recibido
   y queda con `diferencia` NEGATIVA informativa, sin línea nueva,
   `notificacion=NULL`.
-- **Falta `>= $50.000`**: la cuota cierra con lo recibido (`diferencia=0`) y
-  se crea una CUOTA NUEVA (mismo patrón de llave que antes,
-  `_generar_llave_saldo`) con `notificacion='FALTA DE PAGO'` por el faltante.
+- **Falta `>= $50.000`**: la cuota ORIGINAL —la que no se pagó completa— queda
+  marcada `notificacion='FALTA DE PAGO'` con `diferencia` NEGATIVA (el monto
+  que quedó a deber), y se crea una CUOTA NUEVA por ese faltante (mismo patrón
+  de llave, `_generar_llave_saldo`) SIN notificación y con `diferencia` vacía
+  (todavía no tiene pago). La marca y la deuda viven en la original, no en la
+  nueva.
 - **Sobra `>= $1`** (sin importar el monto, sin distinción SOBRANTE/
   EXCEDENTE): la ÚLTIMA cuota cubierta cierra con `diferencia` POSITIVA
   informativa (el saldo a favor "vive" ahí) y se crea/actualiza un registro
@@ -504,9 +507,17 @@ def _cerrar_o_faltante(info: dict, hoy: str,
     if s <= 0:
         return _fila_cierre(info, hoy), None
     if s >= UMBRAL_LINEA_NUEVA:
+        # El faltante (>= $50.000) genera una cuota NUEVA por la deuda, pero la
+        # marca 'FALTA DE PAGO' y el monto que quedó a deber viven en la cuota
+        # ORIGINAL —la que no se pagó completa—, que es a la que le faltó el
+        # pago. `diferencia` negativa = deuda (misma convención que el faltante
+        # < $50.000). La cuota nueva queda como una cuota pendiente normal: sin
+        # notificación y con `diferencia` vacía (todavía no tiene ningún pago).
         fila = _fila_cierre(info, hoy, cerrar_al_monto_recibido=True)
+        fila['notificacion'] = 'FALTA DE PAGO'
+        fila['diferencia'] = -s
         nueva_llave = _generar_llave_saldo(cuota['llave'], info['ultimo_pago'], llaves_cobradas)
-        linea_nueva = _fila_linea_saldo(info, nueva_llave, notificacion='FALTA DE PAGO')
+        linea_nueva = _fila_linea_saldo(info, nueva_llave, notificacion=None)
         return fila, linea_nueva
     return _fila_cierre(info, hoy, cerrar_al_monto_recibido=False), None
 
