@@ -314,6 +314,35 @@ def update_cruce_valores(supabase_url: str, service_role_key: str, updates: list
     log.info('Update cruce_cartera (cruce inverso) OK: %d filas.', len(updates))
 
 
+def update_consolidated_metodo(supabase_url: str, service_role_key: str,
+                                updates: list[dict]) -> None:
+    """Escribe `metodo_de_pago` (link/manual de WOMPI) en consolidated_
+    transactions. Cada dict trae `matching_key` + `metodo_de_pago`.
+
+    Va por upsert con `on_conflict=matching_key` y `merge-duplicates`, igual
+    que `upsert()`: la tabla tiene esa llave única, así que PostgREST hace un
+    UPDATE de solo esas columnas sobre las filas que ya existen. Todas las
+    llaves salen de un SELECT de la misma tabla, así que ninguna inserta.
+
+    La etiqueta vive acá, y no solo en cruce_cartera, porque un pago apartado
+    (matrícula, cesantías…) se borra del cruce y el reporte de métricas WOMPI
+    igual tiene que poder contarlo (punto #8, 23 de julio)."""
+    if not updates:
+        return
+    hdrs = _headers(service_role_key, prefer='return=minimal,resolution=merge-duplicates')
+    batch = 500
+    for i in range(0, len(updates), batch):
+        resp = http.post(
+            f'{supabase_url}/rest/v1/consolidated_transactions',
+            params={'on_conflict': 'matching_key'},
+            json=updates[i:i + batch],
+            headers=hdrs,
+            timeout=30,
+        )
+        _raise_for_status(resp)
+    log.info('Update consolidated_transactions (metodo_de_pago) OK: %d filas.', len(updates))
+
+
 def upsert_pagos_apartados(supabase_url: str, service_role_key: str, rows: list[dict]) -> None:
     """Upsert por matching_key a pagos_apartados (matrículas, cesantías,
     pago por llave, cheques — ver Fase 2 del rediseño)."""

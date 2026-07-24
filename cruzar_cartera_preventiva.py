@@ -94,6 +94,32 @@ Reglas nuevas:
       resetea a pendiente si no queda ninguna asociación vigente que la
       cubra.
 
+────────────────────────────────────────────────────────────────────────────
+Requerimientos del 23 de julio (`requeriments.md`, puntos #1, #2 y #3):
+
+- **Cerrar una cuota escribe `pago`** (#3). "Cerrada" para el usuario es que
+  el mismo número viva en `Valor Pago` y en `Pago`, con
+  `valor_a_cobrar = valor_cuota - pago` — así representa el Sistema
+  Financiero una cuota cobrada (verificado: la fórmula se cumple en 1.000 de
+  1.000 filas del Excel). Cuando la persona pagó justo, `valor_a_cobrar` cae
+  a cero solo; cuando pagó de menos, el faltante queda a la vista, que es lo
+  que el equipo usa para repartir la deuda en la cartera siguiente.
+  `pago` ACUMULA sobre el abono que traía el Excel, y `pago_confirmado`
+  guarda cuánto puso el cierre para poder deshacerlo sin borrar ese abono.
+  Aplicar un pago NO cierra: cerrar es un acto de una persona.
+
+- **Descartar recalcula y deshace el cierre** (#1). El pase de reconciliación
+  pasó a cubrir TODA cuota cuya suma de asociaciones vigentes ya no coincida
+  con lo que muestra — antes solo miraba las de asociación manual, y el reset
+  solo las que perdían todas sus asociaciones, así que una cuota con dos
+  pagos automáticos a la que se le descartaba uno no la tocaba nadie nunca.
+
+- **`notificacion` es un aviso VIVO de plata sin repartir** (#2). Mientras el
+  sobrante de un pago siga entero, la cuota que lo recibió dice cuánto pagó
+  la persona medido en cuotas (`1 CUOTA + ABONO`, `PAGA DOS CUOTAS`, …). En
+  cuanto se reparte una parte, el texto desaparece. Se recalcula entero en
+  cada corrida; ver `_etiqueta_notificacion`.
+
 `_fila_cierre` sigue devolviendo el MISMO set de claves siempre en cada POST
 (bug crítico PGRST102 del 16/07 — leer su docstring). El orden de escritura
 (`pago_asociaciones` primero) también se conserva por la misma razón.
@@ -132,6 +158,24 @@ _FECHA_MAX = '9999-12-31'
 # distinto según el modo; ahora siempre `>=`).
 UMBRAL_LINEA_NUEVA = 50000
 
+# Umbral de la columna `notificacion` (23 de julio, punto #2). Distinto y muy
+# por debajo del de FALTA DE PAGO a propósito: aquí no se decide si se abre
+# una cuota nueva, solo si vale la pena AVISAR que hay plata sin repartir.
+# Con $50.000 se habrían perdido 9 de los 11 casos reales con plata de verdad.
+# Ver `_etiqueta_notificacion` para los dos usos que tiene este número.
+UMBRAL_NOTIFICACION = 1000
+
+_NUMERO_EN_LETRA = {2: 'DOS', 3: 'TRES', 4: 'CUATRO', 5: 'CINCO', 6: 'SEIS',
+                     7: 'SIETE', 8: 'OCHO', 9: 'NUEVE', 10: 'DIEZ'}
+
+# Etiquetas que escribe `_etiqueta_notificacion`. La pasada de notificación
+# solo puede LIMPIAR filas cuyo texto pertenezca a esta familia — nunca pisa
+# 'FALTA DE PAGO' (que vive en la cuota nueva del faltante) ni 'CARTERA'
+# (cierre manual), que son de otros dueños.
+def _es_etiqueta_de_sobrante(valor) -> bool:
+    v = str(valor or '').strip().upper()
+    return bool(v) and (v.startswith('PAGA ') or v.endswith('+ ABONO'))
+
 
 def _normalizar_documento(valor) -> str:
     return normalizar_nit(str(valor or '').strip())
@@ -160,11 +204,21 @@ def _saldo_a_cobrar(cuota: dict) -> float:
 
     `_fila_cierre_cartera` (cierre manual) ya usaba `valor_a_cobrar` por
     esta misma razón; acá se unifica el criterio para el FIFO automático.
-    Cae a `valor_cuota` solo si `valor_a_cobrar` viene NULL."""
+    Cae a `valor_cuota` solo si `valor_a_cobrar` viene NULL.
+
+    CIERRE CONFIRMADO (23 de julio, punto #3): cerrar una cuota escribe en
+    `pago` lo que está en `valor_pago` y baja `valor_a_cobrar` por la fórmula
+    del Sistema Financiero (`valor_a_cobrar = valor_cuota - pago`). Es decir
+    que en una cuota ya cerrada `valor_a_cobrar` NO es el saldo que la cuota
+    tenía cuando se le aplicó el pago — es lo que quedó después del cierre.
+    Como el cierre baja `valor_a_cobrar` exactamente en `pago_confirmado`,
+    el saldo original se recupera sumándolo de vuelta. Sin esto, recalcular
+    una cuota cerrada (ej. tras un descarte) mediría el pago contra un saldo
+    en cero y daría una `diferencia` igual al pago entero."""
     valor = cuota.get('valor_a_cobrar')
     if valor is None:
         valor = cuota.get('valor_cuota')
-    return float(valor or 0)
+    return float(valor or 0) + float(cuota.get('pago_confirmado') or 0)
 
 
 def _es_wompi_automatico(pago: dict) -> bool:
@@ -212,46 +266,80 @@ def _generar_llave_saldo(llave_base: str, pago: dict,
     return candidata
 
 
-def _fila_reset(cuota_id) -> dict:
+def _pago_sin_confirmar(cuota: dict) -> float:
+    """El `pago` que la cuota tenía ANTES de cerrarse, o sea el abono que
+    trajo el Excel del proceso manual. `pago` mezcla dos cosas desde el 23 de
+    julio (punto #3): lo que registró el proceso manual y lo que escribió el
+    cierre. `pago_confirmado` guarda cuánto puso el cierre, y restarlo
+    devuelve el valor original — sin esto, deshacer un cierre borraría
+    también el abono del Excel."""
+    return round(float(cuota.get('pago') or 0) - float(cuota.get('pago_confirmado') or 0), 2)
+
+
+def _fila_reset(cuota: dict) -> dict:
     """Dict de reset a NULL de las columnas de resultado del cruce para una
     cuota — usado tanto por el reset de asociaciones huérfanas como por el
     reset de cuotas que perdieron todas sus asociaciones por un descarte, o
     que se reabren al apagar `cerrado_manual`.
 
+    DESHACE EL CIERRE (23 de julio, punto #1): si la cuota estaba cerrada, se
+    devuelve `pago` a lo que traía el Excel y `valor_a_cobrar` al saldo que
+    le corresponde. Confirmado por el usuario: una cuota a la que se le
+    descarta el pago no puede quedar marcada como pagada sin tener con qué.
+
     ADVERTENCIA (bug PGRST102, ver `_fila_cierre`): este dict tiene un set de
-    claves DISTINTO al de `_fila_cierre` (no incluye `valor_cuota`/
-    `valor_a_cobrar`). Nunca mezclar filas de `_fila_reset` en el mismo array
-    que filas de `_fila_cierre` en una misma llamada a
+    claves DISTINTO al de `_fila_cierre`. Nunca mezclar filas de `_fila_reset`
+    en el mismo array que filas de `_fila_cierre` en una misma llamada a
     `upsert_cartera_preventiva` — escribirlas en una lista/POST aparte."""
-    return {'id': cuota_id, 'fecha_pago': None, 'medio_pago': None, 'valor_pago': None,
+    pago_excel = _pago_sin_confirmar(cuota)
+    return {'id': cuota['id'], 'fecha_pago': None, 'medio_pago': None, 'valor_pago': None,
             'codigo_transaccion_1': None, 'codigo_transaccion_2': None, 'correo_elec': None,
             'diferencia': None, 'fecha_cruce': None, 'notificacion': None,
-            'es_wompi_automatico': None}
+            'es_wompi_automatico': None,
+            'pago': pago_excel or None,
+            'pago_confirmado': None,
+            'valor_a_cobrar': round(float(cuota.get('valor_cuota') or 0) - pago_excel, 2)}
 
 
 def _fila_cierre_cartera(cuota: dict, fecha_pago_manual: str, hoy: str) -> dict:
-    """Cierre MANUAL de una cuota puntual (regla #8, "Cerrar cartera") — la
-    persona la marca desde financial-platform y elige la fecha. No viene de
-    un pago real: `valor_pago` = `valor_a_cobrar` (el saldo pendiente actual
-    de la cuota, confirmado por el usuario — no `valor_cuota`), `medio_pago`
-    literal `'Cartera'`, `notificacion='CARTERA'`. Mismo set de claves que
-    `_fila_cierre` (12), para poder mezclarse en el mismo array/POST sin
-    disparar PGRST102."""
-    valor_a_cobrar = cuota.get('valor_a_cobrar')
+    """Cierre MANUAL de una cuota puntual ("Cerrar Cuota", antes "Cerrar
+    cartera") — la persona la marca desde financial-platform y elige la
+    fecha. No viene de un pago real: `valor_pago` = el saldo pendiente de la
+    cuota (confirmado por el usuario — no `valor_cuota`), `medio_pago`
+    literal `'Cartera'`, `notificacion='CARTERA'`.
+
+    Cerrar también escribe `pago` (23 de julio, punto #3): el usuario ve una
+    cuota cerrada cuando el mismo número vive en `Valor Pago` y en `Pago`.
+    Es como el Sistema Financiero representa una cuota cobrada — verificado
+    contra 1.000 filas del Excel, todas cumplen `valor_a_cobrar =
+    valor_cuota - pago` y 987 tienen `pago == valor_pago`.
+
+    `pago` ACUMULA en vez de reemplazar: si la cuota ya traía un abono del
+    proceso manual, pisarlo lo borraría y la cuota volvería a mostrar deuda
+    ya pagada. `pago_confirmado` deja constancia de cuánto puso este cierre
+    para poder deshacerlo (ver `_fila_reset`).
+
+    Mismo set de claves que `_fila_cierre` (15), para poder mezclarse en el
+    mismo array/POST sin disparar PGRST102."""
+    valor_cuota = float(cuota.get('valor_cuota') or 0)
+    saldo       = _saldo_a_cobrar(cuota)
+    pago_nuevo  = round(_pago_sin_confirmar(cuota) + saldo, 2)
     return {
         'id':                   cuota['id'],
         'fecha_pago':           fecha_pago_manual,
         'medio_pago':           'Cartera',
-        'valor_pago':           valor_a_cobrar,
+        'valor_pago':           saldo,
         'codigo_transaccion_1': None,
         'codigo_transaccion_2': None,
         'correo_elec':          None,
         'fecha_cruce':          hoy,
         'notificacion':         'CARTERA',
         'diferencia':           0,
-        'valor_cuota':          cuota.get('valor_cuota'),
-        'valor_a_cobrar':       valor_a_cobrar,
+        'valor_cuota':          valor_cuota,
+        'valor_a_cobrar':       round(valor_cuota - pago_nuevo, 2),
         'es_wompi_automatico':  None,
+        'pago':                 pago_nuevo,
+        'pago_confirmado':      saldo,
     }
 
 
@@ -333,6 +421,14 @@ def _fila_cierre(info: dict, hoy: str, cerrar_al_monto_recibido: bool = False) -
     cuota = info['cuota']
     ultimo_pago = info['ultimo_pago']
     monto = round(info['monto_aplicado'], 2)
+    # Aplicar un pago NO confirma la cuota: confirmar (escribir `pago`) es un
+    # acto de una persona, con "Cerrar Cuota" o "Cerrar Cartera" (23 de julio,
+    # punto #3). Y si la cuota venía confirmada y se está recalculando —el
+    # único motivo es que sus asociaciones cambiaron, o sea un descarte— el
+    # cierre se DESHACE: `pago` vuelve al abono del Excel y `valor_a_cobrar`
+    # al saldo que le corresponde. Confirmado por el usuario en el punto #1.
+    pago_excel = _pago_sin_confirmar(cuota)
+    valor_cuota = float(cuota.get('valor_cuota') or 0)
     fila = {
         'id':                   cuota['id'],
         'fecha_pago':           ultimo_pago.get('payment_date'),
@@ -344,24 +440,25 @@ def _fila_cierre(info: dict, hoy: str, cerrar_al_monto_recibido: bool = False) -
         'fecha_cruce':          hoy,
         'notificacion':         None,
         'es_wompi_automatico':  _es_wompi_automatico(ultimo_pago),
+        # `valor_cuota`/`valor_a_cobrar` NO se pisan con lo recibido (21 de
+        # julio): son el espejo del Excel, y sobrescribirlos hacía ilegible la
+        # fila — el caso real mostraba "Valor Cuota 300.000 / Pago 500.000"
+        # cuando la cuota de verdad era de 873.636. Lo recibido se ve en
+        # `valor_pago`. Se recalcula por la fórmula del Sistema Financiero
+        # para que un cierre deshecho quede consistente; sin confirmación de
+        # por medio da exactamente el mismo valor que ya tenía.
+        'valor_cuota':          valor_cuota,
+        'valor_a_cobrar':       round(valor_cuota - pago_excel, 2),
+        'pago':                 pago_excel or None,
+        'pago_confirmado':      None,
     }
     if cerrar_al_monto_recibido:
         # La cuota ORIGINAL de un faltante >= $50.000 queda cerrada con
         # diferencia=0 — el faltante real pasa a la cuota nueva "FALTA DE
         # PAGO".
-        #
-        # `valor_cuota`/`valor_a_cobrar` NO se pisan con lo recibido (21 de
-        # julio): son el espejo del Excel, y sobrescribirlos hacía ilegible
-        # la fila — el caso real mostraba "Valor Cuota 300.000 / Pago
-        # 500.000" cuando la cuota de verdad era de 873.636. Lo recibido ya
-        # se ve en `valor_pago`.
-        fila['valor_cuota']    = cuota.get('valor_cuota')
-        fila['valor_a_cobrar'] = cuota.get('valor_a_cobrar')
-        fila['diferencia']     = 0
+        fila['diferencia'] = 0
     else:
-        fila['diferencia']     = round(monto - _saldo_a_cobrar(cuota), 2)
-        fila['valor_cuota']    = cuota.get('valor_cuota')
-        fila['valor_a_cobrar'] = cuota.get('valor_a_cobrar')
+        fila['diferencia'] = round(monto - _saldo_a_cobrar(cuota), 2)
     return fila
 
 
@@ -390,6 +487,7 @@ def _fila_linea_saldo(parcial: dict, nueva_llave: str, notificacion: str | None 
         'diferencia':          None,
         'notificacion':        notificacion,
         'es_wompi_automatico': None,
+        'pago_confirmado':     None,
     }
 
 
@@ -456,6 +554,35 @@ def _procesar_inscripcion(cuotas_inscripcion: list[dict], pagos_para: list[dict]
     return cierres_filas, linea_nueva, asociaciones, saldo_favor_nuevo
 
 
+def _etiqueta_notificacion(valor_cuota: float, sobrante: float) -> str | None:
+    """Texto de la columna `notificacion` para un pago que dejó plata sin
+    repartir (23 de julio, punto #2). Describe CUÁNTO pagó la persona medido
+    en cuotas, no cuántas cuotas alcanzó a cerrar el sistema: la cartera
+    suele tener registrada una sola cuota pendiente, así que "pagó tres
+    cuotas" se ve como una cuota cubierta + un sobrante grande esperando que
+    alguien lo asigne. Ese aviso es justamente para quien revisa.
+
+    Devuelve None cuando no hay nada que avisar (sobrante por debajo del
+    umbral, o sea redondeo de las pasarelas).
+
+    `UMBRAL_NOTIFICACION` hace dos trabajos:
+      1. piso para avisar — medido sobre los 23 sobrantes reales del 23/07,
+         con $1.000 se marcan 11 (de $1.364 a $2.081.818) y quedan mudos 12
+         (de $1, $2 y $980);
+      2. tolerancia al contar cuotas enteras — caso real GP & A SAS: cuota
+         $325.317 con sobrante $325.296, o sea 21 pesos por debajo de una
+         cuota entera. Contando estricto salía "1 CUOTA + ABONO" cuando
+         cualquiera diría que pagó dos."""
+    if valor_cuota <= 0 or sobrante < UMBRAL_NOTIFICACION:
+        return None
+    enteras = int((sobrante + UMBRAL_NOTIFICACION) // valor_cuota)
+    resto   = sobrante - enteras * valor_cuota
+    total   = 1 + enteras
+    if resto >= UMBRAL_NOTIFICACION:
+        return f'{total} CUOTA{"S" if total > 1 else ""} + ABONO'
+    return f'PAGA {_NUMERO_EN_LETRA.get(total, str(total))} CUOTAS'
+
+
 def _pago_mas_reciente(asociaciones: list[dict], pagos_por_matching_key: dict) -> dict:
     """De un grupo de asociaciones vigentes de una misma cuota, el pago con
     `payment_date` más reciente — usado para llenar fecha_pago/medio_pago/
@@ -485,9 +612,10 @@ def main():
 
     log.info('Cargando overrides y asociaciones existentes...')
     overrides_rows = select_all(supabase_url, srk, 'cartera_preventiva_overrides',
-                                 select='llave,cerrado_manual,fecha_pago_manual')
+                                 select='llave,cerrado_manual,fecha_pago_manual,valor_cuota_manual')
     llaves_cerradas_manual = {r['llave'] for r in overrides_rows if r.get('cerrado_manual')}
     cerrados_manual_por_llave = {r['llave']: r for r in overrides_rows if r.get('cerrado_manual')}
+    overrides_por_llave = {r['llave']: r for r in overrides_rows if r.get('llave')}
 
     asociaciones_rows = select_all(supabase_url, srk, 'pago_asociaciones',
                                     select='id,matching_key,llave,monto,origen')
@@ -497,7 +625,7 @@ def main():
         supabase_url, srk, 'cartera_preventiva',
         select='id,llave,cruce_access,correo,fecha_vencimiento,valor_cuota,valor_a_cobrar,inscrip,'
                'cliente,sistema_financiero,moneda,programa,fecha_pago,valor_pago,fecha_cruce,'
-               'diferencia,notificacion,codigo_transaccion_1',
+               'diferencia,notificacion,codigo_transaccion_1,pago,pago_confirmado',
     )
     # Llaves que ya pertenecen a una cuota COBRADA (incluidas las líneas
     # partidas que el Excel trae cerradas con su pago anotado).
@@ -511,8 +639,33 @@ def main():
     llave_por_id      = {c['id']: c['llave'] for c in cuotas_rows}
     cliente_por_llave = {c['llave']: c.get('cliente') for c in cuotas_rows if c.get('llave')}
 
-    # Regla #8 — "Cerrar cartera": cierre MANUAL de una cuota puntual, fuera
-    # del proceso (fin-platform escribe cerrado_manual=true +
+    # Valor de cuota corregido a mano desde fin-platform
+    # (`cartera_preventiva_overrides.valor_cuota_manual`). La app lo guarda
+    # desde el 16 de julio y le promete al usuario "se reflejará en el
+    # próximo cruce", pero NADIE lo leía — el campo no aparecía ni una vez en
+    # este repo. Se aplica acá, antes que todo lo demás, para que el cierre y
+    # la cascada usen el valor corregido. `valor_a_cobrar` se recalcula por la
+    # fórmula del Sistema Financiero sobre el abono que trajo el Excel.
+    ajustes_valor_cuota: list[dict] = []
+    for cuota in cuotas_rows:
+        override = overrides_por_llave.get(cuota.get('llave') or '')
+        nuevo = override.get('valor_cuota_manual') if override else None
+        if nuevo is None:
+            continue
+        nuevo = round(float(nuevo), 2)
+        if round(float(cuota.get('valor_cuota') or 0), 2) == nuevo:
+            continue
+        pago_excel = _pago_sin_confirmar(cuota)
+        cuota['valor_cuota']    = nuevo
+        cuota['valor_a_cobrar'] = round(nuevo - pago_excel, 2)
+        ajustes_valor_cuota.append({'id': cuota['id'], 'valor_cuota': nuevo,
+                                     'valor_a_cobrar': cuota['valor_a_cobrar']})
+    if ajustes_valor_cuota:
+        upsert_cartera_preventiva(supabase_url, srk, ajustes_valor_cuota)
+        log.info('%d cuota(s) con valor corregido a mano aplicado.', len(ajustes_valor_cuota))
+
+    # "Cerrar Cuota" (antes "Cerrar cartera"): cierre MANUAL de una cuota
+    # puntual, fuera del proceso (fin-platform escribe cerrado_manual=true +
     # fecha_pago_manual). Estas filas van en listas propias porque
     # `_fila_cierre_cartera` y `_fila_reset` no comparten el mismo set de
     # claves entre sí (ver docstrings) — cada una se postea en su propio
@@ -528,34 +681,48 @@ def main():
         override = cerrados_manual_por_llave.get(llave)
         fecha_manual = override.get('fecha_pago_manual') if override else None
         if fecha_manual:
-            valor_a_cobrar = cuota.get('valor_a_cobrar')
+            saldo = _saldo_a_cobrar(cuota)
+            # Idempotencia: `_saldo_a_cobrar` ya devuelve el saldo que la
+            # cuota tenía ANTES de cerrarse (le suma `pago_confirmado`), así
+            # que en una cuota ya cerrada esta comparación sigue dando igual
+            # corrida tras corrida. `pago_confirmado` en NULL fuerza una
+            # pasada más para las cerradas antes del 23 de julio, que todavía
+            # no tienen el `pago` escrito.
             ya_reflejado = (
                 cuota.get('notificacion') == 'CARTERA'
                 and cuota.get('fecha_pago') == fecha_manual
                 and cuota.get('valor_pago') is not None
-                and valor_a_cobrar is not None
-                and round(float(cuota['valor_pago']), 2) == round(float(valor_a_cobrar), 2)
+                and cuota.get('pago_confirmado') is not None
+                and round(float(cuota['valor_pago']), 2) == round(saldo, 2)
             )
             if ya_reflejado:
                 continue
             fila = _fila_cierre_cartera(cuota, fecha_manual, hoy)
             cierres_cartera.append(fila)
-            cuota['fecha_pago']    = fecha_manual
-            cuota['valor_pago']    = valor_a_cobrar
-            cuota['diferencia']    = 0
-            cuota['notificacion']  = 'CARTERA'
-            cuota['fecha_cruce']   = hoy
+            cuota['fecha_pago']      = fecha_manual
+            cuota['valor_pago']      = fila['valor_pago']
+            cuota['diferencia']      = 0
+            cuota['notificacion']    = 'CARTERA'
+            cuota['fecha_cruce']     = hoy
+            cuota['pago']            = fila['pago']
+            cuota['pago_confirmado'] = fila['pago_confirmado']
+            cuota['valor_a_cobrar']  = fila['valor_a_cobrar']
             cerrados_cartera += 1
         elif cuota.get('notificacion') == 'CARTERA':
             # cerrado_manual se apagó (reabrir) o nunca tuvo fecha puesta —
             # sin fecha no se cierra (P1), así que si quedó marcada CARTERA
-            # de una corrida anterior, se resetea a pendiente.
-            resets_varios.append(_fila_reset(cuota['id']))
-            cuota['fecha_pago']   = None
-            cuota['valor_pago']   = None
-            cuota['diferencia']   = None
-            cuota['fecha_cruce']  = None
-            cuota['notificacion'] = None
+            # de una corrida anterior, se resetea a pendiente. El reset
+            # también deshace el cierre (`pago`/`valor_a_cobrar`).
+            fila_reset = _fila_reset(cuota)
+            resets_varios.append(fila_reset)
+            cuota['fecha_pago']      = None
+            cuota['valor_pago']      = None
+            cuota['diferencia']      = None
+            cuota['fecha_cruce']     = None
+            cuota['notificacion']    = None
+            cuota['pago']            = fila_reset['pago']
+            cuota['pago_confirmado'] = None
+            cuota['valor_a_cobrar']  = fila_reset['valor_a_cobrar']
             reabiertos_cartera += 1
     if cerrados_cartera or reabiertos_cartera:
         log.info('Cartera manual (regla #8): %d cuota(s) cerradas, %d reabierta(s).',
@@ -591,15 +758,20 @@ def main():
                 ids_a_borrar.append(r['id'])
 
         delete_by_keys(supabase_url, srk, 'pago_asociaciones', 'id', ids_a_borrar)
-        reset_rows = [_fila_reset(id_por_llave[llave]) for llave in llaves_a_resetear if llave in id_por_llave]
-        upsert_cartera_preventiva(supabase_url, srk, reset_rows)
+        reset_rows = []
         for c in cuotas_rows:
             if c.get('llave') in llaves_a_resetear:
+                fila_reset = _fila_reset(c)
+                reset_rows.append(fila_reset)
                 c['fecha_pago'] = None
                 c['valor_pago'] = None
                 c['diferencia'] = None
                 c['fecha_cruce'] = None
                 c['notificacion'] = None
+                c['pago'] = fila_reset['pago']
+                c['pago_confirmado'] = None
+                c['valor_a_cobrar'] = fila_reset['valor_a_cobrar']
+        upsert_cartera_preventiva(supabase_url, srk, reset_rows)
         log.info('%d asociación(es) huérfana(s) borradas, %d cuota(s) reseteada(s) para reproceso.',
                   len(ids_a_borrar), len(reset_rows))
 
@@ -613,13 +785,21 @@ def main():
     nuevas_asociaciones: list[dict] = []
     saldos_favor_nuevos: list[dict] = []
 
-    # §3.5 — Pase de reconciliación manual: toda cuota con al menos una
-    # asociación origen='manual' se recalcula a partir de la SUMA de TODAS
-    # sus asociaciones vigentes (mismo umbral que el FIFO automático).
-    log.info('Reconciliando asociaciones manuales...')
-    llaves_con_asoc_manual = {a['llave'] for a in asociaciones_vigentes if a.get('origen') == 'manual'}
+    # Pase de reconciliación: toda cuota se recalcula a partir de la SUMA de
+    # TODAS sus asociaciones vigentes (mismo umbral que el FIFO automático).
+    #
+    # AMPLIADO el 23 de julio (punto #1): antes solo miraba las cuotas con al
+    # menos una asociación `origen='manual'`, y el reset de más abajo solo
+    # cubre las que pierden TODAS sus asociaciones. Entre las dos quedaba un
+    # hueco: una cuota cubierta por DOS pagos automáticos a la que se le
+    # descarta uno no la tocaba nadie — seguía mostrando la suma de los dos
+    # para siempre, y ninguna corrida posterior la volvía a mirar.
+    #
+    # Es seguro ampliarlo a todas porque el chequeo de idempotencia de abajo
+    # descarta las que ya reflejan su suma, que son la enorme mayoría.
+    log.info('Reconciliando cuotas contra sus asociaciones vigentes...')
     reconciliadas = 0
-    for llave in llaves_con_asoc_manual:
+    for llave in list(asociaciones_por_llave.keys()):
         if llave in llaves_cerradas_manual:
             continue
         cuota_id = id_por_llave.get(llave)
@@ -643,9 +823,14 @@ def main():
         actualizaciones_cierre.append(fila)
         if linea:
             lineas_nuevas.append(linea)
-        cuota['valor_pago'] = suma
-        cuota['fecha_pago'] = fila.get('fecha_pago')
-        cuota['fecha_cruce'] = hoy
+        cuota['valor_pago']      = suma
+        cuota['fecha_pago']      = fila.get('fecha_pago')
+        cuota['fecha_cruce']     = hoy
+        # El recálculo deshace el cierre: si a la cuota se le descartó un
+        # pago, no puede seguir marcada como pagada (punto #1).
+        cuota['pago']            = fila['pago']
+        cuota['pago_confirmado'] = None
+        cuota['valor_a_cobrar']  = fila['valor_a_cobrar']
         reconciliadas += 1
 
     # Cuotas que perdieron TODAS sus asociaciones vigentes por un descarte
@@ -673,16 +858,20 @@ def main():
             continue
         if llave in asociaciones_por_llave:
             continue  # todavía tiene asociación(es) vigente(s)
-        resets_varios.append(_fila_reset(cuota['id']))
+        fila_reset = _fila_reset(cuota)
+        resets_varios.append(fila_reset)
         cuota['fecha_pago'] = None
         cuota['valor_pago'] = None
         cuota['diferencia'] = None
         cuota['fecha_cruce'] = None
         cuota['notificacion'] = None
+        cuota['pago'] = fila_reset['pago']
+        cuota['pago_confirmado'] = None
+        cuota['valor_a_cobrar'] = fila_reset['valor_a_cobrar']
         reseteadas_descarte += 1
 
     if reconciliadas or reseteadas_descarte:
-        log.info('%d cuota(s) reconciliadas por asociación manual, %d reseteada(s) por descarte.',
+        log.info('%d cuota(s) reconciliadas contra sus asociaciones, %d reseteada(s) por descarte.',
                   reconciliadas, reseteadas_descarte)
 
     # §3.6: pagos_nuevos = cruzados con INCP, sin ninguna asociación vigente
@@ -841,6 +1030,73 @@ def main():
         upsert_cartera_preventiva(supabase_url, srk, sync_diferencia)
         log.info('Saldo a favor: %d cuota(s) origen sincronizadas con su disponible restante.',
                   len(sync_diferencia))
+
+    # ── Notificación de plata sin repartir (23 de julio, punto #2) ─────────
+    # Es un aviso VIVO, no un texto que se escribe una vez: se recalcula
+    # entero en cada corrida y se limpia cuando deja de aplicar.
+    #
+    # Regla del usuario: mientras el sobrante de un pago siga ENTERO y sin
+    # asignar, la cuota que recibió ese pago avisa cuánto pagó la persona
+    # medido en cuotas. En cuanto alguien reparte una parte —así sea una
+    # sola— el texto desaparece y queda solo el saldo a favor actualizado.
+    #
+    # Los tres casos que pidió cubrir salen de la misma regla, sin código
+    # aparte: se asigna parte del saldo → `disponible` baja y el texto se va;
+    # se asigna todo → igual; el pago se repartió entre dos cuotas y a una se
+    # le descarta → esa parte vuelve a ser plata sin repartir (fila
+    # `origen='descarte'` en el ledger) y el texto queda en la cuota que
+    # conservó el pago, que es la que sigue teniendo asociación vigente.
+    etiqueta_por_llave: dict[str, str] = {}
+    for cr in saldos_favor_rows:
+        monto      = round(float(cr.get('monto') or 0), 2)
+        disponible = round(float(cr.get('disponible') or 0), 2)
+        if monto <= 0 or disponible < monto:
+            continue  # ya se repartió algo: no se avisa nada
+        if cr.get('origen') == 'sobrante':
+            llave_destino = cr.get('llave_origen')
+        else:
+            # Descarte: el texto va a la cuota que CONSERVÓ el pago, o sea la
+            # última que le sigue quedando asociada a ese mismo pago.
+            restantes = [a['llave'] for a in asociaciones_vigentes
+                          if a['matching_key'] == cr.get('matching_key')]
+            restantes += [a['llave'] for a in nuevas_asociaciones
+                           if a['matching_key'] == cr.get('matching_key')]
+            llave_destino = restantes[-1] if restantes else None
+        cuota_id = id_por_llave.get(llave_destino) if llave_destino else None
+        if cuota_id is None:
+            continue
+        cuota_destino = next((c for c in cuotas_rows if c['id'] == cuota_id), None)
+        if not cuota_destino:
+            continue
+        etiqueta = _etiqueta_notificacion(_saldo_a_cobrar(cuota_destino), disponible)
+        if etiqueta:
+            etiqueta_por_llave[llave_destino] = etiqueta
+
+    sync_notificacion = []
+    for cuota in cuotas_rows:
+        llave = cuota.get('llave') or ''
+        if not llave:
+            continue
+        actual  = cuota.get('notificacion')
+        deseada = etiqueta_por_llave.get(llave)
+        if deseada:
+            # 'FALTA DE PAGO' y 'CARTERA' son de otros dueños y nunca compiten
+            # por la misma fila (viven en la cuota nueva del faltante y en una
+            # cuota cerrada a mano, que no tiene pago real). Si aun así
+            # coincidieran, mandan ellas.
+            if actual in ('FALTA DE PAGO', 'CARTERA') or actual == deseada:
+                continue
+            sync_notificacion.append({'id': cuota['id'], 'notificacion': deseada})
+            cuota['notificacion'] = deseada
+        elif _es_etiqueta_de_sobrante(actual):
+            # Ya no aplica (se repartió el saldo, se descartó el pago, o el
+            # sobrante bajó del umbral): se limpia. Solo se tocan las
+            # etiquetas de esta familia, nunca las ajenas.
+            sync_notificacion.append({'id': cuota['id'], 'notificacion': None})
+            cuota['notificacion'] = None
+    if sync_notificacion:
+        upsert_cartera_preventiva(supabase_url, srk, sync_notificacion)
+        log.info('Notificación de sobrante: %d cuota(s) actualizadas.', len(sync_notificacion))
 
     # Cruce a la inversa (informativo, ver docstring del módulo).
     llaves_por_pago: dict[str, list[str]] = {}

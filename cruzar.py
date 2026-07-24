@@ -211,7 +211,7 @@ from utils.excel_cartera import read_pagos_wompi_reporte
 from utils.parser import normalizar_nit as _normalizar_nit
 from utils.parser import normalizar_sufijo as _normalizar_sufijo
 from utils.supabase import (select_all, upsert_cruce, upsert_pagos_apartados, delete_by_keys,
-                             update_cruce_valores)
+                             update_cruce_valores, update_consolidated_metodo)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -555,6 +555,33 @@ def _cargar_lookup_wompi_reporte(sa_json: str, folder_id: str) -> tuple[dict[str
     return lookup, True
 
 
+def _tiene_senal_de_cruce(t: dict, lookup_inscrip: dict, lookup_bc2576: dict,
+                           lookup_wompi: dict, lookup_stripe: dict) -> bool:
+    """¿El documento o el correo de este pago cruzan HOY contra alguna hoja?
+
+    Usado solo para decidir si vale la pena reabrir una fila que una persona
+    marcó "no se logra identificar" (punto #7). Es a propósito más simple que
+    el cruce real: no resuelve ambigüedades, sufijos ni nombres — solo
+    responde "apareció algo donde antes no había nada". El cruce de verdad
+    corre después, sobre la fila ya reabierta.
+
+    Se usa `.get(...)` y no `in`: `_build_lookup` guarda la llave aunque el
+    valor venga vacío, y una hoja con INCP en blanco no es una señal."""
+    identification = str(t.get('identification') or '').strip()
+    if identification and lookup_inscrip.get(identification):
+        return True
+    email          = str(t.get('email') or '').strip()
+    email_lower    = email.lower()
+    payment_method = str(t.get('payment_method') or '').upper()
+    if payment_method == 'BANCOLOMBIA':
+        return bool(email and lookup_bc2576.get(email))
+    if payment_method.startswith('WOMPI'):
+        return bool(email_lower and lookup_wompi.get(email_lower))
+    if payment_method == 'STRIPE_USA':
+        return bool(email_lower and lookup_stripe.get(email_lower))
+    return False
+
+
 def _build_id_inscripcion_por_base(inscrip_rows: list[dict]) -> dict[str, set[str]]:
     """Índice inverso de cartera_inscrip.id_inscripcion: número base (sin
     sufijo PN/PJ) -> conjunto de valores completos vistos con esa base.
@@ -790,7 +817,8 @@ def main():
     log.info('Cargando estado_cruce existente...')
     existentes = select_all(
         supabase_url, srk, 'cruce_cartera',
-        select='matching_key,identification,payment_method,estado_cruce,corregido_manual',
+        select='matching_key,identification,payment_method,estado_cruce,corregido_manual,'
+               'incp,correo_2',
     )
     identificacion_cruzada = {
         r['matching_key']: str(r.get('identification') or '').strip()
@@ -806,9 +834,47 @@ def main():
         supabase_url, srk, 'consolidated_transactions',
         select='identification,payment_date,transaction_code_1,transaction_code_2,'
                'email,payment_method,program,phone,payment_amount,matching_key,'
-               'registration_date',
+               'registration_date,metodo_de_pago',
     )
     transacciones = _aplicar_correcciones_documento(transacciones, correcciones_documento)
+
+    # Punto #8 (23 de julio): la etiqueta link/manual se guarda PEGADA AL PAGO,
+    # en el consolidado, y no solo dentro de cruce_cartera.
+    #
+    # Motivo: el reporte "WOMPI del día" es de MÉTRICAS (¿el cliente usa más el
+    # link o el pago manual?), así que necesita los pagos del día completos. Un
+    # pago apartado —matrícula, cesantías…— se BORRA de cruce_cartera, y con él
+    # desaparecía su etiqueta: el 23/07 entraron 75 WOMPI y el reporte solo
+    # podía ver 64. Los 11 de matrícula ($9.050.627) no estaban mal
+    # clasificados, estaban sin clasificar.
+    #
+    # Se corre sobre TODAS las transacciones, antes del filtro de filas
+    # terminales, porque el reporte cuenta pagos, no estados de cruce.
+    if wompi_reporte_disponible:
+        actualizaciones_metodo = []
+        for t in transacciones:
+            if not str(t.get('payment_method') or '').upper().startswith('WOMPI'):
+                continue
+            actual = str(t.get('metodo_de_pago') or '').strip()
+            # NUNCA degradar link -> manual. La misma propiedad que ya tenía la
+            # Fase 9.4: el reporte de una corrida solo cubre su propio período,
+            # así que "no aparece" significa "este archivo no lo trae", no "no
+            # fue link". Sin esto, un pago clasificado bien ayer se marcaría
+            # manual hoy y las métricas oscilarían con cada archivo.
+            if actual == WOMPI_GENERA_LINK_LABEL:
+                continue
+            tx_id = str(t.get('matching_key') or '').strip()
+            nuevo = (WOMPI_GENERA_LINK_LABEL if tx_id and lookup_wompi_reporte.get(tx_id)
+                     else PAGOS_MANUALES_LABEL)
+            if nuevo == actual:
+                continue
+            t['metodo_de_pago'] = nuevo
+            actualizaciones_metodo.append({'matching_key': t['matching_key'],
+                                            'metodo_de_pago': nuevo})
+        if actualizaciones_metodo:
+            update_consolidated_metodo(supabase_url, srk, actualizaciones_metodo)
+            log.info('Consolidado: %d pago(s) WOMPI con método actualizado.',
+                      len(actualizaciones_metodo))
 
     # Una fila terminal se salta, SALVO que el documento con el que se cruzó ya
     # no sea el documento que tiene hoy: eso significa que alguien lo corrigió
@@ -830,7 +896,39 @@ def main():
     if reabiertas:
         log.info('%d fila(s) terminales reabiertas por corrección de documento: %s',
                  len(reabiertas), ', '.join(reabiertas[:5]))
-    llaves_terminadas = terminadas - set(reabiertas)
+
+    # Punto #7 (23 de julio): un pago marcado a mano "no se logra identificar"
+    # se queda en Excepciones para siempre — y como es terminal, si el equipo
+    # registra esa inscripción MÁS ADELANTE nadie lo vuelve a mirar. Medido al
+    # decidirlo: 24 filas por $24.182.850, todas con documento correcto y
+    # ninguno de esos documentos en cartera todavía.
+    #
+    # Se reabre solo cuando aparece una señal que la fila NO tenía: el
+    # documento ya cruza contra cartera_inscrip, o el correo ya cruza contra
+    # la hoja de su banco. No desautoriza a la persona — cuando marcó, no
+    # había nada; ahora sí. Y no cicla: al re-cruzarla queda 'cruzado' o
+    # 'pendiente', así que deja de ser candidata.
+    #
+    # NO aplica a las 'cruzado' (esas ya tienen su señal) ni a las que una
+    # persona marcó teniendo INCP o CORREO(2) a la vista, que sería
+    # contradecirla.
+    sin_senal_previa = {
+        r['matching_key'] for r in existentes
+        if r.get('estado_cruce') == 'no_identificable'
+        and not str(r.get('incp') or '').strip()
+        and not str(r.get('correo_2') or '').strip()
+    }
+    reabiertas_senal = [
+        t['matching_key'] for t in transacciones
+        if t.get('matching_key') in sin_senal_previa
+        and t['matching_key'] not in reabiertas
+        and _tiene_senal_de_cruce(t, lookup_inscrip, lookup_bc2576, lookup_wompi, lookup_stripe)
+    ]
+    if reabiertas_senal:
+        log.info('%d fila(s) no_identificable reabiertas porque su documento/correo ya cruza: %s',
+                 len(reabiertas_senal), ', '.join(reabiertas_senal[:5]))
+
+    llaves_terminadas = terminadas - set(reabiertas) - set(reabiertas_senal)
     log.info('%d filas ya resueltas (cruzado/no_identificable), se saltan.', len(llaves_terminadas))
 
     transacciones = [t for t in transacciones if t.get('matching_key') not in llaves_terminadas]
