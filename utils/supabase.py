@@ -58,14 +58,33 @@ def upsert(supabase_url: str, service_role_key: str, rows: list[list]) -> None:
         'Content-Type':  'application/json',
         'Prefer':        _PREFER,
     }
-    resp = http.post(
-        f'{supabase_url}{_ENDPOINT}',
-        json=payload,
-        headers=hdrs,
-        timeout=30,
-    )
-    _raise_for_status(resp)
-    log.info('Upsert Supabase OK: %d registros, HTTP %s.', len(payload), resp.status_code)
+
+    # registration_date es la fecha en que un pago ENTRA por primera vez al
+    # sistema, y debe ser ESTABLE: no se re-escribe cuando el mismo archivo se
+    # reprocesa. Sin esto, el export acumulado de Stripe (que trae varios días
+    # de pagos) re-sellaba con la fecha de hoy pagos que ya habían entrado días
+    # atrás, cada vez que se procesaba. Solución: los pagos que YA existen se
+    # actualizan (merge) en todas sus columnas MENOS registration_date; solo
+    # los nuevos la estrenan. Van en dos POST porque un array de merge exige
+    # que todos los objetos tengan el mismo set de claves (PGRST102).
+    existentes = existing_matching_keys(
+        supabase_url, service_role_key, [p['matching_key'] for p in payload])
+    nuevos   = [p for p in payload if p['matching_key'] not in existentes]
+    ya_estan = [{k: v for k, v in p.items() if k != 'registration_date'}
+                for p in payload if p['matching_key'] in existentes]
+
+    for lote in (nuevos, ya_estan):
+        if not lote:
+            continue
+        resp = http.post(
+            f'{supabase_url}{_ENDPOINT}',
+            json=lote,
+            headers=hdrs,
+            timeout=30,
+        )
+        _raise_for_status(resp)
+    log.info('Upsert Supabase OK: %d registros (%d nuevos, %d ya existían — '
+             'sin re-sellar fecha de ingreso).', len(payload), len(nuevos), len(ya_estan))
 
 
 def existing_matching_keys(supabase_url: str, service_role_key: str, keys: list[str]) -> set[str]:
