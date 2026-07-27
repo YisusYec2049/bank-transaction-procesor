@@ -9,8 +9,14 @@ Implementado hasta ahora (columnas 10-11 del diseño de 20 columnas):
                que identification nunca lo trae — sin esto ningún pago hecho
                por una empresa (Persona Jurídica) cruzaba (ver _normalizar_nit).
   - CORREO(2): email vs la hoja "Ingresos PSE y PAYU" correspondiente al banco
-               (BANCOLOMBIA 2576 / WOMPI / STRIPE_USA), primera coincidencia
-               (replica BUSCARV de Excel: la primera fila que matchea gana).
+               (BANCOLOMBIA 2576 / BANCOL 2833 / WOMPI / STRIPE_USA), primera
+               coincidencia (replica BUSCARV de Excel: la primera fila que
+               matchea gana). La hoja de 2833 se sumó el 27 de julio: hasta
+               entonces los pagos de esa cuenta ('PREBANCOLOMBIA') no tenían
+               ninguna rama acá y su CORREO(2) salía siempre vacío, aunque la
+               hoja los tuviera identificados a mano. Pesa más que en 2576:
+               la mayoría de esas referencias no son documentos (NEQUI manda
+               el nombre del pagador), así que la hoja es su única señal.
 
 Las columnas 12-19 (CRUCE, NOMBRE, ...) todavía no están definidas y quedan NULL.
 Requiere haber corrido sync_cartera.py antes (o el mismo día) para que las tablas
@@ -616,7 +622,8 @@ def _archivar_reportes_wompi(sa_json: str, archivos: list[dict]) -> None:
 
 
 def _tiene_senal_de_cruce(t: dict, lookup_inscrip: dict, lookup_bc2576: dict,
-                           lookup_wompi: dict, lookup_stripe: dict) -> bool:
+                           lookup_bc2833: dict, lookup_wompi: dict,
+                           lookup_stripe: dict) -> bool:
     """¿El documento o el correo de este pago cruzan HOY contra alguna hoja?
 
     Usado solo para decidir si vale la pena reabrir una fila que una persona
@@ -635,6 +642,8 @@ def _tiene_senal_de_cruce(t: dict, lookup_inscrip: dict, lookup_bc2576: dict,
     payment_method = str(t.get('payment_method') or '').upper()
     if payment_method == 'BANCOLOMBIA':
         return bool(email and lookup_bc2576.get(email))
+    if payment_method == 'PREBANCOLOMBIA':
+        return bool(email and lookup_bc2833.get(email))
     if payment_method.startswith('WOMPI'):
         return bool(email_lower and lookup_wompi.get(email_lower))
     if payment_method == 'STRIPE_USA':
@@ -806,6 +815,8 @@ def main():
 
     bc2576_rows  = select_all(supabase_url, srk, 'cartera_ingresos_bancolombia_2576',
                                select='referencia_1,incp,fecha')
+    bc2833_rows  = select_all(supabase_url, srk, 'cartera_ingresos_bancolombia_2833',
+                               select='referencia_1,incp,fecha')
     wompi_rows   = select_all(supabase_url, srk, 'cartera_ingresos_wompi',
                                select='email,inscrip,fecha')
     stripe_rows  = select_all(supabase_url, srk, 'cartera_ingresos_stripe_usa',
@@ -816,13 +827,16 @@ def main():
     id_inscripcion_por_base = _build_id_inscripcion_por_base(inscrip_rows)
     lookup_bc2576, ambiguos_bc2576, historial_bc2576, valores_bc2576 = _build_lookup(
         bc2576_rows, 'referencia_1', 'incp', fecha_field='fecha')
+    lookup_bc2833, ambiguos_bc2833, historial_bc2833, valores_bc2833 = _build_lookup(
+        bc2833_rows, 'referencia_1', 'incp', fecha_field='fecha')
     lookup_wompi, ambiguos_wompi, historial_wompi, valores_wompi     = _build_lookup(
         wompi_rows, 'email', 'inscrip', lower=True, fecha_field='fecha')
     lookup_stripe, ambiguos_stripe, historial_stripe, valores_stripe = _build_lookup(
         stripe_rows, 'email_cliente', 'incp', lower=True, fecha_field='fecha')
 
-    log.info('Referencias cargadas: inscrip=%d, bc2576=%d, wompi=%d, stripe=%d',
-              len(lookup_inscrip), len(lookup_bc2576), len(lookup_wompi), len(lookup_stripe))
+    log.info('Referencias cargadas: inscrip=%d, bc2576=%d, bc2833=%d, wompi=%d, stripe=%d',
+              len(lookup_inscrip), len(lookup_bc2576), len(lookup_bc2833),
+              len(lookup_wompi), len(lookup_stripe))
 
     # Fase 3.1-3.3: estructuras auxiliares para el cruce de Stripe por doble
     # señal correo+nombre (ver _cruzar_stripe). nombre_cliente ya viene
@@ -982,7 +996,8 @@ def main():
         t['matching_key'] for t in transacciones
         if t.get('matching_key') in sin_senal_previa
         and t['matching_key'] not in reabiertas
-        and _tiene_senal_de_cruce(t, lookup_inscrip, lookup_bc2576, lookup_wompi, lookup_stripe)
+        and _tiene_senal_de_cruce(t, lookup_inscrip, lookup_bc2576, lookup_bc2833,
+                                   lookup_wompi, lookup_stripe)
     ]
     if reabiertas_senal:
         log.info('%d fila(s) no_identificable reabiertas porque su documento/correo ya cruza: %s',
@@ -1109,6 +1124,14 @@ def main():
             correo_2           = lookup_bc2576.get(email, '')
             correo_2_ambiguo   = email in ambiguos_bc2576
             correo_2_historial = historial_bc2576.get(email, {})
+        elif payment_method == 'PREBANCOLOMBIA':
+            # Bancolombia 2833. Misma llave que 2576 (email, que en Bancolombia
+            # es copia del documento, contra la REFERENCIA 1 de la hoja) y sin
+            # bajar el nivel: si CORREO(2) resuelve solo, la fila queda
+            # 'cruce_unico' para que una persona confirme, igual que en 2576.
+            correo_2           = lookup_bc2833.get(email, '')
+            correo_2_ambiguo   = email in ambiguos_bc2833
+            correo_2_historial = historial_bc2833.get(email, {})
         elif payment_method.startswith('WOMPI'):
             correo_2           = lookup_wompi.get(email_lower, '')
             correo_2_ambiguo   = email_lower in ambiguos_wompi
@@ -1195,6 +1218,8 @@ def main():
             candidatos_doc = valores_inscrip.get(identification, set())
             if payment_method == 'BANCOLOMBIA':
                 candidatos_correo = valores_bc2576.get(email, set())
+            elif payment_method == 'PREBANCOLOMBIA':
+                candidatos_correo = valores_bc2833.get(email, set())
             elif payment_method.startswith('WOMPI'):
                 candidatos_correo = valores_wompi.get(email_lower, set())
             elif payment_method == 'STRIPE_USA':

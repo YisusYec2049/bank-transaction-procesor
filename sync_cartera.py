@@ -24,8 +24,8 @@ Preventiva tiene una versión nueva pendiente de activar se reduce a mirar
 
 Escrituras por archivo:
   - Payu UC.xlsx            → cartera_inscrip (replace_table)
-  - Ingresos PSE y PAYU.xlsx → cartera_ingresos_bancolombia_2576 / _wompi /
-                                _stripe_usa (replace_table cada una)
+  - Ingresos PSE y PAYU.xlsx → cartera_ingresos_bancolombia_2576 / _2833 /
+                                _wompi / _stripe_usa (replace_table cada una)
   - CARTERA PREVENTIVA*.xlsx → cartera_preventiva_staging (replace_table) —
     YA NO escribe sobre cartera_preventiva (la tabla VIVA). Cada carga nueva
     marca una fila `cartera_cargas(estado='staged')` — el marcador que
@@ -48,8 +48,8 @@ from dotenv import load_dotenv
 
 from utils.drive import build_drive_service, find_latest_any_file, download_pdf as download_file, move_file
 from utils.excel_cartera import (
-    read_inscrip, read_bancolombia_2576, read_wompi, read_stripe_usa,
-    read_cartera_preventiva,
+    read_inscrip, read_bancolombia_2576, read_bancolombia_2833, read_wompi,
+    read_stripe_usa, read_cartera_preventiva,
 )
 from utils.supabase import (replace_table, replace_cartera_preventiva_staging,
                              select_all, delete_by_keys, upsert_cartera_cargas)
@@ -160,15 +160,25 @@ def main():
     def _cargar_ingresos(drive, file_id) -> bool:
         ingresos_bytes = download_file(drive, file_id).read()
         bc2576_rows = read_bancolombia_2576(io.BytesIO(ingresos_bytes))
+        bc2833_rows = read_bancolombia_2833(io.BytesIO(ingresos_bytes))
         wompi_rows  = read_wompi(io.BytesIO(ingresos_bytes))
         stripe_rows = read_stripe_usa(io.BytesIO(ingresos_bytes))
-        if not (bc2576_rows or wompi_rows or stripe_rows):
-            log.warning('Ingresos PSE y PAYU: 0 filas leídas en las 3 hojas, se omite la carga '
+        if not (bc2576_rows or bc2833_rows or wompi_rows or stripe_rows):
+            log.warning('Ingresos PSE y PAYU: 0 filas leídas en las 4 hojas, se omite la carga '
                         '(no se tocan las tablas cartera_ingresos_*).')
             return False
         replace_table(supabase_url, srk, 'cartera_ingresos_bancolombia_2576', bc2576_rows)
         replace_table(supabase_url, srk, 'cartera_ingresos_wompi', wompi_rows)
         replace_table(supabase_url, srk, 'cartera_ingresos_stripe_usa', stripe_rows)
+        # 2833 aparte: read_bancolombia_2833 devuelve vacío (sin lanzar) si su
+        # hoja cambió de forma, y un replace_table con [] borraría el mirror
+        # entero. Se conserva lo cargado la vez anterior — para los pagos de
+        # 2833 una hoja vieja sigue siendo mejor señal que ninguna.
+        if bc2833_rows:
+            replace_table(supabase_url, srk, 'cartera_ingresos_bancolombia_2833', bc2833_rows)
+        else:
+            log.error('BANCOL 2833: 0 filas, no se reemplaza cartera_ingresos_bancolombia_2833 '
+                      '(se conserva la carga anterior).')
         return True
 
     def _cargar_cartera_prev(drive, file_id) -> bool:

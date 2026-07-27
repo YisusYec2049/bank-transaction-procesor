@@ -167,6 +167,57 @@ def read_bancolombia_2576(path: str | BinaryIO) -> list[dict]:
         wb.close()
 
 
+def read_bancolombia_2833(path: str | BinaryIO) -> list[dict]:
+    """Ingresos PSE y PAYU.xlsx → hoja BANCOL 2833. [{referencia_1, incp, fecha}, ...].
+
+    Misma forma y mismo uso que la hoja de 2576 (la REFERENCIA 1 del extracto
+    contra el `email` del pago, que en Bancolombia es copia del documento),
+    con dos diferencias propias de esta hoja:
+      - el encabezado está en la fila 2, debajo de un título "BANCO 2833"
+        que ocupa la fila 1 — _find_header_row lo resuelve solo;
+      - la columna del número de inscripción se llama "N° de Inscripción",
+        no "incp".
+
+    27 de julio: hasta hoy esta hoja no se leía, así que NINGÚN pago de la
+    2833 (payment_method 'PREBANCOLOMBIA') tenía forma de resolver CORREO(2).
+    No es un refuerzo del documento: de sus 333 referencias, 242 no existen
+    en cartera_inscrip — 51 son nombres que manda NEQUI en vez de un número
+    (ej. "SANTIAGO MORA 0058"), que jamás van a cruzar por documento. Para
+    esos pagos esta hoja es la ÚNICA señal de identidad.
+
+    A diferencia de las otras 3 hojas, una falla de lectura aquí NO tumba la
+    corrida: se loguea como error y se devuelve vacío. Es una hoja añadida
+    después, con un encabezado menos estándar que el resto, y su peor caso
+    (los pagos de 2833 se quedan en Excepciones, como estaban antes) es
+    visible en la plataforma; en cambio un ValueError aquí corta la cadena
+    del cron con `&&` y deja el pipeline entero sin correr ese día.
+    """
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    try:
+        try:
+            ws = wb['BANCOL 2833']
+            header_row, cols = _find_header_row(ws, ['REFERENCIA 1', 'N° de Inscripción', 'FECHA'])
+        except (KeyError, ValueError) as e:
+            log.error('BANCOL 2833 (Ingresos): no se pudo leer la hoja (%s). Los pagos de la '
+                      '2833 se quedan sin CORREO(2) esta corrida; la tabla mirror no se toca.', e)
+            return []
+
+        rows = []
+        for row in ws.iter_rows(min_row=header_row + 1, values_only=True):
+            ref1 = _cell_str(row[cols['referencia 1']])
+            if not ref1:
+                continue
+            rows.append({
+                'referencia_1': ref1,
+                'incp':         _cell_str(row[cols['n° de inscripción']]),
+                'fecha':        _cell_date(row[cols['fecha']]),
+            })
+        log.info('BANCOL 2833 (Ingresos): %d filas leídas.', len(rows))
+        return rows
+    finally:
+        wb.close()
+
+
 def read_wompi(path: str | BinaryIO) -> list[dict]:
     """Ingresos PSE y PAYU.xlsx → hoja WOMPI. [{email, inscrip, fecha}, ...]."""
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
