@@ -229,7 +229,8 @@ def read_pagos_wompi_reporte(path: str | BinaryIO) -> list[dict]:
     """ReportePagosWompi_*.xlsx (hoja "Pagos Wompi") → pagos automáticos WOMPI
     ("Genera Link") reportados por el Sistema Financiero (Azure). El nombre
     del archivo trae un rango de fechas variable y cambia en cada entrega (se
-    busca por patrón en Drive, ver find_latest_file en utils/drive.py).
+    busca por patrón en Drive, ver find_all_files en utils/drive.py — se leen
+    TODAS las entregas que haya en la carpeta, no solo la más reciente).
 
     Mismo patrón que las demás tablas mirror de "Ingresos PSE y PAYU.xlsx"
     (BANCOLOMBIA 2576 / WOMPI / STRIPE_USA): se reemplaza por completo en

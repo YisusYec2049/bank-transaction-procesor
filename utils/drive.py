@@ -50,16 +50,45 @@ def find_latest_any_file(drive, folder_id: str) -> str | None:
 
 
 def list_files(drive, folder_id: str) -> list[dict]:
-    """Lista todos los archivos (no carpetas, no nativos de Google) en la carpeta."""
-    result = drive.files().list(
-        q=(f"'{folder_id}' in parents"
-           " and trashed=false"
-           " and mimeType!='application/vnd.google-apps.folder'"
-           " and not mimeType contains 'vnd.google-apps'"),
-        fields='files(id, name, mimeType)',
-        orderBy='createdTime',
-    ).execute()
-    return result.get('files', [])
+    """Lista todos los archivos (no carpetas, no nativos de Google) en la
+    carpeta, ordenados por createdTime ascendente (el último es el más
+    reciente).
+
+    Pagina hasta agotar la carpeta: la API devuelve como máximo 100 archivos
+    por página, y sin paginar los que se perdían eran justamente los ÚLTIMOS
+    de la lista — o sea los más nuevos, porque el orden es ascendente. El
+    Inbox se vacía en cada corrida y no llega a ese tope, pero Histórico y la
+    carpeta del ReportePagosWompi sí acumulan."""
+    archivos, token = [], None
+    while True:
+        result = drive.files().list(
+            q=(f"'{folder_id}' in parents"
+               " and trashed=false"
+               " and mimeType!='application/vnd.google-apps.folder'"
+               " and not mimeType contains 'vnd.google-apps'"),
+            fields='nextPageToken, files(id, name, mimeType)',
+            orderBy='createdTime',
+            pageSize=100,
+            pageToken=token,
+        ).execute()
+        archivos += result.get('files', [])
+        token = result.get('nextPageToken')
+        if not token:
+            return archivos
+
+
+def find_all_files(drive, folder_id: str, contains: str) -> list[dict]:
+    """Todos los archivos de la carpeta cuyo nombre contiene `contains`
+    (case-insensitive), del más viejo al más reciente — el último es el más
+    nuevo, igual que find_latest_file.
+
+    Existe para el ReportePagosWompi: leer un solo archivo (el más reciente)
+    hace que, cuando se suben varias entregas juntas —el lunes con el fin de
+    semana, o el martes si el lunes fue festivo—, las demás no se lean NUNCA
+    y sus pagos por link queden clasificados como manuales para siempre."""
+    wanted = contains.strip().lower()
+    return [f for f in list_files(drive, folder_id)
+            if wanted in f['name'].strip().lower()]
 
 
 def list_pdfs(drive, folder_id: str) -> list[dict]:

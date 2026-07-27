@@ -206,7 +206,8 @@ from datetime import date, datetime as dt
 
 from dotenv import load_dotenv
 
-from utils.drive import build_drive_service, find_latest_file, download_pdf as download_file
+from utils.drive import (build_drive_service, find_all_files, move_file,
+                         download_pdf as download_file)
 from utils.excel_cartera import read_pagos_wompi_reporte
 from utils.parser import normalizar_nit as _normalizar_nit
 from utils.parser import normalizar_sufijo as _normalizar_sufijo
@@ -510,11 +511,22 @@ PAGOS_MANUALES_LABEL  = 'PAGOS MANUALES'
 WOMPI_GENERA_LINK_LABEL = 'WOMPI (Genera Link)'
 
 
-def _cargar_lookup_wompi_reporte(sa_json: str, folder_id: str) -> tuple[dict[str, dict], bool]:
-    """Lee el ReportePagosWompi_*.xlsx más reciente directo de Drive y arma
-    {id_transaccion: {pagador, comprobante, inscripcion, id_transaccion,
+def _cargar_lookup_wompi_reporte(sa_json: str, folder_id: str) -> tuple[dict[str, dict], bool, list[dict]]:
+    """Lee TODOS los ReportePagosWompi_*.xlsx que haya en la carpeta de Drive
+    y arma {id_transaccion: {pagador, comprobante, inscripcion, id_transaccion,
     proyecto, fecha_pago}} en memoria — no se guarda en ninguna tabla, se
     descarta al terminar la corrida.
+
+    Se leen todos y no solo el más reciente (2026-07-26) porque los lunes —o
+    los martes, cuando el lunes es festivo— se sube el acumulado del fin de
+    semana de una sola vez. Con un solo archivo leído, las demás entregas no
+    se miraban nunca y sus pagos por link quedaban rotulados "PAGOS MANUALES"
+    de forma permanente. Sumar archivos solo puede mejorar la clasificación:
+    la regla nunca degrada link -> manual (ver el bloque 9.4 en main()).
+
+    Dentro de un archivo gana la primera fila de cada id (criterio BUSCARV,
+    igual que el resto del script); entre archivos gana el MÁS RECIENTE, que
+    es la entrega más autoritativa.
 
     Indexado por `id_transaccion` (columna "Transaction Id (Wompi)"), NO por
     documento (21 de julio, regla #2 de "Automatización de Cartera"): el
@@ -527,32 +539,80 @@ def _cargar_lookup_wompi_reporte(sa_json: str, folder_id: str) -> tuple[dict[str
     cruzarlas). Primera coincidencia gana (mismo criterio BUSCARV que el
     resto del script).
 
-    Devuelve (lookup, disponible). `disponible=False` significa que esta
-    corrida no pudo cargar el reporte en absoluto (config faltante o archivo
-    no encontrado) — el llamador debe omitir la regla por completo en ese
-    caso, no tratarlo como "ningún documento identificado" (que marcaría de
-    golpe todas las transacciones WOMPI del día como sin identificar)."""
+    Devuelve (lookup, disponible, archivos). `disponible=False` significa que
+    esta corrida no pudo cargar el reporte en absoluto (config faltante o
+    archivo no encontrado) — el llamador debe omitir la regla por completo en
+    ese caso, no tratarlo como "ningún documento identificado" (que marcaría
+    de golpe todas las transacciones WOMPI del día como sin identificar).
+    `archivos` son los que se leyeron, del más viejo al más reciente, para que
+    el llamador archive los ya consumidos al terminar."""
     if not sa_json or not folder_id:
         log.warning('GOOGLE_SA_JSON / WOMPI_REPORTE_DRIVE_FOLDER_ID no configurados, '
                     'se omite el cruce NOMBRE/CI/MÉTODO DE PAGO de WOMPI.')
-        return {}, False
+        return {}, False, []
 
     drive = build_drive_service(sa_json)
-    file_id = find_latest_file(drive, folder_id, WOMPI_REPORTE_PATTERN)
-    if not file_id:
+    archivos = find_all_files(drive, folder_id, WOMPI_REPORTE_PATTERN)
+    if not archivos:
         log.warning('No se encontró ningún archivo "%s*" en la carpeta de Drive (%s), '
                     'se omite el cruce NOMBRE/CI/MÉTODO DE PAGO de WOMPI esta corrida.',
                     WOMPI_REPORTE_PATTERN, folder_id)
-        return {}, False
+        return {}, False, []
 
-    filas = read_pagos_wompi_reporte(download_file(drive, file_id))
-    lookup = {}
-    for fila in filas:
-        tx_id = str(fila.get('id_transaccion') or '').strip()
-        if tx_id and tx_id not in lookup:
-            lookup[tx_id] = fila
-    log.info('ReportePagosWompi: %d id(s) de transacción indexados (de %d filas).', len(lookup), len(filas))
-    return lookup, True
+    log.info('ReportePagosWompi: %d archivo(s) en la carpeta.', len(archivos))
+    lookup, total_filas = {}, 0
+    # Del más viejo al más reciente: el .update() deja ganar al último leído,
+    # o sea a la entrega más nueva.
+    for f in archivos:
+        try:
+            filas = read_pagos_wompi_reporte(download_file(drive, f['id']))
+        except Exception:
+            log.exception('ReportePagosWompi: no se pudo leer %s, se omite ese archivo.', f['name'])
+            continue
+        del_archivo = {}
+        for fila in filas:
+            tx_id = str(fila.get('id_transaccion') or '').strip()
+            if tx_id and tx_id not in del_archivo:
+                del_archivo[tx_id] = fila
+        total_filas += len(filas)
+        log.info('  %s -> %d id(s) de %d filas.', f['name'], len(del_archivo), len(filas))
+        lookup.update(del_archivo)
+
+    log.info('ReportePagosWompi: %d id(s) de transacción indexados (de %d filas, %d archivo(s)).',
+             len(lookup), total_filas, len(archivos))
+    return lookup, True, archivos
+
+
+def _archivar_reportes_wompi(sa_json: str, archivos: list[dict]) -> None:
+    """Mueve a Histórico los ReportePagosWompi ya leídos, dejando SOLO el más
+    reciente en la carpeta.
+
+    El más nuevo se queda a propósito: durante el día puede correr el pipeline
+    varias veces (cron + reprocesos disparados desde la plataforma), y si la
+    primera corrida se lo llevara todo, las siguientes se quedarían sin
+    reporte y los pagos que entren después no se alcanzarían a clasificar
+    hasta el día siguiente. Dejando uno, la carpeta no crece y el archivo del
+    día sigue disponible; cuando llega la entrega siguiente, esta misma
+    función archiva la anterior.
+
+    Se llama al FINAL de la corrida, cuando ya se escribió todo: si algo falla
+    antes, los archivos siguen en su sitio y la corrida siguiente los reintenta."""
+    if len(archivos) < 2:
+        return
+    destino = (os.environ.get('WOMPI_REPORTE_HISTORICO_FOLDER_ID', '')
+               or os.environ.get('WOMPI_HISTORICO_FOLDER_ID', ''))
+    if not destino:
+        log.warning('Sin carpeta de Histórico configurada para el ReportePagosWompi, '
+                    'se dejan los %d archivo(s) en su sitio.', len(archivos))
+        return
+
+    drive = build_drive_service(sa_json)
+    for f in archivos[:-1]:
+        try:
+            move_file(drive, f['id'], destino)
+            log.info('ReportePagosWompi movido a Histórico: %s', f['name'])
+        except Exception:
+            log.exception('No se pudo mover %s a Histórico (se queda en la carpeta).', f['name'])
 
 
 def _tiene_senal_de_cruce(t: dict, lookup_inscrip: dict, lookup_bc2576: dict,
@@ -808,7 +868,7 @@ def main():
 
     sa_json = os.environ.get('GOOGLE_SA_JSON', '')
     wompi_reporte_folder_id = os.environ.get('WOMPI_REPORTE_DRIVE_FOLDER_ID', '')
-    lookup_wompi_reporte, wompi_reporte_disponible = _cargar_lookup_wompi_reporte(
+    lookup_wompi_reporte, wompi_reporte_disponible, reportes_wompi = _cargar_lookup_wompi_reporte(
         sa_json, wompi_reporte_folder_id)
 
     correcciones_documento = _cargar_correcciones_documento(supabase_url, srk)
@@ -1314,20 +1374,22 @@ def main():
             update_cruce_valores(supabase_url, srk, actualizaciones_9_4)
         log.info('Fase 9.4: %d fila(s) WOMPI re-evaluadas contra el reporte.', len(actualizaciones_9_4))
 
-    if not resultado:
+    if resultado:
+        batch_size = 500
+        for i in range(0, len(resultado), batch_size):
+            upsert_cruce(supabase_url, srk, resultado[i:i + batch_size])
+
+        cruzados    = sum(1 for r in resultado if r['estado_cruce'] == 'cruzado')
+        sin_cruce   = sum(1 for r in resultado if r['excepcion_motivo'] == 'sin_cruce')
+        ambiguos    = sum(1 for r in resultado if r['excepcion_motivo'] == 'cruce_ambiguo')
+        log.info('cruzar.py completado: %d filas | cruzadas=%d | sin_cruce=%d | '
+                 'cruce_ambiguo=%d',
+                  len(resultado), cruzados, sin_cruce, ambiguos)
+    else:
         log.info('Sin transacciones para cruzar.')
-        return
 
-    batch_size = 500
-    for i in range(0, len(resultado), batch_size):
-        upsert_cruce(supabase_url, srk, resultado[i:i + batch_size])
-
-    cruzados    = sum(1 for r in resultado if r['estado_cruce'] == 'cruzado')
-    sin_cruce   = sum(1 for r in resultado if r['excepcion_motivo'] == 'sin_cruce')
-    ambiguos    = sum(1 for r in resultado if r['excepcion_motivo'] == 'cruce_ambiguo')
-    log.info('cruzar.py completado: %d filas | cruzadas=%d | sin_cruce=%d | '
-             'cruce_ambiguo=%d',
-              len(resultado), cruzados, sin_cruce, ambiguos)
+    # Al final y pase lo que pase con el cruce: los reportes ya se leyeron.
+    _archivar_reportes_wompi(sa_json, reportes_wompi)
 
 
 if __name__ == '__main__':
