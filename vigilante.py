@@ -9,12 +9,21 @@ Responde con el CÓDIGO DE SALIDA, para encadenarlo con `&&` en el cron:
 
 Para qué existe
 ---------------
-El pipeline corre una vez al día a las 10:30 (hora Colombia). Si el equipo
-sube los archivos más tarde —o si es lunes y sube el acumulado del fin de
-semana, o martes cuando el lunes fue festivo— esos pagos esperaban hasta la
-corrida del día siguiente, o tocaba apretar el botón "Actualizar cruce" a
-mano. Con este chequeo cada pocos minutos, subir los archivos es lo único
-que hay que hacer: el proceso arranca solo cuando detecta que llegaron.
+El pipeline corre una vez al día a las 10:30 (hora Colombia) y esa sigue
+siendo LA corrida: el equipo sube todo antes de esa hora y el lote se procesa
+completo, de una sola vez, para poder revisarlo sobre un resultado quieto.
+
+Este script es la EXCEPCIÓN, no el camino normal: cubre lo que llegó tarde.
+Antes, un archivo subido a las 10:45 esperaba hasta el día siguiente o tocaba
+apretar "Actualizar cruce" a mano.
+
+Por eso en el crontab del VPS la línea de este script está acotada a las
+horas POSTERIORES a la corrida diaria (`5,20,35,50 16-23 * * *` — el servidor
+va en UTC, así que son las 11:00 a 18:59 de Colombia). Es a propósito y no es
+un descuido: si corriera también en la mañana, un cargue hecho a las 8:00 se
+procesaría a las 8:05 y otro a las 8:40 dispararía una segunda corrida
+parcial, justo lo contrario de "una corrida limpia con todo el lote junto".
+Decisión del usuario, 2026-07-26.
 
 Es deliberadamente barato: solo lista carpetas (unas pocas llamadas a Drive),
 no descarga ni escribe nada. La corrida real la hacen los scripts de siempre,
