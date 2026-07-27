@@ -218,7 +218,7 @@ from utils.excel_cartera import read_pagos_wompi_reporte
 from utils.parser import normalizar_nit as _normalizar_nit
 from utils.parser import normalizar_sufijo as _normalizar_sufijo
 from utils.supabase import (select_all, upsert_cruce, upsert_pagos_apartados, delete_by_keys,
-                             update_cruce_valores, update_consolidated_metodo)
+                             update_cruce_valores, update_consolidated_campos)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -924,31 +924,50 @@ def main():
     #
     # Se corre sobre TODAS las transacciones, antes del filtro de filas
     # terminales, porque el reporte cuenta pagos, no estados de cruce.
+    # Junto con la etiqueta viaja el PROGRAMA (27 de julio): el CSV de WOMPI no
+    # trae ninguna columna de programa —solo transacción, fecha, referencia,
+    # monto, medio, correo, nombre, teléfono y documento—, así que en
+    # Transacciones consolidadas salía vacío para TODO WOMPI. El nombre del
+    # programa existe únicamente en el "Proyecto" del ReportePagosWompi, y
+    # hasta hoy solo se escribía en cruce_cartera. Los pagos hechos por el link
+    # público general no están en ese reporte y siguen sin programa: nadie sabe
+    # cuál es hasta que el pago cruce contra su inscripción.
     if wompi_reporte_disponible:
-        actualizaciones_metodo = []
+        actualizaciones = []
         for t in transacciones:
             if not str(t.get('payment_method') or '').upper().startswith('WOMPI'):
                 continue
+            tx_id  = str(t.get('matching_key') or '').strip()
+            match  = lookup_wompi_reporte.get(tx_id) if tx_id else None
+            cambios = {}
+
             actual = str(t.get('metodo_de_pago') or '').strip()
             # NUNCA degradar link -> manual. La misma propiedad que ya tenía la
             # Fase 9.4: el reporte de una corrida solo cubre su propio período,
             # así que "no aparece" significa "este archivo no lo trae", no "no
             # fue link". Sin esto, un pago clasificado bien ayer se marcaría
             # manual hoy y las métricas oscilarían con cada archivo.
-            if actual == WOMPI_GENERA_LINK_LABEL:
-                continue
-            tx_id = str(t.get('matching_key') or '').strip()
-            nuevo = (WOMPI_GENERA_LINK_LABEL if tx_id and lookup_wompi_reporte.get(tx_id)
-                     else PAGOS_MANUALES_LABEL)
-            if nuevo == actual:
-                continue
-            t['metodo_de_pago'] = nuevo
-            actualizaciones_metodo.append({'matching_key': t['matching_key'],
-                                            'metodo_de_pago': nuevo})
-        if actualizaciones_metodo:
-            update_consolidated_metodo(supabase_url, srk, actualizaciones_metodo)
-            log.info('Consolidado: %d pago(s) WOMPI con método actualizado.',
-                      len(actualizaciones_metodo))
+            if actual != WOMPI_GENERA_LINK_LABEL:
+                nuevo = WOMPI_GENERA_LINK_LABEL if match else PAGOS_MANUALES_LABEL
+                if nuevo != actual:
+                    t['metodo_de_pago'] = nuevo
+                    cambios['metodo_de_pago'] = nuevo
+
+            # Mismo criterio de no degradar: el programa solo se escribe cuando
+            # el reporte de ESTA corrida lo trae. Que no venga significa que
+            # este archivo no cubre ese pago, no que el pago no tenga programa
+            # — vaciarlo borraría lo que dejó una entrega anterior.
+            proyecto = str((match or {}).get('proyecto') or '').strip()
+            if proyecto and proyecto != str(t.get('program') or '').strip():
+                t['program'] = proyecto
+                cambios['program'] = proyecto
+
+            if cambios:
+                actualizaciones.append({'matching_key': t['matching_key'], **cambios})
+        if actualizaciones:
+            update_consolidated_campos(supabase_url, srk, actualizaciones)
+            log.info('Consolidado: %d pago(s) WOMPI actualizados (método/programa).',
+                      len(actualizaciones))
 
     # Una fila terminal se salta, SALVO que el documento con el que se cruzó ya
     # no sea el documento que tiene hoy: eso significa que alguien lo corrigió

@@ -333,10 +333,17 @@ def update_cruce_valores(supabase_url: str, service_role_key: str, updates: list
     log.info('Update cruce_cartera (cruce inverso) OK: %d filas.', len(updates))
 
 
-def update_consolidated_metodo(supabase_url: str, service_role_key: str,
+def update_consolidated_campos(supabase_url: str, service_role_key: str,
                                 updates: list[dict]) -> None:
-    """Escribe `metodo_de_pago` (link/manual de WOMPI) en consolidated_
-    transactions. Cada dict trae `matching_key` + `metodo_de_pago`.
+    """Escribe de vuelta en consolidated_transactions los campos que el pago
+    crudo no traía y el pipeline resolvió después. Cada dict trae
+    `matching_key` + las columnas a escribir.
+
+    Hoy son los dos que salen del ReportePagosWompi:
+      - `metodo_de_pago` (link/manual, punto #8 del 23 de julio),
+      - `program` (el "Proyecto" del reporte, 27 de julio) — el CSV de WOMPI
+        no trae el programa en ninguna columna, así que sin esto la vista de
+        Transacciones consolidadas lo muestra vacío para todo WOMPI.
 
     PATCH individual por `matching_key` (mismo patrón que `update_cruce_valores`
     / `update_cruce_inverso`): NO usa upsert/POST. `consolidated_transactions`
@@ -344,25 +351,30 @@ def update_consolidated_metodo(supabase_url: str, service_role_key: str,
     con `on_conflict` pero payload parcial viola ese `NOT NULL` al construir la
     tupla de INSERT — Postgres valida `NOT NULL` ANTES de que el `ON CONFLICT`
     pueda redirigir al UPDATE, así que revienta con 23502 aunque la fila exista.
-    Un PATCH real solo toca `metodo_de_pago` sobre las filas que ya existen; si
-    una llave no está, es no-op.
+    Un PATCH real solo toca las columnas enviadas sobre las filas que ya
+    existen; si una llave no está, es no-op.
 
-    La etiqueta vive acá, y no solo en cruce_cartera, porque un pago apartado
+    Estos campos viven acá, y no solo en cruce_cartera, porque un pago apartado
     (matrícula, cesantías…) se borra del cruce y el reporte de métricas WOMPI
     igual tiene que poder contarlo (punto #8, 23 de julio)."""
     if not updates:
         return
     hdrs = _headers(service_role_key, prefer='return=minimal')
+    escritas = 0
     for u in updates:
+        payload = {k: v for k, v in u.items() if k != 'matching_key'}
+        if not payload:
+            continue
         resp = http.patch(
             f'{supabase_url}/rest/v1/consolidated_transactions',
             params={'matching_key': f"eq.{u['matching_key']}"},
-            json={'metodo_de_pago': u['metodo_de_pago']},
+            json=payload,
             headers=hdrs,
             timeout=30,
         )
         _raise_for_status(resp)
-    log.info('Update consolidated_transactions (metodo_de_pago) OK: %d filas.', len(updates))
+        escritas += 1
+    log.info('Update consolidated_transactions OK: %d filas.', escritas)
 
 
 def upsert_pagos_apartados(supabase_url: str, service_role_key: str, rows: list[dict]) -> None:
