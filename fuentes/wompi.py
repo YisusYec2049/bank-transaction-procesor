@@ -13,11 +13,10 @@ Columnas esperadas (headers en minúsculas):
   [4] transaction_code_2  ← id conciliacion
   [5] email               ← email del pagador
   [6] payment_method      ← 'WOMPI {medio de pago}'
-  [7] program             ← vacío (Fase 9.5, 16 de julio; antes: nombre del
-                              pagador — bug desde el 26 de junio, ver más
-                              abajo). Solo cruzar.py lo llena, con el
-                              "Proyecto" de ReportePagosWompi, y solo para
-                              filas WOMPI LINK (9.2) — el resto queda vacío.
+  [7] program             ← `ref. 2` del CSV (28 de julio; antes vacío, ver
+                              más abajo). cruzar.py lo pisa con el "Proyecto"
+                              de ReportePagosWompi cuando el pago está en ese
+                              reporte (9.2), y nunca lo borra si no está.
   [8] phone               ← nombre del pagador (Fase 9.5; antes: ref. 2)
   [9] payment_amount      ← float
   [10] matching_key       ← id de la transaccion
@@ -26,10 +25,25 @@ Fase 9.5 del rediseño (16 de julio): `program` y `phone` estaban
 intercambiados desde el 26 de junio (línea 1 de "Cambios para Consolidado"):
 `program` traía el nombre del pagador en vez del programa, y de paso eso fue
 lo que rompió la regla original del 13 de julio de WOMPI automático/manual
-(asumía "program vacío = automático", pero nunca estaba vacío). `program`
-queda vacío a propósito hasta que cruzar.py lo llena desde el reporte —
-`ref. 2` deja de usarse (no tenía otro destino en el diseño de columnas
-15-25).
+(asumía "program vacío = automático", pero nunca estaba vacío). Esa fase dejó
+`program` vacío a propósito y descartó `ref. 2` "porque no tenía otro
+destino".
+
+28 de julio — `ref. 2` vuelve, ahora a `program`. La fase 9.5 asumió que el
+"Proyecto" del ReportePagosWompi cubría el programa de todo WOMPI, y no: ese
+reporte solo trae los pagos por link PERSONAL. Los del link PÚBLICO no están
+ahí, así que llegaban a Excepciones sin nombre, sin comprobante y sin
+programa — y son justo los que alguien tiene que identificar a mano.
+
+Las dos fuentes son complementarias, medido sobre los CSV reales del 17 al 20
+de julio: de los pagos por link personal, CERO traen `ref. 2`; de los del link
+público, TODOS (56/56 el 17 de julio). Por eso conviven sin pisarse — el
+reporte manda donde llega, y `ref. 2` llena el resto.
+
+Ojo con qué es este dato: **texto libre que teclea quien paga** ("Programa y
+Detalle Pago" en el formulario del link). Junto a "Diplomado en SARLAFT"
+aparece "Inscripción", "Pago mitad cuota" o "PAGO U DE CATALUÑA". Sirve para
+identificar el pago, no como nombre oficial del programa.
 """
 
 import csv
@@ -85,6 +99,7 @@ def parse_file(buf: io.BytesIO, filename: str = '') -> list[dict]:
             'medio':           medio,
             'nombre':          r.get('nombre del pagador', ''),
             'documento':       r.get('documento del pagador', ''),
+            'ref_2':           r.get('ref. 2', ''),
             'monto':           monto,
         })
 
@@ -102,7 +117,7 @@ def normalize(raw_rows: list[dict]) -> list[list]:
             r['id_conciliacion'],              # [4]  transaction_code_2
             r['email'],                        # [5]
             f"WOMPI {r['medio']}".strip(),     # [6]  payment_method
-            '',                                # [7]  program (Fase 9.5: lo llena cruzar.py)
+            r['ref_2'],                        # [7]  program (ver docstring, 28 de julio)
             r['nombre'],                       # [8]  phone (Fase 9.5: nombre del pagador)
             r['monto'],                        # [9]  payment_amount
             r['id_tx'],                        # [10] matching_key
