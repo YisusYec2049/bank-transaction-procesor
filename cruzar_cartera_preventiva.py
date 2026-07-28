@@ -565,7 +565,8 @@ def _procesar_inscripcion(cuotas_inscripcion: list[dict], pagos_para: list[dict]
     return cierres_filas, linea_nueva, asociaciones, saldo_favor_nuevo
 
 
-def _etiqueta_notificacion(valor_cuota: float, sobrante: float) -> str | None:
+def _etiqueta_notificacion(valor_cuota: float, sobrante: float,
+                            cuotas_cubiertas: int = 1) -> str | None:
     """Texto de la columna `notificacion` para un pago que dejó plata sin
     repartir (23 de julio, punto #2). Describe CUÁNTO pagó la persona medido
     en cuotas, no cuántas cuotas alcanzó a cerrar el sistema: la cartera
@@ -583,12 +584,20 @@ def _etiqueta_notificacion(valor_cuota: float, sobrante: float) -> str | None:
       2. tolerancia al contar cuotas enteras — caso real GP & A SAS: cuota
          $325.317 con sobrante $325.296, o sea 21 pesos por debajo de una
          cuota entera. Contando estricto salía "1 CUOTA + ABONO" cuando
-         cualquiera diría que pagó dos."""
+         cualquiera diría que pagó dos.
+
+    `cuotas_cubiertas` son las cuotas que ESE pago tiene asociadas hoy. Hasta
+    el 28 de julio se asumía 1 y el aviso quedaba corto cuando un pago cerraba
+    dos o más: el caso 16079640 cerró la cuota de junio y la de julio y dejó
+    $4.090.910 sueltos, y decía "PAGA CINCO CUOTAS" cuando la persona pagó
+    seis. Sale la misma cuenta por los dos caminos — si después se le descarta
+    el pago a una de las dos, esa cuota deja de contarse pero su plata vuelve
+    al saldo disponible y reaparece como cuota entera."""
     if valor_cuota <= 0 or sobrante < UMBRAL_NOTIFICACION:
         return None
     enteras = int((sobrante + UMBRAL_NOTIFICACION) // valor_cuota)
     resto   = sobrante - enteras * valor_cuota
-    total   = 1 + enteras
+    total   = max(int(cuotas_cubiertas), 1) + enteras
     if resto >= UMBRAL_NOTIFICACION:
         return f'{total} CUOTA{"S" if total > 1 else ""} + ABONO'
     return f'PAGA {_NUMERO_EN_LETRA.get(total, str(total))} CUOTAS'
@@ -1019,27 +1028,116 @@ def main():
               len(actualizaciones_cierre), len(resets_varios), len(lineas_nuevas),
               len(nuevas_asociaciones), len(saldos_favor_nuevos))
 
-    # §3.3.2 (P3): sincronizar la diferencia positiva de la cuota ORIGEN de
-    # cada saldo a favor tipo 'sobrante' con su `disponible` restante.
-    # fin-platform decrementa `disponible` al asociar; acá solo se refleja,
-    # nunca se recalcula. Va DESPUÉS de los cierres (no depende de su orden,
-    # es idempotente y de solo lectura sobre el ledger cargado al inicio).
-    sync_diferencia = []
+    # ── Dónde se muestran el saldo a favor y su aviso (28 de julio) ────────
+    # Los dos viven en la MISMA cuota, y cuál es esa cuota se RECALCULA en
+    # cada corrida: es la última que hoy le sigue quedando asociada al pago.
+    #
+    # Antes el saldo a favor se plantaba en `llave_origen` —la cuota donde
+    # cayó el pago la primera vez— y ese apunte no se movía nunca más. Si
+    # después alguien le descartaba el pago a esa cuota, la plata quedaba
+    # colgada de una cuota que ya no lo tenía y la que sí lo conservaba
+    # quedaba muda. Caso real 16079640 (27 de julio): $4.090.910 visibles en
+    # la cuota de julio —descartada y cerrada a mano por Cartera— mientras la
+    # de junio, que es la que se quedó con el pago, no mostraba nada. El
+    # aviso ya se movía así para los descartes; ahora las dos columnas siguen
+    # la misma regla, venga la fila del ledger de un sobrante o de un
+    # descarte, y da igual a cuál de las cuotas se le descarte el pago.
+    #
+    # `llave_origen` queda solo de respaldo, para el pago que se quedó sin
+    # ninguna asociación vigente: la plata tiene que verse en algún lado.
+    venc_por_llave = {c['llave']: (c.get('fecha_vencimiento') or _FECHA_MAX)
+                       for c in cuotas_rows if c.get('llave')}
+    llaves_vigentes_por_pago: dict[str, list[str]] = {}
+    for a in list(asociaciones_vigentes) + list(nuevas_asociaciones):
+        vistas = llaves_vigentes_por_pago.setdefault(a['matching_key'], [])
+        if a['llave'] not in vistas:
+            vistas.append(a['llave'])
+    for vistas in llaves_vigentes_por_pago.values():
+        vistas.sort(key=lambda l: (venc_por_llave.get(l, _FECHA_MAX), l))
+
+    # El ledger se agrupa POR PAGO, no fila por fila: un mismo pago puede
+    # tener varias filas (su sobrante original más lo que le devuelva un
+    # descarte) y todas describen la misma plata suelta de la misma persona.
+    saldo_por_pago: dict[str, dict] = {}
     for cr in saldos_favor_rows:
-        if cr.get('origen') != 'sobrante' or not cr.get('llave_origen'):
+        mk = cr.get('matching_key')
+        if not mk:
             continue
-        cuota_id = id_por_llave.get(cr['llave_origen'])
+        acum = saldo_por_pago.setdefault(
+            mk, {'monto': 0.0, 'disponible': 0.0, 'llave_origen': cr.get('llave_origen')})
+        acum['monto']      = round(acum['monto'] + float(cr.get('monto') or 0), 2)
+        acum['disponible'] = round(acum['disponible'] + float(cr.get('disponible') or 0), 2)
+
+    destino_por_pago: dict[str, str] = {}
+    for mk, acum in saldo_por_pago.items():
+        vigentes = llaves_vigentes_por_pago.get(mk) or []
+        if vigentes:
+            # Una cuota cerrada a mano por Cartera se declara saldada, y no es
+            # sitio para mostrar plata suelta — era justo la pantalla
+            # contradictoria del caso 16079640. Se baja a la anterior que sí
+            # tenga el pago; si TODAS están cerradas a mano, se queda en la
+            # última antes que dejar la plata invisible.
+            abiertas = [l for l in vigentes if l not in llaves_cerradas_manual]
+            destino = (abiertas or vigentes)[-1]
+        else:
+            destino = acum['llave_origen']
+        if destino:
+            destino_por_pago[mk] = destino
+
+    # §3.3.2 (P3): la `diferencia` POSITIVA de la cuota destino es el saldo a
+    # favor de ese pago que sigue sin repartir. fin-platform decrementa
+    # `disponible` al asociar; acá solo se refleja, nunca se recalcula. Va
+    # DESPUÉS de los cierres (no depende de su orden, es idempotente y de
+    # solo lectura sobre el ledger cargado al inicio).
+    diferencia_deseada: dict[str, float] = {}
+    for mk, destino in destino_por_pago.items():
+        if destino not in id_por_llave:
+            continue
+        diferencia_deseada[destino] = round(
+            diferencia_deseada.get(destino, 0.0) + saldo_por_pago[mk]['disponible'], 2)
+
+    # Candidatas a limpieza: toda cuota donde este saldo pudo haberse
+    # mostrado antes de moverse. Se acota a cuotas que tocó el pipeline
+    # (`fecha_cruce`) y a valores POSITIVOS: la diferencia positiva que trae
+    # el propio Excel de cartera (144 filas al 28 de julio, ninguna con
+    # `fecha_cruce`) es del proceso manual y no se toca, igual que las
+    # negativas, que son de FALTA DE PAGO.
+    candidatas_saldo: set[str] = set(diferencia_deseada)
+    for mk, acum in saldo_por_pago.items():
+        if acum['llave_origen']:
+            candidatas_saldo.add(acum['llave_origen'])
+        candidatas_saldo.update(llaves_vigentes_por_pago.get(mk) or [])
+
+    sync_diferencia = []
+    for llave in sorted(candidatas_saldo):
+        cuota_id = id_por_llave.get(llave)
         if cuota_id is None:
             continue
-        disponible = round(float(cr.get('disponible') or 0), 2)
-        cuota_origen = next((c for c in cuotas_rows if c['id'] == cuota_id), None)
-        actual = cuota_origen.get('diferencia') if cuota_origen else None
-        if actual is not None and round(float(actual), 2) == disponible:
+        cuota = next((c for c in cuotas_rows if c['id'] == cuota_id), None)
+        if not cuota:
             continue
-        sync_diferencia.append({'id': cuota_id, 'diferencia': disponible})
+        actual  = round(float(cuota.get('diferencia') or 0), 2)
+        deseada = diferencia_deseada.get(llave)
+        if deseada is not None:
+            if actual == deseada:
+                continue
+            if actual < 0:
+                # La cuota debe plata (faltante del pase de reconciliación).
+                # Escribirle el saldo a favor encima convertiría una deuda en
+                # un crédito a la vista. No pasa hoy (excedente y faltante son
+                # excluyentes dentro de una misma corrida), pero si llegara a
+                # pasar es preferible que se vea en el log a taparlo.
+                log.warning('Saldo a favor de %s no se muestra: la cuota debe %s.',
+                             llave, actual)
+                continue
+            sync_diferencia.append({'id': cuota_id, 'diferencia': deseada})
+            cuota['diferencia'] = deseada
+        elif actual > 0 and cuota.get('fecha_cruce'):
+            sync_diferencia.append({'id': cuota_id, 'diferencia': 0})
+            cuota['diferencia'] = 0
     if sync_diferencia:
         upsert_cartera_preventiva(supabase_url, srk, sync_diferencia)
-        log.info('Saldo a favor: %d cuota(s) origen sincronizadas con su disponible restante.',
+        log.info('Saldo a favor: %d cuota(s) sincronizadas con el disponible de su pago.',
                   len(sync_diferencia))
 
     # ── Notificación de plata sin repartir (23 de julio, punto #2) ─────────
@@ -1055,33 +1153,29 @@ def main():
     # aparte: se asigna parte del saldo → `disponible` baja y el texto se va;
     # se asigna todo → igual; el pago se repartió entre dos cuotas y a una se
     # le descarta → esa parte vuelve a ser plata sin repartir (fila
-    # `origen='descarte'` en el ledger) y el texto queda en la cuota que
-    # conservó el pago, que es la que sigue teniendo asociación vigente.
+    # `origen='descarte'` en el ledger) y el texto se muda solo a la cuota que
+    # conservó el pago, la misma donde queda el saldo a favor (ver el bloque
+    # de arriba: los dos usan `destino_por_pago`).
     etiqueta_por_llave: dict[str, str] = {}
-    for cr in saldos_favor_rows:
-        monto      = round(float(cr.get('monto') or 0), 2)
-        disponible = round(float(cr.get('disponible') or 0), 2)
-        if monto <= 0 or disponible < monto:
+    for mk, acum in saldo_por_pago.items():
+        if acum['monto'] <= 0 or acum['disponible'] < acum['monto']:
             continue  # ya se repartió algo: no se avisa nada
-        if cr.get('origen') == 'sobrante':
-            llave_destino = cr.get('llave_origen')
-        else:
-            # Descarte: el texto va a la cuota que CONSERVÓ el pago, o sea la
-            # última que le sigue quedando asociada a ese mismo pago.
-            restantes = [a['llave'] for a in asociaciones_vigentes
-                          if a['matching_key'] == cr.get('matching_key')]
-            restantes += [a['llave'] for a in nuevas_asociaciones
-                           if a['matching_key'] == cr.get('matching_key')]
-            llave_destino = restantes[-1] if restantes else None
-        cuota_id = id_por_llave.get(llave_destino) if llave_destino else None
+        destino = destino_por_pago.get(mk)
+        cuota_id = id_por_llave.get(destino) if destino else None
         if cuota_id is None:
             continue
         cuota_destino = next((c for c in cuotas_rows if c['id'] == cuota_id), None)
         if not cuota_destino:
             continue
-        etiqueta = _etiqueta_notificacion(_saldo_a_cobrar(cuota_destino), disponible)
+        # Cuántas cuotas cerró ESTE pago: sin esto el aviso cuenta de menos
+        # cuando el pago cerró dos o más (caso 16079640: cerró la de junio y
+        # la de julio y dejó $4.090.910 sueltos — "PAGA CINCO CUOTAS" cuando
+        # la persona pagó seis).
+        cubiertas = len(llaves_vigentes_por_pago.get(mk) or []) or 1
+        etiqueta = _etiqueta_notificacion(_saldo_a_cobrar(cuota_destino),
+                                           acum['disponible'], cubiertas)
         if etiqueta:
-            etiqueta_por_llave[llave_destino] = etiqueta
+            etiqueta_por_llave[destino] = etiqueta
 
     sync_notificacion = []
     for cuota in cuotas_rows:
