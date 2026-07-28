@@ -363,8 +363,14 @@ def _aplicar_pagos_inscripcion(cuotas_abiertas: list[dict], pagos_nuevos: list[d
       - parcial: misma forma, o None — la ÚLTIMA cuota tocada que se quedó
         sin dinero para completarla. A lo sumo una.
       - asociaciones: [{'matching_key', 'cuota_id', 'monto'}].
-      - excedente: plata que sobró tras cubrir TODAS las cuotas conocidas
-        de la inscripción (saldo a favor, ver §2 de la spec)."""
+      - excedentes: [{'pago', 'monto'}] — plata que sobró tras cubrir TODAS
+        las cuotas conocidas de la inscripción (saldo a favor, ver §2 de la
+        spec), SEPARADA POR PAGO. Se devuelve así, y no como un total, porque
+        el saldo a favor tiene que quedar a nombre del pago del que sobró de
+        verdad: con dos pagos en la misma corrida y uno sobrando entero, el
+        total se registraba bajo el pago que cerró la última cuota (caso real
+        4166PN, 22 de julio — dos pagos de $524.688, uno cubrió la cuota y el
+        otro quedó libre, pero el ledger los atribuía los dos al primero)."""
     cuotas_ordenadas = sorted(cuotas_abiertas, key=lambda c: c.get('fecha_vencimiento') or _FECHA_MAX)
     pagos_ordenados = sorted(pagos_nuevos, key=lambda p: p.get('payment_date') or _FECHA_MAX)
 
@@ -372,7 +378,7 @@ def _aplicar_pagos_inscripcion(cuotas_abiertas: list[dict], pagos_nuevos: list[d
     ultimo_pago_por_cuota: dict = {}
     asociaciones = []
     idx = 0
-    excedente = 0.0
+    excedentes: list[dict] = []
 
     for pago in pagos_ordenados:
         restante = float(pago.get('payment_amount') or 0)
@@ -396,7 +402,7 @@ def _aplicar_pagos_inscripcion(cuotas_abiertas: list[dict], pagos_nuevos: list[d
             if saldo_cuota - acumulado[cuota_id] <= 0:
                 idx += 1
         if restante > 0:
-            excedente += restante
+            excedentes.append({'pago': pago, 'monto': round(restante, 2)})
 
     cierres, parcial = [], None
     for cuota in cuotas_ordenadas:
@@ -410,7 +416,7 @@ def _aplicar_pagos_inscripcion(cuotas_abiertas: list[dict], pagos_nuevos: list[d
         else:
             parcial = info
 
-    return cierres, parcial, asociaciones, excedente
+    return cierres, parcial, asociaciones, excedentes
 
 
 def _fila_cierre(info: dict, hoy: str, cerrar_al_monto_recibido: bool = False) -> dict:
@@ -528,9 +534,9 @@ def _procesar_inscripcion(cuotas_inscripcion: list[dict], pagos_para: list[dict]
     el modelo "Saldo a Favor Manual + FALTA DE PAGO" (21 de julio).
 
     No escribe nada en Supabase — solo calcula. Devuelve:
-      (cierres_filas, linea_nueva_o_None, asociaciones, saldo_favor_nuevo_o_None)
+      (cierres_filas, linea_nueva_o_None, asociaciones, saldos_favor_nuevos)
     """
-    cierres, parcial, asociaciones, excedente = _aplicar_pagos_inscripcion(cuotas_inscripcion, pagos_para)
+    cierres, parcial, asociaciones, excedentes = _aplicar_pagos_inscripcion(cuotas_inscripcion, pagos_para)
 
     cierres_filas = [_fila_cierre(info, hoy) for info in cierres]
     linea_nueva = None
@@ -538,31 +544,38 @@ def _procesar_inscripcion(cuotas_inscripcion: list[dict], pagos_para: list[dict]
         fila, linea_nueva = _cerrar_o_faltante(parcial, hoy, llaves_cobradas)
         cierres_filas.append(fila)
 
-    saldo_favor_nuevo = None
-    if excedente > 0 and cierres_filas:
+    saldos_favor_nuevos: list[dict] = []
+    if excedentes and cierres_filas:
         # El excedente lo absorbe la ÚLTIMA cuota que toca el pago (nunca la
         # parcial: excedente y parcial son mutuamente excluyentes dentro de
         # una misma llamada — si sobra plata es porque TODAS las cuotas ya
         # se cerraron). Queda como `diferencia` POSITIVA informativa — NUNCA
         # se suma a `valor_pago` ni se auto-aplica a otra cuota.
+        #
+        # La cuota es una sola, pero el LEDGER lleva una fila por pago: cada
+        # peso queda a nombre del pago del que sobró de verdad. Antes se
+        # escribía una sola fila con el total a nombre de `cierres[-1]`, y con
+        # dos pagos en la misma corrida eso mentía sobre de quién era la plata
+        # (caso 4166PN del 22 de julio) y dejaba al segundo pago sin rastro de
+        # haberse usado, así que cada corrida lo volvía a mirar como nuevo.
         ultima_cuota = cierres[-1]['cuota']
-        ultimo_pago = cierres[-1]['ultimo_pago']
-        cierres_filas[-1]['diferencia'] = round(excedente, 2)
-        saldo_favor_nuevo = {
-            'inscrip':      ultima_cuota.get('inscrip'),
-            'cliente':      ultima_cuota.get('cliente'),
-            'documento':    _normalizar_documento(ultima_cuota.get('cruce_access')),
-            'correo':       _normalizar_correo(ultima_cuota.get('correo')),
-            'monto':        round(excedente, 2),
-            'disponible':   round(excedente, 2),
-            'origen':       'sobrante',
-            'llave_origen': ultima_cuota['llave'],
-            'matching_key': ultimo_pago['matching_key'],
-            'fecha':        ultimo_pago.get('payment_date'),
-            'aplicado':     False,
-        }
+        cierres_filas[-1]['diferencia'] = round(sum(e['monto'] for e in excedentes), 2)
+        for e in excedentes:
+            saldos_favor_nuevos.append({
+                'inscrip':      ultima_cuota.get('inscrip'),
+                'cliente':      ultima_cuota.get('cliente'),
+                'documento':    _normalizar_documento(ultima_cuota.get('cruce_access')),
+                'correo':       _normalizar_correo(ultima_cuota.get('correo')),
+                'monto':        e['monto'],
+                'disponible':   e['monto'],
+                'origen':       'sobrante',
+                'llave_origen': ultima_cuota['llave'],
+                'matching_key': e['pago']['matching_key'],
+                'fecha':        e['pago'].get('payment_date'),
+                'aplicado':     False,
+            })
 
-    return cierres_filas, linea_nueva, asociaciones, saldo_favor_nuevo
+    return cierres_filas, linea_nueva, asociaciones, saldos_favor_nuevos
 
 
 def _etiqueta_notificacion(valor_cuota: float, sobrante: float,
@@ -982,7 +995,7 @@ def main():
         if not pagos_para_inscripcion:
             continue
 
-        cierres_filas, linea_nueva, asociaciones, saldo_favor = _procesar_inscripcion(
+        cierres_filas, linea_nueva, asociaciones, saldos_favor = _procesar_inscripcion(
             cuotas_inscripcion, pagos_para_inscripcion, hoy, llaves_cobradas)
 
         actualizaciones_cierre.extend(cierres_filas)
@@ -995,8 +1008,7 @@ def main():
                 'monto':        a['monto'],
                 'origen':       'automatico',
             })
-        if saldo_favor:
-            saldos_favor_nuevos.append(saldo_favor)
+        saldos_favor_nuevos.extend(saldos_favor)
         docs_procesados += 1
 
     log.info('%d documento(s) procesados, %d con 2+ inscripciones debiendo (sin auto-aplicar).',
