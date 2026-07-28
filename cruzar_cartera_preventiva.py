@@ -132,7 +132,7 @@ Requerimientos del 23 de julio (`requeriments.md`, puntos #1, #2 y #3):
 import logging
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytz
 from dotenv import load_dotenv
@@ -772,7 +772,8 @@ def main():
     pagos_rows = select_all(
         supabase_url, srk, 'cruce_cartera',
         select='matching_key,identification,payment_date,transaction_code_1,transaction_code_2,'
-               'email,payment_method,payment_amount,estado_cruce,incp,metodo_de_pago',
+               'email,payment_method,payment_amount,estado_cruce,incp,metodo_de_pago,'
+               'registration_date',
     )
     pagos_cruzados = [p for p in pagos_rows if p.get('estado_cruce') == 'cruzado' and p.get('incp')]
     pagos_por_matching_key = {p['matching_key']: p for p in pagos_cruzados}
@@ -924,14 +925,54 @@ def main():
         if c.get('codigo_transaccion_1')
     }
 
+    # Pagos ya aplicados bajo una VERSIÓN ANTERIOR de la cartera (28 de julio).
+    # Cargar una cartera nueva archiva `pago_asociaciones` y
+    # `cartera_saldos_favor` y deja las vivas vacías, así que sin esto el
+    # pipeline pierde la memoria de lo que ya repartió y vuelve a aplicar
+    # TODOS los pagos viejos sobre las cuotas nuevas. Medido el día que se
+    # cargó la primera cartera nueva: de 41 cuotas resueltas esa corrida, 20
+    # eran pagos de días anteriores re-aplicados, contra 23 que el proceso
+    # manual había trabajado ese día — la diferencia que reportó el equipo.
+    #
+    # Regla del usuario: "lo que ya cruzó en cuotas anteriores no tiene nada
+    # que ver". Un pago se reparte UNA vez en su vida; si la deuda sigue viva
+    # en la cartera nueva, se resuelve a mano, no reaplicando plata vieja.
+    #
+    # EXCEPCIÓN, y es la que hace que esto no rompa el día del cambio: la
+    # corrida de la mañana ya había aplicado los pagos DE HOY contra la
+    # cartera saliente, así que al archivar quedaron mezclados con los viejos.
+    # Filtrar solo por "está archivado" habría bloqueado también lo de hoy
+    # (40 de 41 asociaciones). El corte que dio el usuario: se re-aplica un
+    # pago archivado únicamente si entró al sistema HOY y el banco lo reporta
+    # de hoy o de ayer — la ventana normal entre que alguien paga y el
+    # extracto llega. Todo lo anterior se considera ya trabajado.
+    archivo_asociaciones = select_all(supabase_url, srk, 'pago_asociaciones_archivo',
+                                       select='matching_key')
+    archivo_ledger       = select_all(supabase_url, srk, 'cartera_saldos_favor_archivo',
+                                       select='matching_key')
+    matching_keys_archivados = {
+        r['matching_key'] for r in (archivo_asociaciones + archivo_ledger) if r.get('matching_key')
+    }
+    ayer = (datetime.strptime(hoy, '%Y-%m-%d') - timedelta(days=1)).strftime('%Y-%m-%d')
+
+    def _reaplicable(pago: dict) -> bool:
+        """¿Un pago ya aplicado bajo una cartera anterior puede volver a
+        entrar? Solo si es de la tanda de hoy."""
+        return (str(pago.get('registration_date') or '') == hoy
+                and str(pago.get('payment_date') or '')[:10] in (hoy, ayer))
+
     pagos_nuevos = [
         p for p in pagos_cruzados
         if p['matching_key'] not in matching_keys_asociados
         and p['matching_key'] not in matching_keys_en_ledger
         and p['matching_key'] not in matching_keys_en_excel
+        and (p['matching_key'] not in matching_keys_archivados or _reaplicable(p))
     ]
-    log.info('%d pagos cruzados totales, %d nuevos (sin asociación/ledger previo).',
-              len(pagos_cruzados), len(pagos_nuevos))
+    bloqueados = sum(1 for p in pagos_cruzados
+                     if p['matching_key'] in matching_keys_archivados and not _reaplicable(p))
+    log.info('%d pagos cruzados totales, %d nuevos (sin asociación/ledger previo). '
+              '%d bloqueados por venir aplicados de una cartera anterior.',
+              len(pagos_cruzados), len(pagos_nuevos), bloqueados)
 
     # §4.1/4.2: cuotas pendientes = sin pago identificado, sin cierre manual
     # y con saldo real por cobrar.
