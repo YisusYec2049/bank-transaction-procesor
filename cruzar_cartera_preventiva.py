@@ -132,7 +132,7 @@ Requerimientos del 23 de julio (`requeriments.md`, puntos #1, #2 y #3):
 import logging
 import os
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import pytz
 from dotenv import load_dotenv
@@ -178,6 +178,23 @@ _NUMERO_EN_LETRA = {2: 'DOS', 3: 'TRES', 4: 'CUATRO', 5: 'CINCO', 6: 'SEIS',
 def _es_etiqueta_de_sobrante(valor) -> bool:
     v = str(valor or '').strip().upper()
     return bool(v) and (v.startswith('PAGA ') or v.endswith('+ ABONO'))
+
+
+def _dia_bogota(marca, tz) -> str:
+    """Día (YYYY-MM-DD, hora Colombia) de una marca de tiempo de Supabase.
+
+    Supabase las guarda en UTC, así que cortar la cadena a 10 caracteres
+    parte el día: una carga hecha a las 21:12 de Colombia queda registrada
+    como `2026-07-22T02:12+00:00` — el día siguiente. Pasó de verdad (las
+    dos últimas cargas del 21 de julio), y con el corte crudo esas cargas y
+    los repartos de esa misma tarde caerían en días distintos.
+    """
+    if not marca:
+        return ''
+    try:
+        return datetime.fromisoformat(str(marca).replace('Z', '+00:00')).astimezone(tz).strftime('%Y-%m-%d')
+    except ValueError:
+        return str(marca)[:10]
 
 
 def _normalizar_documento(valor) -> str:
@@ -772,8 +789,7 @@ def main():
     pagos_rows = select_all(
         supabase_url, srk, 'cruce_cartera',
         select='matching_key,identification,payment_date,transaction_code_1,transaction_code_2,'
-               'email,payment_method,payment_amount,estado_cruce,incp,metodo_de_pago,'
-               'registration_date',
+               'email,payment_method,payment_amount,estado_cruce,incp,metodo_de_pago',
     )
     pagos_cruzados = [p for p in pagos_rows if p.get('estado_cruce') == 'cruzado' and p.get('incp')]
     pagos_por_matching_key = {p['matching_key']: p for p in pagos_cruzados}
@@ -942,24 +958,55 @@ def main():
     # corrida de la mañana ya había aplicado los pagos DE HOY contra la
     # cartera saliente, así que al archivar quedaron mezclados con los viejos.
     # Filtrar solo por "está archivado" habría bloqueado también lo de hoy
-    # (40 de 41 asociaciones). El corte que dio el usuario: se re-aplica un
-    # pago archivado únicamente si entró al sistema HOY y el banco lo reporta
-    # de hoy o de ayer — la ventana normal entre que alguien paga y el
-    # extracto llega. Todo lo anterior se considera ya trabajado.
+    # (40 de 41 asociaciones).
+    #
+    # CRITERIO DE LA EXCEPCIÓN (corregido el 29 de julio). La primera versión
+    # miraba la fecha del BANCO: se re-aplicaba si el pago entró al sistema
+    # hoy y el banco lo reportaba de hoy o de ayer. Ese es el dato equivocado,
+    # porque muchos pagos llegan tarde — medido sobre los 799 pagos cruzados,
+    # 273 (34%) traen 2+ días de desfase entre que la persona paga y que el
+    # archivo del banco llega, que son los fines de semana de WOMPI. Un pago
+    # del viernes que entra el lunes, se aplica en la corrida de las 10:30 y
+    # se archiva al mediodía porque cargaron cartera nueva quedaba bloqueado
+    # ("es viejo") aunque lo hubiera repartido el pipeline dos horas antes:
+    # desaparecía sin dejar rastro, con la cuota abierta y la plata en ningún
+    # lado.
+    #
+    # Ahora el criterio es cuándo lo repartió EL SISTEMA, no cuándo pagó la
+    # persona: se re-aplica lo que quedó archivado con fecha de reparto del
+    # mismo día en que se cargó la cartera activa (`cartera_cargas`). Es el
+    # dato exacto y ya estaba guardado. Verificado contra el swap del 28 de
+    # julio: de 1.358 repartos archivados, 21 se hicieron ese mismo día —
+    # justo los que había que conservar.
+    #
+    # Se compara contra la fecha de la CARGA ACTIVA, no contra `hoy`, para
+    # que siga siendo correcto si la cartera se carga por la tarde y la
+    # corrida siguiente es al otro día.
     archivo_asociaciones = select_all(supabase_url, srk, 'pago_asociaciones_archivo',
-                                       select='matching_key')
+                                       select='matching_key,created_at')
     archivo_ledger       = select_all(supabase_url, srk, 'cartera_saldos_favor_archivo',
-                                       select='matching_key')
-    matching_keys_archivados = {
-        r['matching_key'] for r in (archivo_asociaciones + archivo_ledger) if r.get('matching_key')
-    }
-    ayer = (datetime.strptime(hoy, '%Y-%m-%d') - timedelta(days=1)).strftime('%Y-%m-%d')
+                                       select='matching_key,created_at')
+    cargas_rows = select_all(supabase_url, srk, 'cartera_cargas', select='fecha,estado')
+    dia_carga_activa = next(
+        (_dia_bogota(c.get('fecha'), tz_bogota) for c in cargas_rows if c.get('estado') == 'activa'),
+        '',
+    ) or hoy
+
+    matching_keys_archivados: set[str] = set()
+    matching_keys_reaplicables: set[str] = set()
+    for r in archivo_asociaciones + archivo_ledger:
+        mk = r.get('matching_key')
+        if not mk:
+            continue
+        matching_keys_archivados.add(mk)
+        if _dia_bogota(r.get('created_at'), tz_bogota) == dia_carga_activa:
+            matching_keys_reaplicables.add(mk)
 
     def _reaplicable(pago: dict) -> bool:
         """¿Un pago ya aplicado bajo una cartera anterior puede volver a
-        entrar? Solo si es de la tanda de hoy."""
-        return (str(pago.get('registration_date') or '') == hoy
-                and str(pago.get('payment_date') or '')[:10] in (hoy, ayer))
+        entrar? Solo si el pipeline lo repartió el día en que se cargó la
+        cartera que está activa hoy."""
+        return pago['matching_key'] in matching_keys_reaplicables
 
     pagos_nuevos = [
         p for p in pagos_cruzados
@@ -971,8 +1018,9 @@ def main():
     bloqueados = sum(1 for p in pagos_cruzados
                      if p['matching_key'] in matching_keys_archivados and not _reaplicable(p))
     log.info('%d pagos cruzados totales, %d nuevos (sin asociación/ledger previo). '
-              '%d bloqueados por venir aplicados de una cartera anterior.',
-              len(pagos_cruzados), len(pagos_nuevos), bloqueados)
+              '%d bloqueados por venir aplicados de una cartera anterior '
+              '(carga activa del %s).',
+              len(pagos_cruzados), len(pagos_nuevos), bloqueados, dia_carga_activa)
 
     # §4.1/4.2: cuotas pendientes = sin pago identificado, sin cierre manual
     # y con saldo real por cobrar.
