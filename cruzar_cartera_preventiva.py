@@ -677,6 +677,38 @@ def main():
                'cliente,sistema_financiero,moneda,programa,fecha_pago,valor_pago,fecha_cruce,'
                'diferencia,notificacion,codigo_transaccion_1,pago,pago_confirmado',
     )
+    # Códigos de pago de las carteras ANTERIORES, ya archivadas (30 de julio).
+    # `codigo_transaccion_1` es la memoria de lo que el proceso manual ya
+    # cobró, y vive en el Excel de cartera — así que se pierde entera al
+    # cambiar de versión si solo se mira la activa. El archivo de agosto
+    # llegó SIN un solo código (el de julio traía 1.581): sin esto, 581 pagos
+    # de julio se reaplicarían sobre las cuotas nuevas, y 113 de ellos
+    # ($99.812.515) ya los había cobrado una persona a mano.
+    #
+    # Es la misma regla que ya rige para lo que repartió el pipeline ("un
+    # pago se reparte UNA vez en su vida", ver más abajo), extendida a lo que
+    # cobró el equipo: si la deuda sigue viva en la cartera nueva se resuelve
+    # a mano, no reaplicando plata que ya se usó.
+    # OJO con de dónde sale cada código: en esta columna escriben DOS manos.
+    # El Excel anota ahí el pago que cobró el proceso manual, pero el propio
+    # pipeline también la llena al aplicar un pago (`_fila_cuota_cerrada`).
+    # Tomar las dos haría que un pago repartido esta mañana quedara bloqueado
+    # por su propio rastro al archivarse la cartera saliente — justo la
+    # pérdida que evita la excepción "repartido hoy" de más abajo. Medido: 4
+    # de las 22 asociaciones vivas se autobloqueaban así.
+    #
+    # `fecha_cruce` es la marca de "esto lo tocó el pipeline" (21 de julio):
+    # las filas que NO la tienen son las que trae el Excel, y son las únicas
+    # que cuentan como memoria del proceso manual.
+    log.info('Cargando códigos de pago de carteras archivadas...')
+    codigos_archivo_rows = [
+        r for r in select_all(
+            supabase_url, srk, 'cartera_preventiva_archivo',
+            select='codigo_transaccion_1,fecha_cruce',
+        )
+        if not r.get('fecha_cruce')
+    ]
+
     # Llaves que ya pertenecen a una cuota COBRADA (incluidas las líneas
     # partidas que el Excel trae cerradas con su pago anotado).
     # `_generar_llave_saldo` las esquiva para no pisarlas con una línea de
@@ -936,8 +968,11 @@ def main():
     # julio con el pago 7614). Sin esto el pipeline los volvía a aplicar
     # encima del saldo que ya venía neto, duplicando la plata y generando
     # una segunda línea de saldo por la misma deuda.
+    # Se unen la cartera VIVA y las ARCHIVADAS: la memoria de lo cobrado a
+    # mano no puede depender de que el Excel del mes en curso la traiga.
     matching_keys_en_excel = {
-        str(c['codigo_transaccion_1']).strip() for c in cuotas_rows
+        str(c['codigo_transaccion_1']).strip()
+        for c in (*cuotas_rows, *codigos_archivo_rows)
         if c.get('codigo_transaccion_1')
     }
 
