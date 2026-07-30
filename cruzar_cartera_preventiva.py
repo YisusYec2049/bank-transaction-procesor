@@ -492,6 +492,10 @@ def _fila_linea_saldo(parcial: dict, nueva_llave: str, notificacion: str | None 
     cuota = parcial['cuota']
     saldo = round(_saldo_a_cobrar(cuota) - parcial['monto_aplicado'], 2)
     return {
+        # Llave de la cuota que originó esta línea. Solo circula en memoria
+        # (`_sincronizar_lineas_falta_de_pago` la usa para saber si la
+        # original ya tiene línea); se quita antes de escribir a Supabase.
+        '_base':               cuota.get('llave'),
         'llave':               nueva_llave,
         'sistema_financiero':  cuota.get('sistema_financiero'),
         'inscrip':             cuota.get('inscrip'),
@@ -515,6 +519,108 @@ def _fila_linea_saldo(parcial: dict, nueva_llave: str, notificacion: str | None 
         'es_wompi_automatico': None,
         'pago_confirmado':     None,
     }
+
+
+def _sincronizar_lineas_falta_de_pago(
+        cuotas_rows: list[dict],
+        actualizaciones_cierre: list[dict],
+        lineas_nuevas: list[dict],
+        llaves_cerradas_manual: set,
+        asociaciones_por_llave: dict) -> tuple[list[dict], list[str]]:
+    """La línea de FALTA DE PAGO no es una cuota independiente: es el REFLEJO
+    de lo que quedó debiendo su cuota original (regla del usuario, 30 de
+    julio). Mientras la original siga ABIERTA:
+
+      * si su `diferencia` baja porque le asociaron plata, la línea baja con
+        ella;
+      * si lo que falta cae por debajo de `UMBRAL_LINEA_NUEVA`, la línea
+        DESAPARECE y el faltante queda solo como `diferencia` en la original,
+        igual que cuando nace pequeño;
+      * la original tiene UNA sola línea, venga la plata del pago que venga.
+        Sin esto, asociar plata de un pago con otra fecha creaba una segunda
+        línea (la llave se deriva del pago) y la primera se quedaba con el
+        número viejo, cobrando dos veces la misma deuda.
+
+    Cuando la original se CIERRA —"Cerrar Cuota" o el cierre de cartera del
+    día, que escriben `pago_confirmado`— la línea se INDEPENDIZA: deja de ser
+    un reflejo y pasa a ser la deuda que se arrastra al mes siguiente. Desde
+    ese momento esta función no la vuelve a tocar.
+
+    Guardas al borrar (una línea es una fila de cartera como cualquier otra,
+    y puede tener trabajo humano encima): no se borra si tiene pago aplicado,
+    asociaciones o cierre manual — en ese caso se avisa en el log en vez de
+    llevarse por delante algo que alguien hizo.
+
+    Devuelve (updates, llaves_a_borrar). No escribe nada.
+    """
+    final_por_id = {f['id']: f for f in actualizaciones_cierre if f.get('id') is not None}
+    por_llave = {c['llave']: c for c in cuotas_rows if c.get('llave')}
+
+    def _campo(cuota: dict, nombre: str):
+        """El valor que la cuota va a tener al terminar esta corrida."""
+        fin = final_por_id.get(cuota['id'])
+        if fin is not None and nombre in fin:
+            return fin[nombre]
+        return cuota.get(nombre)
+
+    # Líneas VIVAS por cuota original. Una línea del Excel (cuota partida en
+    # abonos por el proceso manual) usa el mismo formato `llave (fecha)` pero
+    # llega con `fecha_pago` puesto — esas no son nuestras y no se tocan.
+    lineas_por_original: dict[str, list[dict]] = {}
+    for c in cuotas_rows:
+        llave = c.get('llave') or ''
+        corte = llave.rfind(' (')
+        if corte <= 0:
+            continue
+        base = llave[:corte]
+        if base in por_llave and _campo(c, 'fecha_pago') is None:
+            lineas_por_original.setdefault(base, []).append(c)
+
+    updates: list[dict] = []
+    a_borrar: list[str] = []
+    bases = set(lineas_por_original) | {
+        l['_base'] for l in lineas_nuevas if l.get('_base') in por_llave
+    }
+    for base in sorted(bases):
+        original = por_llave.get(base)
+        if original is None:
+            continue
+        if (_campo(original, 'pago_confirmado') is not None
+                or base in llaves_cerradas_manual):
+            continue  # cerrada: la línea ya es independiente
+
+        diferencia = _campo(original, 'diferencia')
+        falta = round(-float(diferencia), 2) if diferencia is not None and float(diferencia) < 0 else 0.0
+        existentes = sorted(lineas_por_original.get(base, []), key=lambda c: c['id'])
+
+        if falta >= UMBRAL_LINEA_NUEVA and existentes:
+            # Ya hay línea: se ajusta esa y no se crea ninguna otra.
+            viva = existentes[0]
+            if round(float(viva.get('valor_a_cobrar') or 0), 2) != falta:
+                updates.append({'id': viva['id'], 'valor_cuota': falta, 'valor_a_cobrar': falta})
+                viva['valor_cuota'] = viva['valor_a_cobrar'] = falta
+            sobrantes = existentes[1:]
+        else:
+            sobrantes = existentes
+
+        for linea in sobrantes:
+            llave = linea['llave']
+            if asociaciones_por_llave.get(llave):
+                log.warning('Línea de deuda %s no se borra: tiene pago(s) asociado(s).', llave)
+                continue
+            if llave in llaves_cerradas_manual or _campo(linea, 'pago_confirmado') is not None:
+                log.warning('Línea de deuda %s no se borra: está cerrada a mano.', llave)
+                continue
+            a_borrar.append(llave)
+
+    # Una línea a punto de crearse para una original que ya tiene la suya (o
+    # que ya no llega al umbral) no debe llegar a escribirse.
+    ya_cubiertas = {b for b in bases if lineas_por_original.get(b)}
+    lineas_nuevas[:] = [
+        l for l in lineas_nuevas
+        if l.get('_base') not in ya_cubiertas and l['llave'] not in a_borrar
+    ]
+    return updates, a_borrar
 
 
 def _cerrar_o_faltante(info: dict, hoy: str,
@@ -1147,8 +1253,24 @@ def main():
         upsert_pago_asociaciones(supabase_url, srk, nuevas_asociaciones)
     if saldos_favor_nuevos:
         upsert_cartera_saldos_favor(supabase_url, srk, saldos_favor_nuevos)
+    # La línea de FALTA DE PAGO sigue a la `diferencia` de su cuota original
+    # mientras esa original siga abierta (30 de julio). Va ANTES de escribir
+    # las líneas nuevas porque puede descartar alguna que ya no corresponde.
+    sync_lineas, lineas_a_borrar = _sincronizar_lineas_falta_de_pago(
+        cuotas_rows, actualizaciones_cierre, lineas_nuevas,
+        llaves_cerradas_manual, asociaciones_por_llave)
+    if sync_lineas:
+        upsert_cartera_preventiva(supabase_url, srk, sync_lineas)
+        log.info('Líneas de deuda ajustadas a la diferencia de su cuota original: %d.',
+                  len(sync_lineas))
+    if lineas_a_borrar:
+        delete_by_keys(supabase_url, srk, 'cartera_preventiva', 'llave', lineas_a_borrar)
+        log.info('Líneas de deuda eliminadas (el faltante bajó de %s): %d.',
+                  UMBRAL_LINEA_NUEVA, len(lineas_a_borrar))
     if lineas_nuevas:
-        insert_cartera_preventiva_lineas(supabase_url, srk, lineas_nuevas)
+        insert_cartera_preventiva_lineas(
+            supabase_url, srk,
+            [{k: v for k, v in l.items() if not k.startswith('_')} for l in lineas_nuevas])
     if actualizaciones_cierre:
         batch_size = 500
         for i in range(0, len(actualizaciones_cierre), batch_size):
