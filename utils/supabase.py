@@ -6,6 +6,8 @@ from datetime import datetime
 import pytz
 import requests as http
 
+from utils import dry_run
+
 log = logging.getLogger(__name__)
 
 _ENDPOINT = '/rest/v1/consolidated_transactions?on_conflict=matching_key'
@@ -32,6 +34,8 @@ def upsert(supabase_url: str, service_role_key: str, rows: list[list]) -> None:
     rows: filas normalizadas [identification, payment_date(DD-MM-YYYY), ...]
     registration_date se agrega aquí como la fecha de hoy en Bogotá.
     """
+    if dry_run.registrar('consolidated_transactions', 'upsert', rows):
+        return
     tz_bogota = pytz.timezone('America/Bogota')
     today_iso = datetime.now(tz_bogota).strftime('%Y-%m-%d')
 
@@ -150,6 +154,8 @@ def select_all(supabase_url: str, service_role_key: str, table: str,
 def replace_table(supabase_url: str, service_role_key: str, table: str,
                    rows: list[dict], batch_size: int = 500) -> None:
     """Borra todo el contenido de `table` y lo reemplaza con `rows`."""
+    if dry_run.registrar(table, 'replace', rows):
+        return
     hdrs = _headers(service_role_key, prefer='return=minimal')
     resp = http.delete(
         f'{supabase_url}/rest/v1/{table}',
@@ -187,6 +193,11 @@ def replace_cartera_preventiva_staging(supabase_url: str, service_role_key: str,
     Si la lectura del Excel vino vacía, no se toca staging (misma
     salvaguarda del 15 de julio: "0 filas nuevas" no es "borrar todo lo
     viejo"). Devuelve True si reemplazó, False si se omitió."""
+    # Devuelve True (no None) porque el llamador usa el valor para decidir si
+    # registra la carga: en simulación la respuesta correcta es "sí habría
+    # reemplazado", no "se omitió".
+    if dry_run.registrar('cartera_preventiva_staging', 'replace', rows):
+        return True
     if not rows:
         log.warning('cartera_preventiva_staging: 0 filas leídas del Excel, se omite '
                     '(no se toca la tabla existente).')
@@ -200,6 +211,8 @@ def insert_rows(supabase_url: str, service_role_key: str, table: str,
     """INSERT plano (sin upsert) de `rows` en `table`, en lotes. Usado por el
     swap de versión de cartera (Spec C) para archivar filas hacia las tablas
     `_archivo` — nunca pisa nada existente, siempre agrega."""
+    if dry_run.registrar(table, 'insert', rows):
+        return
     if not rows:
         return
     hdrs = _headers(service_role_key, prefer='return=minimal')
@@ -217,6 +230,8 @@ def delete_all_rows(supabase_url: str, service_role_key: str, table: str,
     null`, cierto para toda fila real (es su primary key). Usado por el swap
     de versión de cartera (Spec C) para vaciar las tablas vivas tras
     archivarlas."""
+    if dry_run.registrar(table, 'delete', None):
+        return
     hdrs = _headers(service_role_key, prefer='return=minimal')
     resp = http.delete(
         f'{supabase_url}/rest/v1/{table}',
@@ -233,6 +248,8 @@ def upsert_cartera_cargas(supabase_url: str, service_role_key: str, rows: list[d
     versiones de cartera (Spec C): `estado` en ('staged','activa','archivada').
     fin-platform prende el banner "hay cartera pendiente" cuando existe una
     fila `staged`."""
+    if dry_run.registrar('cartera_cargas', 'upsert', rows):
+        return
     if not rows:
         return
     hdrs = _headers(service_role_key, prefer='return=minimal,resolution=merge-duplicates')
@@ -248,6 +265,8 @@ def upsert_cartera_cargas(supabase_url: str, service_role_key: str, rows: list[d
 
 def upsert_cruce(supabase_url: str, service_role_key: str, rows: list[dict]) -> None:
     """Upsert de filas ya armadas (dicts con las 21 columnas de cruce_cartera)."""
+    if dry_run.registrar('cruce_cartera', 'upsert', rows):
+        return
     hdrs = _headers(
         service_role_key,
         prefer='return=minimal,resolution=merge-duplicates',
@@ -267,6 +286,8 @@ def upsert_cartera_preventiva(supabase_url: str, service_role_key: str, rows: li
     resultado del cruce (fecha_pago, medio_pago, valor_pago, códigos,
     correo_elec, diferencia) — el resto de la fila (llave, cliente, etc.,
     puestas ahí por el sync del Excel) no se toca."""
+    if dry_run.registrar('cartera_preventiva', 'upsert', rows):
+        return
     hdrs = _headers(service_role_key, prefer='return=minimal,resolution=merge-duplicates')
     resp = http.post(
         f'{supabase_url}/rest/v1/cartera_preventiva?on_conflict=id',
@@ -283,6 +304,8 @@ def insert_cartera_preventiva_lineas(supabase_url: str, service_role_key: str, r
     filas que no existen todavía, sin `id` (bigserial). Upsert por `llave`
     (no por `id`, que no existe aún) para que un reproceso del mismo evento
     no duplique la línea si ya se había creado."""
+    if dry_run.registrar('cartera_preventiva', 'insert', rows):
+        return
     if not rows:
         return
     hdrs = _headers(service_role_key, prefer='return=minimal,resolution=merge-duplicates')
@@ -299,6 +322,8 @@ def insert_cartera_preventiva_lineas(supabase_url: str, service_role_key: str, r
 def upsert_pago_asociaciones(supabase_url: str, service_role_key: str, rows: list[dict]) -> None:
     """Upsert por (matching_key, llave) a pago_asociaciones (Fase 4.2/4.3):
     cada dict trae matching_key, llave, monto, origen."""
+    if dry_run.registrar('pago_asociaciones', 'upsert', rows):
+        return
     if not rows:
         return
     hdrs = _headers(service_role_key, prefer='return=minimal,resolution=merge-duplicates')
@@ -318,6 +343,8 @@ def update_cruce_valores(supabase_url: str, service_role_key: str, updates: list
     No usa upsert/POST porque cruce_cartera tiene columnas que podrían no
     aceptar NULL en un insert parcial — un PATCH real solo toca las columnas
     dadas, sin reconstruir la fila."""
+    if dry_run.registrar('cruce_cartera', 'update', updates):
+        return
     hdrs = _headers(service_role_key, prefer='return=minimal')
     for u in updates:
         mk = u['matching_key']
@@ -357,6 +384,8 @@ def update_consolidated_campos(supabase_url: str, service_role_key: str,
     Estos campos viven acá, y no solo en cruce_cartera, porque un pago apartado
     (matrícula, cesantías…) se borra del cruce y el reporte de métricas WOMPI
     igual tiene que poder contarlo (punto #8, 23 de julio)."""
+    if dry_run.registrar('consolidated_transactions', 'update', updates):
+        return
     if not updates:
         return
     hdrs = _headers(service_role_key, prefer='return=minimal')
@@ -380,6 +409,8 @@ def update_consolidated_campos(supabase_url: str, service_role_key: str,
 def upsert_pagos_apartados(supabase_url: str, service_role_key: str, rows: list[dict]) -> None:
     """Upsert por matching_key a pagos_apartados (matrículas, cesantías,
     pago por llave, cheques — ver Fase 2 del rediseño)."""
+    if dry_run.registrar('pagos_apartados', 'upsert', rows):
+        return
     if not rows:
         return
     hdrs = _headers(service_role_key, prefer='return=minimal,resolution=merge-duplicates')
@@ -400,6 +431,8 @@ def upsert_cartera_saldos_favor(supabase_url: str, service_role_key: str, rows: 
     (plata que sobró tras cubrir todas las cuotas conocidas de una
     inscripción) — nunca las consume ni las marca `aplicado`; eso lo hace
     `financial-platform` al asociar/descartar a mano."""
+    if dry_run.registrar('cartera_saldos_favor', 'upsert', rows):
+        return
     if not rows:
         return
     hdrs = _headers(service_role_key, prefer='return=minimal,resolution=merge-duplicates')
@@ -416,6 +449,8 @@ def upsert_cartera_saldos_favor(supabase_url: str, service_role_key: str, rows: 
 def delete_by_keys(supabase_url: str, service_role_key: str, table: str,
                     key_column: str, keys: list[str], batch_size: int = 200) -> None:
     """Borra de `table` todas las filas cuyo `key_column` esté en `keys`."""
+    if dry_run.registrar(table, 'delete', keys):
+        return
     if not keys:
         return
     hdrs = _headers(service_role_key, prefer='return=minimal')

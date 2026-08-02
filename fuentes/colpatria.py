@@ -24,7 +24,6 @@ ni al cruce (ver pagos_apartados en procesar_todos.py).
 import csv
 import io
 import logging
-import re
 
 from utils.parser import parse_valor, valor_str
 

@@ -7,6 +7,8 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
+from utils import dry_run
+
 log = logging.getLogger(__name__)
 
 SCOPES = ['https://www.googleapis.com/auth/drive']
@@ -24,17 +26,6 @@ def find_file_id(drive, folder_id: str, name: str) -> str | None:
         if f['name'].strip().lower() == wanted:
             return f['id']
     return None
-
-
-def find_latest_file(drive, folder_id: str, contains: str) -> str | None:
-    """Busca en la carpeta el archivo más reciente (por createdTime) cuyo
-    nombre contiene `contains` (case-insensitive) — para archivos cuyo nombre
-    varía en cada entrega (ej. trae fecha/versión, como "1. CARTERA
-    PREVENTIVA DIPLOMADO ESPECIALIZACIONES_JULIO 1.xlsx"), a diferencia de
-    find_file_id que requiere nombre exacto."""
-    wanted = contains.strip().lower()
-    matches = [f for f in list_files(drive, folder_id) if wanted in f['name'].strip().lower()]
-    return matches[-1]['id'] if matches else None
 
 
 def find_latest_any_file(drive, folder_id: str) -> str | None:
@@ -80,7 +71,7 @@ def list_files(drive, folder_id: str) -> list[dict]:
 def find_all_files(drive, folder_id: str, contains: str) -> list[dict]:
     """Todos los archivos de la carpeta cuyo nombre contiene `contains`
     (case-insensitive), del más viejo al más reciente — el último es el más
-    nuevo, igual que find_latest_file.
+    nuevo.
 
     Existe para el ReportePagosWompi: leer un solo archivo (el más reciente)
     hace que, cuando se suben varias entregas juntas —el lunes con el fin de
@@ -89,17 +80,6 @@ def find_all_files(drive, folder_id: str, contains: str) -> list[dict]:
     wanted = contains.strip().lower()
     return [f for f in list_files(drive, folder_id)
             if wanted in f['name'].strip().lower()]
-
-
-def list_pdfs(drive, folder_id: str) -> list[dict]:
-    result = drive.files().list(
-        q=(f"'{folder_id}' in parents"
-           " and mimeType='application/pdf'"
-           " and trashed=false"),
-        fields='files(id, name)',
-        orderBy='createdTime',
-    ).execute()
-    return result.get('files', [])
 
 
 def download_pdf(drive, file_id: str) -> io.BytesIO:
@@ -114,6 +94,12 @@ def download_pdf(drive, file_id: str) -> io.BytesIO:
 
 
 def move_file(drive, file_id: str, dest_folder_id: str) -> None:
+    # Mover un archivo a Histórico es una escritura, y de las que más duelen:
+    # si la corrida no lo procesó bien, moverlo lo esconde. En simulación se
+    # registra y el archivo se queda donde está.
+    if dry_run.registrar(f'drive:{dest_folder_id}', 'move', [file_id]):
+        return
+
     f            = drive.files().get(fileId=file_id, fields='parents').execute()
     prev_parents = ','.join(f.get('parents', []))
     drive.files().update(

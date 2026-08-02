@@ -9,8 +9,8 @@ Diferencias respecto a 2576:
 """
 
 import io
-import re
 import logging
+import re
 from collections import defaultdict
 
 import pdfplumber

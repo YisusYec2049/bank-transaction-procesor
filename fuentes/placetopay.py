@@ -15,8 +15,8 @@ Esquema de salida normalizado (11 columnas, índices 0-10):
 """
 
 import io
-import re
 import logging
+import re
 
 import openpyxl
 

@@ -343,7 +343,7 @@ def read_cartera_preventiva(path: str | BinaryIO) -> list[dict]:
     """CARTERA PREVENTIVA *.xlsx (hoja Hoja1) → cuotas pendientes por
     inscripción, una fila por cuota. El nombre del archivo trae fecha/versión
     y cambia en cada entrega (se busca por patrón en Drive, ver
-    find_latest_file en utils/drive.py).
+    find_all_files en utils/drive.py).
 
     Set de columnas confirmado por el usuario el 14 de julio (reemplaza el
     set original del 13 de julio, que incluía convocatoria/tipo

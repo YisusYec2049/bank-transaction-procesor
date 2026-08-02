@@ -1,10 +1,22 @@
-google-api-python-client>=2.100.0
-google-auth>=2.23.0
-google-auth-httplib2>=0.1.1
-pdfplumber>=0.10.0
-python-dotenv>=1.0.0
-requests>=2.31.0
-pytz>=2023.3
-openpyxl>=3.1.0
+# Versiones fijas: una corrida de este pipeline escribe plata en la base, así que
+# la versión de una librería no puede cambiar sola entre el equipo y el VPS.
+# Tomadas del venv real el 2026-08-02.
+#
+# Para actualizar una: cambiarla acá, correr `pytest` (los tests de
+# caracterización avisan si el parseo cambió), y recién ahí desplegar.
+
+google-api-python-client==2.197.0
+google-auth==2.55.0
+google-auth-httplib2==0.4.0
+pdfplumber==0.11.10
+python-dotenv==1.2.2
+requests==2.34.2
+pytz==2026.2
+openpyxl==3.1.5
+
+# Solo las usa trigger_server.py (el servicio HTTP del VPS). No están instaladas
+# en el venv local, así que no se pudieron fijar desde acá: confirmar la versión
+# real en el VPS (`pip freeze | grep -iE 'flask|gunicorn'`) y fijarlas antes de
+# correr un `pip install -r` allá.
 flask>=3.0.0
 gunicorn>=21.2.0

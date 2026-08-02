@@ -203,22 +203,31 @@ aplicada en _cell_str para todas las hojas, no solo Stripe) antes de que
 estos nombres lleguen aquí.
 """
 
+import argparse
 import logging
 import os
 import re
 import sys
 import unicodedata
-from datetime import date, datetime as dt
+from datetime import date
+from datetime import datetime as dt
 
 from dotenv import load_dotenv
 
-from utils.drive import (build_drive_service, find_all_files, move_file,
-                         download_pdf as download_file)
+from utils import dry_run
+from utils.drive import build_drive_service, find_all_files, move_file
+from utils.drive import download_pdf as download_file
 from utils.excel_cartera import read_pagos_wompi_reporte
 from utils.parser import normalizar_nit as _normalizar_nit
 from utils.parser import normalizar_sufijo as _normalizar_sufijo
-from utils.supabase import (select_all, upsert_cruce, upsert_pagos_apartados, delete_by_keys,
-                             update_cruce_valores, update_consolidated_campos)
+from utils.supabase import (
+    delete_by_keys,
+    select_all,
+    update_consolidated_campos,
+    update_cruce_valores,
+    upsert_cruce,
+    upsert_pagos_apartados,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -788,6 +797,11 @@ def _build_lookup(rows: list[dict], key_field: str, value_field: str,
 
 
 def main():
+    parser = argparse.ArgumentParser(description='Identifica a qué inscripción corresponde cada pago.')
+    dry_run.agregar_flags(parser)
+    args = parser.parse_args()
+    dry_run.desde_args(args, 'cruzar')
+
     load_dotenv()
 
     supabase_url = os.environ.get('SUPABASE_URL', '')
@@ -1438,3 +1452,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+    if dry_run.activo():
+        log.warning('%s', dry_run.resumen())

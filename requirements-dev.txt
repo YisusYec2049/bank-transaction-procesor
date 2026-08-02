@@ -1,0 +1,7 @@
+# Herramientas de desarrollo. No se instalan en el VPS.
+#   pip install -r requirements.txt -r requirements-dev.txt
+
+-r requirements.txt
+
+pytest==8.4.2
+ruff==0.14.4

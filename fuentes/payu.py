@@ -24,7 +24,6 @@ JOIN: PayU.DOCUMENTO == Moneda.Id
 """
 
 import csv
-import datetime
 import io
 import logging
 import re

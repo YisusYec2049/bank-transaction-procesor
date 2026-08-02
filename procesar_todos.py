@@ -22,7 +22,6 @@ Flags:
 """
 
 import argparse
-import io
 import logging
 import os
 import sys
@@ -35,17 +34,18 @@ from googleapiclient.discovery import build
 
 import fuentes.bancolombia_2576 as mod_bc2576
 import fuentes.bancolombia_2833 as mod_bc2833
-import fuentes.placetopay as mod_placetopay
-import fuentes.wompi      as mod_wompi
-import fuentes.stripe     as mod_stripe
-import fuentes.colpatria  as mod_colpatria
+import fuentes.colpatria as mod_colpatria
 import fuentes.davivienda as mod_davivienda
-import fuentes.payu       as mod_payu
-
-from utils.drive     import list_files, download_pdf as download_file, move_file
-from utils.parser    import valor_str
-from utils.sheets    import ensure_tab, append_rows, get_yesterday_keys
-from utils.supabase  import upsert, existing_matching_keys, upsert_pagos_apartados, select_all
+import fuentes.payu as mod_payu
+import fuentes.placetopay as mod_placetopay
+import fuentes.stripe as mod_stripe
+import fuentes.wompi as mod_wompi
+from utils import dry_run
+from utils.drive import download_pdf as download_file
+from utils.drive import list_files, move_file
+from utils.parser import valor_str
+from utils.sheets import append_rows, ensure_tab, get_yesterday_keys
+from utils.supabase import existing_matching_keys, select_all, upsert, upsert_pagos_apartados
 
 logging.basicConfig(
     level=logging.INFO,
@@ -561,8 +561,16 @@ def main():
         '--dry-run', action='store_true',
         help='No escribe a Sheets/Supabase ni mueve archivos.',
     )
+    parser.add_argument(
+        '--dry-run-salida', metavar='RUTA',
+        help='Dónde dejar el detalle de la simulación (default: logs/dry-run-*.jsonl).',
+    )
     args = parser.parse_args()
 
+    # El flag ya existía y frena las escrituras desde la lógica de este script;
+    # encender además el interruptor de utils/ cierra el paso en la puerta, que
+    # es lo que garantiza que no se escape ninguna llamada nueva.
+    dry_run.desde_args(args, 'procesar_todos')
     if args.dry_run:
         log.info('=== DRY RUN activado ===')
 
@@ -608,6 +616,8 @@ def main():
                             args.dry_run, correcciones)
 
     log.info('procesar_todos.py completado.')
+    if dry_run.activo():
+        log.warning('%s', dry_run.resumen())
 
 
 if __name__ == '__main__':

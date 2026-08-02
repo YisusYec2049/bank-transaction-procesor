@@ -1,0 +1,37 @@
+[project]
+name = "matching-test"
+version = "1.0.0"
+description = "Pipeline de conciliación de pagos: normaliza extractos bancarios y de pasarelas, y los cruza contra la cartera de inscripciones."
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# --import-mode=importlib para que tests/ no necesite __init__.py y los módulos
+# del repo (cruzar, utils, fuentes) se importen desde la raíz.
+addopts = "--import-mode=importlib -q"
+pythonpath = ["."]
+markers = [
+    "fixtures: necesita los fixtures generados (scripts/generar_fixtures.py)",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+exclude = ["venv", "__pycache__", "sql"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle
+    "F",   # pyflakes — variables sin usar, imports muertos, nombres indefinidos
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # bugbear — errores reales (mutable default, except sin usar, etc.)
+]
+ignore = [
+    "E501",  # largo de línea: los docstrings-changelog de este repo lo pasan a propósito
+    "B008",  # llamada en default de argumento
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Los tests comparan estructuras completas; el ==True/is True de ruff no aplica.
+"tests/*" = ["E712"]

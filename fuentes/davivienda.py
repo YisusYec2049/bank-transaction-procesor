@@ -28,7 +28,7 @@ import logging
 
 import openpyxl
 
-from utils.parser import parse_valor, valor_str
+from utils.parser import parse_valor
 
 log = logging.getLogger(__name__)
 

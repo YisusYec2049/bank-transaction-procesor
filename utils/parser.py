@@ -69,11 +69,3 @@ def valor_str(v) -> str:
         return str(int(rounded))
     s = f'{rounded:.2f}'.rstrip('0')
     return s.rstrip('.')
-
-
-def norm_valor_str(raw) -> str:
-    """Normaliza un valor leído desde Sheets (str o número) usando valor_str."""
-    try:
-        return valor_str(float(str(raw).replace(',', '').strip()))
-    except (ValueError, TypeError):
-        return str(raw).strip()

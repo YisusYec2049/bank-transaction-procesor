@@ -5,6 +5,8 @@ from datetime import datetime
 
 import pytz
 
+from utils import dry_run
+
 log = logging.getLogger(__name__)
 
 
@@ -62,6 +64,8 @@ def get_yesterday_keys(sheets, spreadsheet_id: str) -> set[str]:
 
 
 def ensure_tab(sheets, spreadsheet_id: str, tab_name: str, headers: list) -> None:
+    if dry_run.registrar(f'sheet:{tab_name}', 'ensure', None):
+        return
     meta = sheets.spreadsheets().get(
         spreadsheetId=spreadsheet_id, fields='sheets.properties.title'
     ).execute()
@@ -83,6 +87,8 @@ def ensure_tab(sheets, spreadsheet_id: str, tab_name: str, headers: list) -> Non
 
 
 def append_rows(sheets, spreadsheet_id: str, tab_name: str, rows: list[list]) -> None:
+    if dry_run.registrar(f'sheet:{tab_name}', 'append', rows):
+        return
     sheets.spreadsheets().values().append(
         spreadsheetId=spreadsheet_id,
         range=f"'{tab_name}'!A1",

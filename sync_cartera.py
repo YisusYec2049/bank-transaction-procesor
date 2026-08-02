@@ -37,6 +37,7 @@ Se corre por cron (encadenado con cruzar.py, ver crontab del VPS) o
 manualmente cada vez que el equipo sube un Excel nuevo.
 """
 
+import argparse
 import io
 import logging
 import os
@@ -46,13 +47,24 @@ from datetime import datetime
 import pytz
 from dotenv import load_dotenv
 
-from utils.drive import build_drive_service, find_latest_any_file, download_pdf as download_file, move_file
+from utils import dry_run
+from utils.drive import build_drive_service, find_latest_any_file, move_file
+from utils.drive import download_pdf as download_file
 from utils.excel_cartera import (
-    read_inscrip, read_bancolombia_2576, read_bancolombia_2833, read_wompi,
-    read_stripe_usa, read_cartera_preventiva,
+    read_bancolombia_2576,
+    read_bancolombia_2833,
+    read_cartera_preventiva,
+    read_inscrip,
+    read_stripe_usa,
+    read_wompi,
 )
-from utils.supabase import (replace_table, replace_cartera_preventiva_staging,
-                             select_all, delete_by_keys, upsert_cartera_cargas)
+from utils.supabase import (
+    delete_by_keys,
+    replace_cartera_preventiva_staging,
+    replace_table,
+    select_all,
+    upsert_cartera_cargas,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -113,6 +125,11 @@ def _procesar_opcional(drive, nombre: str, folder_id: str, hist_folder_id: str,
 
 
 def main():
+    parser = argparse.ArgumentParser(description='Refresca las tablas de referencia desde Google Drive.')
+    dry_run.agregar_flags(parser)
+    args = parser.parse_args()
+    dry_run.desde_args(args, 'sync')
+
     load_dotenv()
 
     folder_id_fallback = os.environ.get('CARTERA_DRIVE_FOLDER_ID', '')
@@ -207,3 +224,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+    if dry_run.activo():
+        log.warning('%s', dry_run.resumen())

@@ -129,6 +129,7 @@ Requerimientos del 23 de julio (`requeriments.md`, puntos #1, #2 y #3):
 ────────────────────────────────────────────────────────────────────────────
 """
 
+import argparse
 import logging
 import os
 import sys
@@ -137,10 +138,17 @@ from datetime import datetime
 import pytz
 from dotenv import load_dotenv
 
+from utils import dry_run
 from utils.parser import normalizar_nit, normalizar_sufijo
-from utils.supabase import (select_all, delete_by_keys, update_cruce_valores,
-                             upsert_cartera_preventiva, insert_cartera_preventiva_lineas,
-                             upsert_pago_asociaciones, upsert_cartera_saldos_favor)
+from utils.supabase import (
+    delete_by_keys,
+    insert_cartera_preventiva_lineas,
+    select_all,
+    update_cruce_valores,
+    upsert_cartera_preventiva,
+    upsert_cartera_saldos_favor,
+    upsert_pago_asociaciones,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -739,6 +747,87 @@ def _etiqueta_notificacion(valor_cuota: float, sobrante: float,
     return f'PAGA {_NUMERO_EN_LETRA.get(total, str(total))} CUOTAS'
 
 
+def verificar_cuadre(supabase_url: str, srk: str, pagos_por_matching_key: dict,
+                     tolerancia: float = 1.0) -> list[dict]:
+    """Comprueba, pago por pago, que la plata no se haya perdido ni duplicado.
+
+    La regla es una sola y no depende de ninguna lógica de este archivo:
+
+        lo aplicado a cuotas  +  lo que queda disponible  ==  lo que entró
+
+    Este chequeo, hecho a mano, es el que destapó el bug del ledger el 28 de
+    julio: de 278 asociaciones y 44 saldos, **una sola** no cerraba — un pago
+    cuyo excedente se había registrado a nombre de otro pago de la misma
+    corrida. Nadie lo habría visto mirando la pantalla, porque los totales
+    cuadraban; solo no cuadraba el detalle. Que corriera solo desde el
+    principio habría ahorrado ese hallazgo.
+
+    Se relee de la base a propósito, en vez de calcularlo con lo que quedó en
+    memoria: lo que interesa saber es qué quedó **escrito**, no qué creía el
+    código que iba a escribir. Son dos consultas chicas (cientos de filas) al
+    final de una corrida que dura minutos.
+
+    Devuelve la lista de descuadres. No lanza excepción ni corta la corrida:
+    para cuando esto corre, el trabajo ya está hecho, y tumbar el proceso no
+    desharía nada — solo escondería el resto del log.
+
+    Medido contra producción el 2026-08-02 antes de instalarlo: 154 pagos con
+    movimiento, **0 descuadres**. La línea base está limpia, así que cualquier
+    cosa que reporte de aquí en adelante es nueva.
+    """
+    from collections import defaultdict
+
+    asociaciones = select_all(supabase_url, srk, 'pago_asociaciones',
+                              select='matching_key,llave,monto')
+    saldos = select_all(supabase_url, srk, 'cartera_saldos_favor',
+                        select='matching_key,disponible')
+
+    aplicado: dict = defaultdict(float)
+    for a in asociaciones:
+        aplicado[a['matching_key']] += float(a.get('monto') or 0)
+
+    disponible: dict = defaultdict(float)
+    for s in saldos:
+        disponible[s['matching_key']] += float(s.get('disponible') or 0)
+
+    descuadres = []
+    for mk in set(aplicado) | set(disponible):
+        pago = pagos_por_matching_key.get(mk)
+        if pago is None:
+            # Un movimiento cuyo pago ya no está en el cruce: el pago se apartó
+            # o se corrigió después de repartirse, y su plata quedó colgando.
+            descuadres.append({
+                'matching_key': mk, 'motivo': 'sin pago en cruce_cartera',
+                'entro': None, 'aplicado': aplicado[mk], 'disponible': disponible[mk],
+            })
+            continue
+
+        entro = float(pago.get('payment_amount') or 0)
+        total = aplicado[mk] + disponible[mk]
+        if abs(total - entro) > tolerancia:
+            descuadres.append({
+                'matching_key': mk,
+                'motivo': 'sobra' if total > entro else 'falta',
+                'entro': entro, 'aplicado': aplicado[mk],
+                'disponible': disponible[mk], 'diferencia': total - entro,
+            })
+
+    if not descuadres:
+        log.info('Cuadre verificado: %d pago(s) con movimiento, todo cuadra.',
+                 len(set(aplicado) | set(disponible)))
+        return []
+
+    log.error('*** CUADRE: %d pago(s) NO cuadran — revisar antes de confiar en '
+              'estos números ***', len(descuadres))
+    for d in descuadres[:20]:
+        log.error('  %s (%s): entró=%s aplicado=%.0f disponible=%.0f',
+                  d['matching_key'], d['motivo'], d['entro'],
+                  d['aplicado'], d['disponible'])
+    if len(descuadres) > 20:
+        log.error('  ... y %d más.', len(descuadres) - 20)
+    return descuadres
+
+
 def _pago_mas_reciente(asociaciones: list[dict], pagos_por_matching_key: dict) -> dict:
     """De un grupo de asociaciones vigentes de una misma cuota, el pago con
     `payment_date` más reciente — usado para llenar fecha_pago/medio_pago/
@@ -755,6 +844,11 @@ def _pago_mas_reciente(asociaciones: list[dict], pagos_por_matching_key: dict) -
 
 
 def main():
+    parser = argparse.ArgumentParser(description='Aplica los pagos identificados sobre las cuotas pendientes.')
+    dry_run.agregar_flags(parser)
+    args = parser.parse_args()
+    dry_run.desde_args(args, 'preventiva')
+
     load_dotenv()
 
     supabase_url = os.environ.get('SUPABASE_URL', '')
@@ -1494,6 +1588,15 @@ def main():
         log.info('Cruce inverso: %d filas actualizadas (%d identificados, %d sin identificar).',
                   len(cruce_updates), con_match, len(cruce_updates) - con_match)
 
+    # Lo último de la corrida: comprobar que la plata cuadra. Va al final
+    # porque relee lo que quedó escrito, no lo que se pensaba escribir.
+    if dry_run.activo():
+        log.info('Cuadre: no se verifica en simulación (nada se escribió).')
+    else:
+        verificar_cuadre(supabase_url, srk, pagos_por_matching_key)
+
 
 if __name__ == '__main__':
     main()
+    if dry_run.activo():
+        log.warning('%s', dry_run.resumen())

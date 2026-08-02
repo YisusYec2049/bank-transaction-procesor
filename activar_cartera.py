@@ -42,6 +42,7 @@ limpio) — no se arrastra ningún saldo a favor, cierre o estado de la
 versión anterior a la nueva, por diseño explícito del usuario.
 """
 
+import argparse
 import logging
 import os
 import sys
@@ -51,7 +52,8 @@ from datetime import datetime
 import pytz
 from dotenv import load_dotenv
 
-from utils.supabase import select_all, insert_rows, delete_all_rows, upsert_cartera_cargas
+from utils import dry_run
+from utils.supabase import delete_all_rows, insert_rows, select_all, upsert_cartera_cargas
 
 logging.basicConfig(
     level=logging.INFO,
@@ -139,6 +141,11 @@ def _desambiguar_llaves(rows: list[dict]) -> tuple[list[dict], int]:
 
 
 def main():
+    parser = argparse.ArgumentParser(description='Cambia la cartera activa por la que está en espera.')
+    dry_run.agregar_flags(parser)
+    args = parser.parse_args()
+    dry_run.desde_args(args, 'activar')
+
     load_dotenv()
     supabase_url = os.environ.get('SUPABASE_URL', '')
     srk          = os.environ.get('SUPABASE_SERVICE_ROLE_KEY', '')
@@ -212,3 +219,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+    if dry_run.activo():
+        log.warning('%s', dry_run.resumen())
