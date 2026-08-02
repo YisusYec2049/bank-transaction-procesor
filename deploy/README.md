@@ -107,6 +107,16 @@ Todo esto se aplica sin tocar el código:
 | `PrivateTmp` | ver o pisar los `/tmp` de otros procesos |
 | `ProtectKernel*`, `RestrictNamespaces` | tocar el kernel o crear contenedores |
 
+Lo único que el pipeline escribe en disco es `logs/` (comprobado: la única
+escritura fuera de la base y de Drive está en `utils/dry_run.py`), así que
+`ReadWritePaths` con esa sola carpeta alcanza.
+
+`StateDirectory=matching` le da al servicio un `/var/lib/matching` propio, que
+systemd crea con el dueño correcto. Es el `HOME` de gunicorn: sin él dejaba un
+`Control server error: Permission denied: '/home/matching'` en cada arranque —
+el servicio andaba igual, pero un error falso permanente en el log termina
+enseñando a ignorar los errores de verdad.
+
 **Detalle a tener presente**: `PrivateTmp=true` le da al servicio su propio
 `/tmp`. Hoy no molesta —el candado `flock -n /tmp/matching.lock` lo usa solo el
 cron, y el servicio se coordina con un lock propio en memoria— pero si alguna

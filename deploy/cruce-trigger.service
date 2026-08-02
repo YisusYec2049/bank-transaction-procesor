@@ -18,6 +18,18 @@ Group=matching
 
 WorkingDirectory=/opt/matching-test
 EnvironmentFile=/opt/matching-test/.env
+
+# El usuario se creó sin carpeta personal (--no-create-home) y ProtectHome
+# bloquea /home de todos modos, así que gunicorn no encontraba dónde poner su
+# servidor de control y dejaba un ERROR en cada arranque:
+#   Control server error: [Errno 13] Permission denied: '/home/matching'
+# El servicio funcionaba igual, pero un error falso permanente en el log es
+# justo lo que hace que después nadie mire los errores de verdad.
+#
+# StateDirectory hace que systemd cree /var/lib/matching con el dueño correcto
+# antes de arrancar; no hay que crearla a mano.
+StateDirectory=matching
+Environment=HOME=/var/lib/matching
 ExecStart=/opt/matching-test/venv/bin/gunicorn --workers 1 --bind 127.0.0.1:5001 --timeout 600 trigger_server:app
 Restart=on-failure
 RestartSec=5
