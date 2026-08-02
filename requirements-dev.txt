@@ -5,3 +5,8 @@
 
 pytest==8.4.2
 ruff==0.14.4
+
+# Solo para poder probar trigger_server.py en local. En el VPS flask viene
+# de requirements.txt; acá hace falta para que sus tests corran en vez de
+# saltarse — un test que se salta no protege nada.
+flask==3.1.3

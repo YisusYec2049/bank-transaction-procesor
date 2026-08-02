@@ -4,12 +4,40 @@ After=network.target
 
 [Service]
 Type=simple
-User=root
+
+# Usuario propio, sin shell y sin privilegios. Antes corría como root: este
+# servicio está expuesto a internet por Tailscale Funnel y sus endpoints lanzan
+# subprocesos, así que cualquier fallo suyo era un fallo con permisos totales
+# sobre la máquina. No hay ninguna razón para que necesite root — solo lee el
+# repo, escribe en logs/ y habla con Supabase y Drive.
+#
+# Ver deploy/README.md para los pasos de migración (crear el usuario y ceder
+# los permisos de /opt/matching-test).
+User=matching
+Group=matching
+
 WorkingDirectory=/opt/matching-test
 EnvironmentFile=/opt/matching-test/.env
 ExecStart=/opt/matching-test/venv/bin/gunicorn --workers 1 --bind 127.0.0.1:5001 --timeout 600 trigger_server:app
 Restart=on-failure
 RestartSec=5
+
+# Aislamiento que aplica systemd sin tocar el código. Si algún día el servicio
+# se ve comprometido, esto limita hasta dónde llega.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+
+# ProtectSystem=strict deja todo el disco en solo lectura: hay que declarar lo
+# que sí se escribe. Son los logs del pipeline y nada más.
+ReadWritePaths=/opt/matching-test/logs
 
 [Install]
 WantedBy=multi-user.target

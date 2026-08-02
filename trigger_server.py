@@ -29,11 +29,9 @@ Dos reglas de diseño que importan:
 Protegido por token compartido (TRIGGER_TOKEN en .env) — no hay otra
 autenticación, así que este servicio NUNCA debe quedar expuesto sin proxy/
 Funnel delante y sin el token configurado.
-
-Protegido por token compartido (TRIGGER_TOKEN en .env) — no hay otra
-autenticación, así que este servicio NUNCA debe quedar expuesto sin proxy/
-Funnel delante y sin el token configurado.
 """
+
+import hmac
 import os
 import subprocess
 import threading
@@ -168,7 +166,18 @@ def _run_activar_cartera():
 
 
 def _autorizado() -> bool:
-    return request.headers.get("Authorization") == f"Bearer {TRIGGER_TOKEN}"
+    """Compara el token en tiempo constante.
+
+    `==` sobre cadenas corta en el primer carácter distinto, así que **cuánto
+    tarda en responder depende de cuántos caracteres acertó** quien pregunta.
+    Con suficientes intentos, eso permite adivinar el token carácter por
+    carácter sin conocerlo. `compare_digest` siempre recorre todo.
+
+    Este servicio está expuesto a internet por Tailscale Funnel y sus endpoints
+    corren el pipeline entero, así que el token es la única puerta.
+    """
+    recibido = request.headers.get("Authorization", "")
+    return hmac.compare_digest(recibido, f"Bearer {TRIGGER_TOKEN}")
 
 
 @app.post("/trigger/cartera/activar")

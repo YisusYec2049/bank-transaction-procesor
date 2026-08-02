@@ -166,7 +166,19 @@ def _headers(service_role_key: str, prefer: str | None = None) -> dict:
 
 def select_all(supabase_url: str, service_role_key: str, table: str,
                 select: str = '*', page_size: int = 1000) -> list[dict]:
-    """Trae todas las filas de `table` paginando de a `page_size`."""
+    """Trae TODAS las filas de `table`, paginando.
+
+    El avance se hace por **lo que el servidor devolvió**, no por lo que se le
+    pidió, y se corta solo con una página vacía. Parece un detalle y no lo es:
+    PostgREST tiene un tope propio (`max-rows`, 1.000 en Supabase) y **recorta
+    en silencio** cualquier página más grande. La versión anterior avanzaba de
+    a `page_size` y cortaba cuando `len(page) < page_size`, así que pedir
+    páginas de 5.000 devolvía **1.000 filas de 23.348 sin error y sin aviso** —
+    y con eso el cruce habría dejado de reconocer al 95% de la gente.
+
+    Nadie pasaba un `page_size` mayor todavía, así que la falla estaba dormida.
+    Medido el 2026-08-02 contra `cartera_ingresos_wompi`.
+    """
     rows: list[dict] = []
     offset = 0
     while True:
@@ -181,11 +193,10 @@ def select_all(supabase_url: str, service_role_key: str, table: str,
         )
         _raise_for_status(resp)
         page = resp.json()
+        if not page:
+            return rows
         rows.extend(page)
-        if len(page) < page_size:
-            break
-        offset += page_size
-    return rows
+        offset += len(page)
 
 
 def replace_table(supabase_url: str, service_role_key: str, table: str,
