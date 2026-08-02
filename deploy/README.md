@@ -31,6 +31,11 @@ sudo chmod 750 /opt/matching-test
 
 # Los secretos, solo para su dueño.
 sudo chmod 600 /opt/matching-test/.env /opt/matching-test/service_account.json
+
+# Sin esto, el próximo `git pull` como root falla con "detected dubious
+# ownership in repository": git se niega a operar sobre un repo que es de
+# otro usuario. Es la consecuencia directa del chown de arriba.
+sudo git config --global --add safe.directory /opt/matching-test
 ```
 
 ### 3. Instalar la unidad nueva
@@ -113,8 +118,11 @@ directiva o mover el candado fuera de `/tmp`.
 ## Actualizar el código
 
 ```bash
-cd /opt/matching-test && git pull
+cd /opt/matching-test && sudo git pull
 sudo systemctl restart cruce-trigger
+
+# El pull deja los archivos nuevos con dueño root; devolvérselos al servicio.
+sudo chown -R matching:matching /opt/matching-test
 ```
 
 **El restart no es opcional**: `gunicorn` tiene el código cargado en memoria, así
