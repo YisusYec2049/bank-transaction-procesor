@@ -85,23 +85,34 @@ def registrar(destino: str, operacion: str, filas) -> bool:
         return False
 
     if isinstance(filas, (list, tuple)):
-        cantidad, muestra = len(filas), list(filas[:3])
+        contenido = list(filas)
     elif filas is None:
-        cantidad, muestra = 0, []
+        contenido = []
     else:
-        cantidad, muestra = 1, [filas]
+        contenido = [filas]
+    cantidad = len(contenido)
 
     _conteo[f'{destino}.{operacion}'] += 1
     _filas[f'{destino}.{operacion}'] += cantidad
 
     if _salida is not None:
+        # Se escribe UNA LÍNEA POR FILA, con todo su contenido, no un resumen.
+        # La primera versión guardaba solo 3 filas de muestra, y con eso el
+        # `diff` entre dos corridas comparaba los totales — no los datos. Un
+        # cambio que dejara igual la cantidad de filas pero cambiara un valor
+        # habría pasado desapercibido, que es justo lo que este archivo existe
+        # para detectar. Ordenado por su forma serializada para que el diff no
+        # marque diferencias cuando lo único que cambió es el orden de proceso.
         with _salida.open('a', encoding='utf-8') as fh:
-            fh.write(json.dumps({
-                'destino': destino,
-                'operacion': operacion,
-                'filas': cantidad,
-                'muestra': muestra,
-            }, default=str, ensure_ascii=False) + '\n')
+            lineas = sorted(
+                json.dumps({'destino': destino, 'operacion': operacion, 'fila': f},
+                           default=str, ensure_ascii=False, sort_keys=True)
+                for f in contenido
+            )
+            if not contenido:
+                lineas = [json.dumps({'destino': destino, 'operacion': operacion,
+                                      'fila': None}, ensure_ascii=False)]
+            fh.write('\n'.join(lineas) + '\n')
 
     log.info('[dry-run] %s %s: %d fila(s) — no escritas', operacion, destino, cantidad)
     return True

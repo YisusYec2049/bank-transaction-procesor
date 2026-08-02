@@ -4,7 +4,9 @@ import logging
 from datetime import datetime
 
 import pytz
-import requests as http
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from utils import dry_run
 
@@ -14,7 +16,42 @@ _ENDPOINT = '/rest/v1/consolidated_transactions?on_conflict=matching_key'
 _PREFER   = 'return=minimal,resolution=merge-duplicates'
 
 
-def _raise_for_status(resp: http.Response) -> None:
+def _construir_sesion() -> requests.Session:
+    """Una sola conexión TCP+TLS para toda la corrida, en vez de una nueva por
+    petición.
+
+    Medido contra producción el 2026-08-02: una petición trivial cuesta
+    **433 ms** abriendo conexión y **247 ms** reusándola. El apretón de manos
+    de TLS es casi la mitad del costo de hablar con la base, y este pipeline
+    hace cientos de peticiones por corrida.
+
+    Los reintentos son parte del mismo cambio y no un extra: una conexión que
+    se mantiene viva puede quedar rancia del otro lado, y el 30 de julio una
+    corrida ya murió con `SSLEOFError` a media escritura. Se reintenta **solo
+    en métodos idempotentes** — `allowed_methods` deja fuera POST y PATCH a
+    propósito: si un POST llegó y lo que se perdió fue la respuesta,
+    reintentarlo escribiría dos veces. Ese riesgo no se corre con plata.
+    """
+    sesion = requests.Session()
+    politica = Retry(
+        total=3,
+        backoff_factor=0.5,              # 0.5s, 1s, 2s
+        status_forcelist=(502, 503, 504),
+        allowed_methods=frozenset(['GET', 'HEAD', 'OPTIONS']),
+        raise_on_status=False,
+    )
+    adaptador = HTTPAdapter(max_retries=politica, pool_maxsize=20)
+    sesion.mount('https://', adaptador)
+    sesion.mount('http://', adaptador)
+    return sesion
+
+
+# Se llama `http` para que las ~40 llamadas de este módulo (`http.get`,
+# `http.post`, …) no cambien: una Session expone los mismos verbos.
+http = _construir_sesion()
+
+
+def _raise_for_status(resp: requests.Response) -> None:
     """Como resp.raise_for_status(), pero logueando resp.text ANTES de
     lanzar la excepción. El mensaje default de requests.HTTPError no
     incluye el cuerpo de la respuesta — y ahí es donde PostgREST pone el
@@ -337,27 +374,120 @@ def upsert_pago_asociaciones(supabase_url: str, service_role_key: str, rows: lis
     log.info('Upsert pago_asociaciones OK: %d registros.', len(rows))
 
 
-def update_cruce_valores(supabase_url: str, service_role_key: str, updates: list[dict]) -> None:
-    """PATCH individual por matching_key: cada dict trae matching_key + los
-    campos a actualizar (ej. {'matching_key': ..., 'cruce': 'Juan Perez'}).
-    No usa upsert/POST porque cruce_cartera tiene columnas que podrían no
-    aceptar NULL en un insert parcial — un PATCH real solo toca las columnas
-    dadas, sin reconstruir la fila."""
-    if dry_run.registrar('cruce_cartera', 'update', updates):
-        return
+# Qué funciones de lote existen en esta base. None = todavía no se preguntó.
+# Se recuerda para no gastar una petición por lote preguntando lo mismo.
+_LOTE_DISPONIBLE: dict[str, bool] = {}
+
+
+def _patch_una_por_una(supabase_url: str, service_role_key: str, tabla: str,
+                        updates: list[dict]) -> int:
+    """El camino de siempre: un PATCH por fila.
+
+    Se conserva como respaldo, no como reliquia. Es lo que corre mientras la
+    función de lote no esté creada en la base, y es lo que deja el despliegue
+    desacoplado del SQL: subir el código antes de correr la migración no rompe
+    nada, solo va lento. Esa dependencia de orden —código nuevo que exige SQL
+    ya corrido— fue la que dejó el motor caído un día entero el 24 de julio.
+    """
     hdrs = _headers(service_role_key, prefer='return=minimal')
+    escritas = 0
     for u in updates:
-        mk = u['matching_key']
         body = {k: v for k, v in u.items() if k != 'matching_key'}
+        if not body:
+            continue
         resp = http.patch(
-            f'{supabase_url}/rest/v1/cruce_cartera',
-            params={'matching_key': f'eq.{mk}'},
+            f'{supabase_url}/rest/v1/{tabla}',
+            params={'matching_key': f"eq.{u['matching_key']}"},
             json=body,
             headers=hdrs,
             timeout=30,
         )
         _raise_for_status(resp)
-    log.info('Update cruce_cartera (cruce inverso) OK: %d filas.', len(updates))
+        escritas += 1
+    return escritas
+
+
+def _actualizar_por_matching_key(supabase_url: str, service_role_key: str, tabla: str,
+                                  rpc: str, updates: list[dict], batch_size: int) -> int:
+    """Aplica actualizaciones parciales por `matching_key` en una sola petición.
+
+    **Nunca usa upsert/POST contra la tabla.** Tanto `cruce_cartera` como
+    `consolidated_transactions` tienen columnas `NOT NULL` sin default, y un
+    POST con `on_conflict` pero payload parcial las viola al construir la tupla
+    de INSERT: Postgres valida el `NOT NULL` **antes** de que el `ON CONFLICT`
+    alcance a redirigir al UPDATE, así que revienta con 23502 aunque la fila ya
+    exista. Es exactamente el crash del 24 de julio.
+
+    Por eso la escritura en lote va por una función de base y no por PostgREST:
+    es la única forma de mandar valores distintos para filas distintas en una
+    sola petición sin pasar por el camino de INSERT.
+
+    Si la función no existe en esta base, cae sola al PATCH fila por fila.
+    """
+    if _LOTE_DISPONIBLE.get(rpc) is False:
+        return _patch_una_por_una(supabase_url, service_role_key, tabla, updates)
+
+    hdrs = _headers(service_role_key, prefer='return=minimal')
+    for i in range(0, len(updates), batch_size):
+        lote = updates[i:i + batch_size]
+        resp = http.post(
+            f'{supabase_url}/rest/v1/rpc/{rpc}',
+            json={'cambios': lote},
+            headers=hdrs,
+            timeout=120,
+        )
+        if resp.status_code in (404, 400) and rpc in resp.text:
+            # PGRST202: la función no está creada acá todavía.
+            if rpc not in _LOTE_DISPONIBLE:
+                log.warning('La función %s() no existe en la base: se actualiza fila por '
+                            'fila (lento). Correr la migración para activarla.', rpc)
+            _LOTE_DISPONIBLE[rpc] = False
+            return _patch_una_por_una(supabase_url, service_role_key, tabla, updates)
+        _raise_for_status(resp)
+        _LOTE_DISPONIBLE[rpc] = True
+
+    return len(updates)
+
+
+def _ultimo_por_llave(updates: list[dict]) -> list[dict]:
+    """Deja una sola entrada por `matching_key`, la última.
+
+    El bucle de PATCH aplicaba las repetidas en orden, así que la última era la
+    que quedaba. En lote, el `UPDATE ... FROM` de Postgres elegiría una de las
+    dos sin criterio — se resuelve acá para que el resultado no cambie.
+    """
+    unicos: dict[str, dict] = {}
+    for u in updates:
+        unicos[u['matching_key']] = u
+    return list(unicos.values())
+
+
+def update_cruce_valores(supabase_url: str, service_role_key: str, updates: list[dict],
+                          batch_size: int = 2000) -> None:
+    """Actualiza filas de cruce_cartera; cada dict trae matching_key + las
+    columnas a cambiar (ej. {'matching_key': ..., 'cruce': 'Juan Perez'}).
+
+    Medido contra producción el 2026-08-02: 1.080 filas × 247 ms ≈ **4,5
+    minutos** fila por fila, contra ~0,4 s en lote. Era el mayor cuello de
+    botella del pipeline; el cálculo nunca fue lento — se pedía el mismo favor
+    mil veces.
+
+    Los lotes son **heterogéneos** a propósito: la fase 9.4 manda `incp` solo
+    cuando lo resolvió. La función de base mira qué claves trae cada objeto y
+    deja intactas las que no vienen; si rellenara con NULL, borraría el INCP de
+    las filas donde no venía.
+    """
+    if dry_run.registrar('cruce_cartera', 'update', updates):
+        return
+    if not updates:
+        return
+
+    filas = _ultimo_por_llave(updates)
+    escritas = _actualizar_por_matching_key(
+        supabase_url, service_role_key, 'cruce_cartera',
+        'actualizar_cruce_valores', filas, batch_size)
+    log.info('Update cruce_cartera (cruce inverso) OK: %d filas%s.', escritas,
+             ' (en lote)' if _LOTE_DISPONIBLE.get('actualizar_cruce_valores') else '')
 
 
 def update_consolidated_campos(supabase_url: str, service_role_key: str,
@@ -388,22 +518,18 @@ def update_consolidated_campos(supabase_url: str, service_role_key: str,
         return
     if not updates:
         return
-    hdrs = _headers(service_role_key, prefer='return=minimal')
-    escritas = 0
-    for u in updates:
-        payload = {k: v for k, v in u.items() if k != 'matching_key'}
-        if not payload:
-            continue
-        resp = http.patch(
-            f'{supabase_url}/rest/v1/consolidated_transactions',
-            params={'matching_key': f"eq.{u['matching_key']}"},
-            json=payload,
-            headers=hdrs,
-            timeout=30,
-        )
-        _raise_for_status(resp)
-        escritas += 1
-    log.info('Update consolidated_transactions OK: %d filas.', escritas)
+
+    # Un objeto que solo trae la llave no tiene nada que escribir.
+    filas = [u for u in _ultimo_por_llave(updates)
+             if any(k != 'matching_key' for k in u)]
+    if not filas:
+        return
+
+    escritas = _actualizar_por_matching_key(
+        supabase_url, service_role_key, 'consolidated_transactions',
+        'actualizar_consolidated_campos', filas, 2000)
+    log.info('Update consolidated_transactions OK: %d filas%s.', escritas,
+             ' (en lote)' if _LOTE_DISPONIBLE.get('actualizar_consolidated_campos') else '')
 
 
 def upsert_pagos_apartados(supabase_url: str, service_role_key: str, rows: list[dict]) -> None:

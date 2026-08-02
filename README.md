@@ -122,8 +122,10 @@ python cruzar_cartera_preventiva.py --dry-run --dry-run-salida /tmp/hoy.jsonl
 ```
 
 Al terminar imprime un resumen (qué tabla, cuántas filas) y deja el detalle en
-`logs/dry-run-*.jsonl`, una operación por línea — pensado para comparar dos
-corridas con `diff`, que es justo lo que se quiere antes y después de un cambio.
+`logs/dry-run-*.jsonl`, **una línea por fila con todo su contenido**, ordenado.
+Está pensado para comparar dos corridas con `diff`: si el archivo sale idéntico,
+el cambio no movió ningún dato. Es la verificación que se usó para la escritura
+en lote — 107 filas, idénticas antes y después.
 
 El interruptor vive en las tres puertas al exterior (`utils/supabase.py`,
 `utils/drive.py`, `utils/sheets.py`), no en cada llamada. Así ninguna escritura
@@ -166,6 +168,25 @@ ACTUALIZAR_SNAPSHOTS=1 pytest
 
 y **revisar el diff de `tests/snapshots/` antes de comitear**: ahí se ve, en
 números, qué cambió de verdad. Un diff más grande de lo esperado es la señal.
+
+## Rendimiento
+
+Dos cosas explican casi todo el tiempo de una corrida, y las dos están
+resueltas:
+
+| | Antes | Ahora |
+|---|---|---|
+| Leer las 8 tablas de referencia | 24,1 s | **14,7 s** (una sola conexión reusada) |
+| Escribir el cruce inverso (1.080 filas) | ~4,5 min | **una petición** |
+| Escribir el consolidado (825 filas WOMPI) | ~3,4 min | **una petición** |
+
+El cálculo nunca fue lo lento: se abría una conexión TLS nueva por petición y se
+hacía una petición por fila.
+
+Las dos escrituras en lote usan funciones de base
+(`actualizar_cruce_valores`, `actualizar_consolidated_campos`). **Si no están
+creadas, el pipeline sigue funcionando** por el camino fila por fila y lo avisa
+en el log — desplegar el código antes de correr el SQL no rompe nada.
 
 ## Configuración de Google
 

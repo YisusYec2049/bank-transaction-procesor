@@ -56,6 +56,23 @@ def test_no_escribe_en_supabase(simulacion, sin_red):
     assert simulacion.read_text().count('\n') == 4
 
 
+def test_registra_una_linea_por_fila_con_todo_el_contenido(simulacion, sin_red):
+    """El archivo se compara con `diff` entre dos corridas: tiene que traer los
+    datos, no un resumen.
+
+    La primera versión guardaba 3 filas de muestra por llamada. Con eso, un
+    cambio que dejara igual la CANTIDAD de filas pero alterara un valor de la
+    fila 40 no aparecía en el diff — o sea que la herramienta decía "no cambió
+    nada" sin haber mirado.
+    """
+    filas = [{'matching_key': f'PAGO-{i}', 'incp': f'INS-{i}'} for i in range(10)]
+    supabase.upsert_cruce('https://x', 'llave', filas)
+
+    lineas = simulacion.read_text().strip().split('\n')
+    assert len(lineas) == 10, 'debe haber una línea por fila, no un resumen'
+    assert 'PAGO-7' in simulacion.read_text(), 'una fila del medio no quedó registrada'
+
+
 def test_delete_by_keys_no_revienta(simulacion, sin_red):
     """La guarda nombraba mal su parámetro; esto lo habría atrapado."""
     supabase.delete_by_keys('https://x', 'llave', 'cruce_cartera', 'matching_key', ['a', 'b'])
