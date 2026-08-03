@@ -455,3 +455,183 @@ def test_el_aviso_se_apaga_cuando_lo_que_queda_no_vale_la_pena(mundo):
     assert _notificacion_de(capturado, 'INS5-A') in (None, '__sin_escribir__'), (
         'avisó por $500, que es ruido de redondeo'
     )
+
+
+def test_un_pago_que_no_paga_ninguna_cuota_no_avisa_nada(mundo):
+    """Caso 1022389618. La cuota la pagó exacto el pago del 2 de agosto; el de
+    julio se había descartado de esa misma cuota y quedó como plata libre.
+
+    La fila decía "PAGA DOS CUOTAS": contaba la cuota donde se paraba —que ese
+    pago ya no pagaba— más lo que sobraba. El aviso habla de un pago que pagó
+    cuotas, y ese pago no paga ninguna."""
+    pago_bueno = _pago_cruzado('PAGO-DE-HOY', '1002003010', 'INS7', 503_125,
+                               fecha='2026-08-02')
+    pago_descartado = _pago_cruzado('PAGO-VIEJO', '1002003010', 'INS7', 503_125,
+                                    fecha='2026-07-16')
+    pago_descartado['registration_date'] = '2026-07-17'
+    capturado = mundo(ccp, tablas={
+        'cartera_cargas': [_carga(f'{_hoy_bogota()}T15:23:32+00:00')],
+        'cartera_preventiva': [
+            _cuota('INS7-A', 'INS7', '1002003010', 503_125, '2026-08-13',
+                   fecha_pago='2026-08-02', valor_pago=503_125,
+                   fecha_cruce=_hoy_bogota(), diferencia=0),
+        ],
+        'pago_asociaciones': [
+            {'id': 9401, 'matching_key': 'PAGO-DE-HOY', 'llave': 'INS7-A',
+             'monto': 503_125, 'origen': 'automatico'},
+        ],
+        # El descarte dejó la plata del pago viejo anclada a esa misma cuota.
+        'cartera_saldos_favor': [
+            {'id': 9501, 'matching_key': 'PAGO-VIEJO', 'llave_origen': 'INS7-A',
+             'monto': 503_125, 'disponible': 503_125, 'aplicado': False,
+             'origen': 'descarte', 'documento': '1002003010',
+             'correo': 'alguien@example.com', 'inscrip': 'INS7',
+             'cliente': 'PERSONA DE PRUEBA', 'fecha': '2026-07-16'},
+        ],
+        'cruce_cartera': [pago_bueno, pago_descartado],
+    })
+
+    assert _notificacion_de(capturado, 'INS7-A') in (None, '__sin_escribir__'), (
+        'la cuota avisa sobre un pago que ya no la paga'
+    )
+
+
+# ── `valor_pago` muestra lo que entró por ese pago (3 de agosto) ───────────
+#
+# Regla del usuario: un pago de $1.000.000 contra una única cuota de $500.000
+# deja la fila con `valor_pago = 1.000.000` y `diferencia = 500.000`. Se rompe
+# cuando ese excedente se asocia a otra cuota: ahí cada una muestra lo suyo.
+
+def _valor_pago_de(capturado, llave):
+    valor = None
+    for f in capturado.get('cartera_preventiva', []):
+        if f.get('id') == _id_de(llave) and 'valor_pago' in f:
+            valor = f['valor_pago']
+    return valor
+
+
+def test_valor_pago_muestra_el_pago_completo_si_el_excedente_no_se_repartio(mundo):
+    """El ejemplo textual del usuario: entra $1.000.000, la única cuota es de
+    $500.000. La fila tiene que decir que entró un millón, no medio."""
+    capturado = mundo(ccp, tablas={
+        'cartera_cargas': [_carga(f'{_hoy_bogota()}T15:23:32+00:00')],
+        'cartera_preventiva': [_cuota('INS8-A', 'INS8', '1002003011', 500_000,
+                                      '2026-08-13')],
+        'cruce_cartera': [_pago_cruzado('PAGO-1M', '1002003011', 'INS8', 1_000_000)],
+    })
+
+    assert _valor_pago_de(capturado, 'INS8-A') == 1_000_000, (
+        'la fila muestra lo aplicado a la cuota, no lo que pagó la persona'
+    )
+    # La fila se escribe en varias pasadas; lo que queda en la base es la
+    # acumulación de todas.
+    fila = {}
+    for f in capturado.get('cartera_preventiva', []):
+        if f.get('id') == _id_de('INS8-A'):
+            fila.update(f)
+    assert float(fila['diferencia']) == 500_000, 'el excedente debe verse en la diferencia'
+
+
+def test_valor_pago_vuelve_a_lo_suyo_cuando_el_excedente_se_reparte(mundo):
+    """"Se rompe eso" — el excedente ya se asoció a una segunda cuota, así que
+    cada fila vuelve a mostrar lo que recibió. Entre las dos suman el millón."""
+    capturado = mundo(ccp, tablas={
+        'cartera_cargas': [_carga(f'{_hoy_bogota()}T15:23:32+00:00')],
+        'cartera_preventiva': [
+            _cuota('INS9-A', 'INS9', '1002003012', 500_000, '2026-08-13',
+                   fecha_pago='2026-08-01', valor_pago=1_000_000,
+                   fecha_cruce=_hoy_bogota(), diferencia=500_000),
+            _cuota('INS9-B', 'INS9', '1002003012', 500_000, '2026-09-13',
+                   fecha_pago='2026-08-01', valor_pago=500_000,
+                   fecha_cruce=_hoy_bogota(), diferencia=0),
+        ],
+        'pago_asociaciones': [
+            {'id': 9601, 'matching_key': 'PAGO-1M', 'llave': 'INS9-A',
+             'monto': 500_000, 'origen': 'automatico'},
+            {'id': 9602, 'matching_key': 'PAGO-1M', 'llave': 'INS9-B',
+             'monto': 500_000, 'origen': 'manual'},
+        ],
+        # El saldo quedó en cero: ya no hay nada sin repartir.
+        'cartera_saldos_favor': [
+            {'id': 9701, 'matching_key': 'PAGO-1M', 'llave_origen': 'INS9-A',
+             'monto': 500_000, 'disponible': 0, 'aplicado': True,
+             'origen': 'sobrante', 'documento': '1002003012',
+             'correo': 'alguien@example.com', 'inscrip': 'INS9',
+             'cliente': 'PERSONA DE PRUEBA', 'fecha': '2026-08-01'},
+        ],
+        'cruce_cartera': [_pago_cruzado('PAGO-1M', '1002003012', 'INS9', 1_000_000)],
+    })
+
+    assert _valor_pago_de(capturado, 'INS9-A') == 500_000, (
+        'la primera cuota sigue mostrando el millón después de repartir el excedente'
+    )
+
+
+def test_plata_aparcada_de_un_pago_ajeno_no_infla_el_valor_pago(mundo):
+    """Caso 1022389618: la cuota la pagó exacto un pago, y al lado había otro
+    descartado por el mismo monto. Sumarlo diría que entró el doble."""
+    pago_bueno = _pago_cruzado('PAGO-BUENO', '1002003013', 'INS10', 503_125)
+    pago_descartado = _pago_cruzado('PAGO-VIEJO', '1002003013', 'INS10', 503_125,
+                                    fecha='2026-07-16')
+    pago_descartado['registration_date'] = '2026-07-17'
+    capturado = mundo(ccp, tablas={
+        'cartera_cargas': [_carga(f'{_hoy_bogota()}T15:23:32+00:00')],
+        'cartera_preventiva': [
+            _cuota('INS10-A', 'INS10', '1002003013', 503_125, '2026-08-13',
+                   fecha_pago='2026-08-02', valor_pago=503_125,
+                   fecha_cruce=_hoy_bogota(), diferencia=0),
+        ],
+        'pago_asociaciones': [
+            {'id': 9801, 'matching_key': 'PAGO-BUENO', 'llave': 'INS10-A',
+             'monto': 503_125, 'origen': 'automatico'},
+        ],
+        'cartera_saldos_favor': [
+            {'id': 9901, 'matching_key': 'PAGO-VIEJO', 'llave_origen': 'INS10-A',
+             'monto': 503_125, 'disponible': 503_125, 'aplicado': False,
+             'origen': 'descarte', 'documento': '1002003013',
+             'correo': 'alguien@example.com', 'inscrip': 'INS10',
+             'cliente': 'PERSONA DE PRUEBA', 'fecha': '2026-07-16'},
+        ],
+        'cruce_cartera': [pago_bueno, pago_descartado],
+    })
+
+    escrito = _valor_pago_de(capturado, 'INS10-A')
+    assert escrito in (None, 503_125), (
+        f'la fila dice que entraron {escrito} cuando el pago fue de 503.125'
+    )
+
+
+def test_el_valor_pago_inflado_no_oscila_entre_corridas(mundo):
+    """El riesgo real de esta regla: la pasada que reconcilia compara
+    `valor_pago` contra lo aplicado, y la que lo ajusta le suma el excedente.
+    Si no hablan el mismo idioma, una lo sube y la otra lo baja en cada
+    corrida, y el número parpadea para siempre.
+
+    Este es el mundo TAL COMO QUEDA después de la corrida anterior."""
+    capturado = mundo(ccp, tablas={
+        'cartera_cargas': [_carga(f'{_hoy_bogota()}T15:23:32+00:00')],
+        'cartera_preventiva': [
+            _cuota('INS11-A', 'INS11', '1002003014', 500_000, '2026-08-13',
+                   fecha_pago='2026-08-01', valor_pago=1_000_000,
+                   fecha_cruce=_hoy_bogota(), diferencia=500_000),
+        ],
+        'pago_asociaciones': [
+            {'id': 9111, 'matching_key': 'PAGO-1M', 'llave': 'INS11-A',
+             'monto': 500_000, 'origen': 'automatico'},
+        ],
+        'cartera_saldos_favor': [
+            {'id': 9222, 'matching_key': 'PAGO-1M', 'llave_origen': 'INS11-A',
+             'monto': 500_000, 'disponible': 500_000, 'aplicado': False,
+             'origen': 'sobrante', 'documento': '1002003014',
+             'correo': 'alguien@example.com', 'inscrip': 'INS11',
+             'cliente': 'PERSONA DE PRUEBA', 'fecha': '2026-08-01'},
+        ],
+        'cruce_cartera': [_pago_cruzado('PAGO-1M', '1002003014', 'INS11', 1_000_000)],
+    })
+
+    escrituras = [f for f in capturado.get('cartera_preventiva', [])
+                  if f.get('id') == _id_de('INS11-A')
+                  and ('valor_pago' in f or 'diferencia' in f)]
+    assert not escrituras, (
+        f'la fila ya estaba correcta y se reescribió igual: {escrituras}'
+    )

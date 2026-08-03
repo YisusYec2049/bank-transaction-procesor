@@ -1088,6 +1088,59 @@ def main():
     #
     # Es seguro ampliarlo a todas porque el chequeo de idempotencia de abajo
     # descarta las que ya reflejan su suma, que son la enorme mayoría.
+    # ── `valor_pago` muestra lo que ENTRÓ por ese pago (3 de agosto) ───────
+    #
+    # Regla del usuario: si llega un pago de $1.000.000 y la única cuota que
+    # puede cubrir es de $500.000, la fila muestra `valor_pago = 1.000.000` y
+    # `diferencia = 500.000` — no $500.000 en las dos. "Se rompe eso" en el
+    # momento en que ese excedente se asocia a otra cuota: ahí cada cuota
+    # vuelve a mostrar lo suyo y la suma sigue dando el pago completo.
+    #
+    # Solo suma el excedente de los pagos que SÍ cubren esa cuota. Plata
+    # aparcada ahí que no la pagó —un pago descartado, por ejemplo— no infla
+    # el número (caso 1022389618: la cuota la pagó exacto un pago, y al lado
+    # había otro descartado por el mismo monto; sumarlo diría que entró el
+    # doble de lo que entró).
+    venc_por_llave = {c['llave']: (c.get('fecha_vencimiento') or _FECHA_MAX)
+                       for c in cuotas_rows if c.get('llave')}
+    disponible_por_pago: dict[str, float] = {}
+    for cr in saldos_favor_rows:
+        mk = cr.get('matching_key')
+        if mk:
+            disponible_por_pago[mk] = round(
+                disponible_por_pago.get(mk, 0.0) + float(cr.get('disponible') or 0), 2)
+
+    def _llaves_por_pago(asociaciones) -> dict[str, list[str]]:
+        """Cuotas que cubre cada pago hoy, de la más vieja a la más nueva."""
+        por_pago: dict[str, list[str]] = {}
+        for a in asociaciones:
+            vistas = por_pago.setdefault(a['matching_key'], [])
+            if a['llave'] not in vistas:
+                vistas.append(a['llave'])
+        for vistas in por_pago.values():
+            vistas.sort(key=lambda llave: (venc_por_llave.get(llave, _FECHA_MAX), llave))
+        return por_pago
+
+    def _destino_saldo(llaves: list[str]) -> str | None:
+        """Dónde se muestra la plata sin repartir de un pago: la última cuota
+        que cubre. Una cerrada a mano por Cartera se declara saldada y no es
+        sitio para mostrar plata suelta (caso 16079640), así que se baja a la
+        anterior; si todas están cerradas a mano, se queda en la última antes
+        que dejar la plata invisible."""
+        if not llaves:
+            return None
+        abiertas = [k for k in llaves if k not in llaves_cerradas_manual]
+        return (abiertas or llaves)[-1]
+
+    def _valor_pago_visible(llave: str, asociaciones_cuota: list[dict],
+                             por_pago: dict[str, list[str]]) -> float:
+        aplicado = round(sum(float(a['monto'] or 0) for a in asociaciones_cuota), 2)
+        extra = 0.0
+        for mk in {a['matching_key'] for a in asociaciones_cuota}:
+            if _destino_saldo(por_pago.get(mk) or []) == llave:
+                extra += disponible_por_pago.get(mk, 0.0)
+        return round(aplicado + extra, 2)
+
     log.info('Reconciliando cuotas contra sus asociaciones vigentes...')
     reconciliadas = 0
     for llave in list(asociaciones_por_llave.keys()):
@@ -1124,9 +1177,15 @@ def main():
         refleja_faltante = faltante <= 0 or (
             diferencia_actual is not None
             and round(float(diferencia_actual), 2) == -faltante)
+        # La comparación va contra lo que la fila DEBE mostrar (que incluye el
+        # excedente sin repartir), no contra lo aplicado: si no, esta pasada y
+        # la que ajusta `valor_pago` al final se pisarían entre sí y el número
+        # oscilaría en cada corrida.
         valor_pago_actual = cuota.get('valor_pago')
+        visible = _valor_pago_visible(llave, asociaciones_cuota,
+                                       _llaves_por_pago(asociaciones_vigentes))
         if (cuota.get('fecha_cruce') and valor_pago_actual is not None
-                and round(float(valor_pago_actual), 2) == suma
+                and round(float(valor_pago_actual), 2) in (suma, visible)
                 and refleja_faltante):
             continue  # ya refleja esta suma, nada que hacer (idempotencia)
 
@@ -1440,6 +1499,16 @@ def main():
         upsert_pago_asociaciones(supabase_url, srk, nuevas_asociaciones)
     if saldos_favor_nuevos:
         upsert_cartera_saldos_favor(supabase_url, srk, saldos_favor_nuevos)
+        # El ledger se leyó al empezar la corrida, así que lo que se acaba de
+        # crear no está ahí. Sin sumarlo, las tres columnas que dependen del
+        # excedente (`valor_pago`, `diferencia` y el aviso) mostrarían solo lo
+        # aplicado y se corregirían recién en la corrida siguiente.
+        saldos_favor_rows.extend(saldos_favor_nuevos)
+        for s in saldos_favor_nuevos:
+            mk = s.get('matching_key')
+            if mk:
+                disponible_por_pago[mk] = round(
+                    disponible_por_pago.get(mk, 0.0) + float(s.get('disponible') or 0), 2)
     # La línea de FALTA DE PAGO sigue a la `diferencia` de su cuota original
     # mientras esa original siga abierta (30 de julio). Va ANTES de escribir
     # las líneas nuevas porque puede descartar alguna que ya no corresponde.
@@ -1490,15 +1559,8 @@ def main():
     #
     # `llave_origen` queda solo de respaldo, para el pago que se quedó sin
     # ninguna asociación vigente: la plata tiene que verse en algún lado.
-    venc_por_llave = {c['llave']: (c.get('fecha_vencimiento') or _FECHA_MAX)
-                       for c in cuotas_rows if c.get('llave')}
-    llaves_vigentes_por_pago: dict[str, list[str]] = {}
-    for a in list(asociaciones_vigentes) + list(nuevas_asociaciones):
-        vistas = llaves_vigentes_por_pago.setdefault(a['matching_key'], [])
-        if a['llave'] not in vistas:
-            vistas.append(a['llave'])
-    for vistas in llaves_vigentes_por_pago.values():
-        vistas.sort(key=lambda llave: (venc_por_llave.get(llave, _FECHA_MAX), llave))
+    asociaciones_finales = list(asociaciones_vigentes) + list(nuevas_asociaciones)
+    llaves_vigentes_por_pago = _llaves_por_pago(asociaciones_finales)
 
     # El ledger se agrupa POR PAGO, no fila por fila: un mismo pago puede
     # tener varias filas (su sobrante original más lo que le devuelva un
@@ -1515,16 +1577,11 @@ def main():
 
     destino_por_pago: dict[str, str] = {}
     for mk, acum in saldo_por_pago.items():
-        vigentes = llaves_vigentes_por_pago.get(mk) or []
-        if vigentes:
-            # Una cuota cerrada a mano por Cartera se declara saldada, y no es
-            # sitio para mostrar plata suelta — era justo la pantalla
-            # contradictoria del caso 16079640. Se baja a la anterior que sí
-            # tenga el pago; si TODAS están cerradas a mano, se queda en la
-            # última antes que dejar la plata invisible.
-            abiertas = [k for k in vigentes if k not in llaves_cerradas_manual]
-            destino = (abiertas or vigentes)[-1]
-        else:
+        # `_destino_saldo` es la misma que usa `_valor_pago_visible`: las dos
+        # columnas tienen que hablar de la misma cuota o los números no cuadran
+        # entre sí en pantalla.
+        destino = _destino_saldo(llaves_vigentes_por_pago.get(mk) or [])
+        if destino is None:
             destino = acum['llave_origen']
         if destino:
             destino_por_pago[mk] = destino
@@ -1585,6 +1642,46 @@ def main():
         log.info('Saldo a favor: %d cuota(s) sincronizadas con el disponible de su pago.',
                   len(sync_diferencia))
 
+    # `valor_pago` = lo que entró por ese pago mientras su excedente siga sin
+    # repartir (ver el bloque de arriba, antes de la reconciliación). Va acá,
+    # al final, porque necesita el ledger ya cuadrado y las asociaciones nuevas
+    # de esta corrida. Solo toca cuotas que tocó el pipeline (`fecha_cruce`):
+    # lo que trae el Excel del proceso manual no se pisa.
+    asociaciones_por_llave_final: dict[str, list[dict]] = {}
+    for a in asociaciones_finales:
+        asociaciones_por_llave_final.setdefault(a['llave'], []).append(a)
+
+    # Una cuota que se cubrió en ESTA corrida todavía no tiene `fecha_cruce` ni
+    # `valor_pago` en memoria: los trae la fila que se acaba de escribir. Sin
+    # mirar ahí, el ajuste se saltaría justo los casos nuevos y solo aparecería
+    # en la corrida siguiente.
+    cierre_por_id = {f['id']: f for f in actualizaciones_cierre if f.get('id') is not None}
+
+    def _campo_final(cuota: dict, nombre: str):
+        fin = cierre_por_id.get(cuota['id'])
+        if fin is not None and nombre in fin:
+            return fin[nombre]
+        return cuota.get(nombre)
+
+    sync_valor_pago = []
+    for llave, asocs in asociaciones_por_llave_final.items():
+        cuota_id = id_por_llave.get(llave)
+        if cuota_id is None or llave in llaves_cerradas_manual:
+            continue
+        cuota = next((c for c in cuotas_rows if c['id'] == cuota_id), None)
+        if not cuota or not _campo_final(cuota, 'fecha_cruce'):
+            continue
+        visible = _valor_pago_visible(llave, asocs, llaves_vigentes_por_pago)
+        actual = _campo_final(cuota, 'valor_pago')
+        if actual is not None and round(float(actual), 2) == visible:
+            continue
+        sync_valor_pago.append({'id': cuota_id, 'valor_pago': visible})
+        cuota['valor_pago'] = visible
+    if sync_valor_pago:
+        upsert_cartera_preventiva(supabase_url, srk, sync_valor_pago)
+        log.info('Valor pago: %d cuota(s) ajustadas al monto que entró por su pago.',
+                  len(sync_valor_pago))
+
     # ── Notificación de plata sin repartir (23 de julio, punto #2) ─────────
     # Es un aviso VIVO, no un texto que se escribe una vez: se recalcula
     # entero en cada corrida y se limpia cuando deja de aplicar.
@@ -1621,7 +1718,17 @@ def main():
         # cuando el pago cerró dos o más (caso 16079640: cerró la de junio y
         # la de julio y dejó $4.090.910 sueltos — "PAGA CINCO CUOTAS" cuando
         # la persona pagó seis).
-        cubiertas = len(llaves_vigentes_por_pago.get(mk) or []) or 1
+        #
+        # Y si no cerró NINGUNA no se avisa nada (3 de agosto): el texto habla
+        # de un pago que pagó cuotas, y un pago descartado o que nunca se
+        # aplicó no pagó ninguna. Antes esto contaba 1 de todos modos (`or 1`)
+        # y salía un fantasma — caso 1022389618: la cuota la pagó exacto el
+        # pago del 2 de agosto, y encima decía "PAGA DOS CUOTAS" por un pago
+        # de julio que ya se había descartado de esa misma cuota. La plata
+        # sigue viéndose donde corresponde, en el saldo a favor.
+        cubiertas = len(llaves_vigentes_por_pago.get(mk) or [])
+        if not cubiertas:
+            continue
         etiqueta = _etiqueta_notificacion(_saldo_a_cobrar(cuota_destino),
                                            acum['disponible'], cubiertas)
         if etiqueta:
