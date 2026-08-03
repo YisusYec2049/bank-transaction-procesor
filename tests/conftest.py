@@ -152,6 +152,64 @@ def mundo(monkeypatch):
 
 
 @pytest.fixture
+def mundo_filtrable(monkeypatch):
+    """Como el fixture `mundo`, pero respetando los filtros de PostgREST.
+
+    Es lo que hace la prueba honesta: si el fake ignorara los filtros, el modo
+    puntual vería el mundo completo y la comparación pasaría siempre, sin haber
+    probado nada.
+    """
+    def correr(tablas: dict, solo: str | None = None) -> dict:
+        import cruzar as modulo
+        argv = ['modulo.py'] + (['--solo', solo] if solo else [])
+        monkeypatch.setattr(sys, 'argv', argv)
+        for clave, valor in {
+            'SUPABASE_URL': 'https://falso.supabase.co',
+            'SUPABASE_SERVICE_ROLE_KEY': 'k',
+            'GOOGLE_SA_JSON': '', 'WOMPI_REPORTE_DRIVE_FOLDER_ID': '',
+        }.items():
+            monkeypatch.setenv(clave, valor)
+
+        lecturas = []
+
+        def _select(_url, _srk, tabla, select=None, filtros=None, **_kw):
+            filas = [dict(f) for f in tablas.get(tabla, [])]
+            lecturas.append((tabla, len(filas), filtros))
+            for columna, condicion in (filtros or {}).items():
+                if condicion.startswith('eq.'):
+                    esperado = condicion[3:]
+                    filas = [f for f in filas if str(f.get(columna, '')) == esperado]
+                elif condicion.startswith('like.'):
+                    prefijo = condicion[5:].rstrip('*')
+                    filas = [f for f in filas if str(f.get(columna, '')).startswith(prefijo)]
+            return filas
+
+        monkeypatch.setattr(modulo, 'select_all', _select)
+
+        capturado: dict[str, list] = {}
+
+        def _capturar(destino):
+            def escribir(*args, **_kw):
+                filas = args[-1] if args else []
+                capturado.setdefault(destino, []).extend(
+                    filas if isinstance(filas, list) else [filas])
+            return escribir
+
+        for nombre, destino in [('upsert_cruce', 'cruce_cartera'),
+                                ('upsert_pagos_apartados', 'pagos_apartados'),
+                                ('update_cruce_valores', 'cruce_update'),
+                                ('update_consolidated_campos', 'consolidated_update')]:
+            monkeypatch.setattr(modulo, nombre, _capturar(destino))
+        monkeypatch.setattr(modulo, 'delete_by_keys', lambda *a, **k: None)
+
+        modulo.main()
+        capturado['_lecturas'] = lecturas
+        return capturado
+
+    return correr
+
+
+@pytest.fixture
 def snapshot():
     """Compara un resultado contra el guardado. El corazón de la caracterización.
 
