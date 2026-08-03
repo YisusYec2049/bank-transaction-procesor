@@ -248,3 +248,116 @@ def test_corregir_el_incp_a_mano_dirige_el_pago_a_la_cuota_correcta(mundo):
         'el cruce a la inversa quedó vacío: en pantalla seguiría pareciendo '
         'que el pago no llegó a ninguna cuota'
     )
+
+
+# ── Pagos anteriores a la carga de cartera activa (3 de agosto) ────────────
+#
+# Regla del usuario: la carga de cartera es LA oportunidad. Lo que no encontró
+# cuota ese día deja de aplicarse solo y queda para que una persona lo asocie.
+# Nace del caso 1020838689: un pago del 16 de julio, de un ciclo de cartera
+# anterior, se aplicó solo el 3 de agosto y se mezcló con el pago que sí
+# correspondía.
+
+def _carga(fecha_utc: str, estado: str = 'activa'):
+    return {'fecha': fecha_utc, 'estado': estado}
+
+
+def _hoy_bogota() -> str:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    return datetime.now(ZoneInfo('America/Bogota')).strftime('%Y-%m-%d')
+
+
+def test_un_pago_anterior_a_la_carga_no_se_aplica_solo(mundo):
+    """El caso reportado. La cartera se cargó el 30 de julio y el pago es del
+    16: hoy ya no es el día de la carga, así que no se toca la cuota."""
+    capturado = mundo(ccp, tablas={
+        'cartera_cargas': [_carga('2026-07-30T15:23:32+00:00')],
+        'cartera_preventiva': [_cuota('INS1-A', 'INS1', '1002003004', 136_361, '2026-10-19')],
+        'cruce_cartera': [_pago_cruzado('PAGO-VIEJO', '1002003004', 'INS1',
+                                        11_561, fecha='2026-07-16')],
+    })
+
+    assert not capturado.get('pago_asociaciones'), (
+        'un pago de un ciclo de cartera anterior se aplicó solo'
+    )
+    assert 'INS1-A' not in _por_llave(capturado), 'la cuota no debía tocarse'
+
+
+def test_un_pago_posterior_a_la_carga_se_aplica_normal(mundo):
+    """La contraparte, con el MISMO mundo: lo único que cambia es la fecha del
+    pago. Sin esta prueba, la regla podría estar bloqueando todo."""
+    capturado = mundo(ccp, tablas={
+        'cartera_cargas': [_carga('2026-07-30T15:23:32+00:00')],
+        'cartera_preventiva': [_cuota('INS2-A', 'INS2', '1002003005', 136_361, '2026-10-19')],
+        'cruce_cartera': [_pago_cruzado('PAGO-NUEVO', '1002003005', 'INS2',
+                                        136_361, fecha='2026-07-31')],
+    })
+
+    cuota = _por_llave(capturado).get('INS2-A')
+    assert cuota is not None, 'un pago posterior a la carga no se aplicó'
+    assert float(cuota['valor_pago']) == 136_361
+
+
+def test_el_dia_de_la_carga_si_entran_los_pagos_viejos(mundo):
+    """El flujo normal del cambio de cartera: llega la cartera del mes y la
+    plata de las semanas previas se acomoda ese día. Medido en producción — el
+    30 de julio se aplicaron así 118 pagos. Si esta prueba se cae, la regla se
+    comió el cambio de cartera entero."""
+    capturado = mundo(ccp, tablas={
+        'cartera_cargas': [_carga(f'{_hoy_bogota()}T15:23:32+00:00')],
+        'cartera_preventiva': [_cuota('INS3-A', 'INS3', '1002003006', 500_000, '2026-10-19')],
+        'cruce_cartera': [_pago_cruzado('PAGO-VIEJO', '1002003006', 'INS3',
+                                        500_000, fecha='2026-07-16')],
+    })
+
+    cuota = _por_llave(capturado).get('INS3-A')
+    assert cuota is not None, (
+        'el día de la carga no se aplicó un pago viejo: se rompe el cambio de cartera'
+    )
+
+
+def test_una_cuota_corta_muestra_su_deuda_aunque_tenga_saldo_a_favor_encima(mundo):
+    """Caso 1020838689. A una cuota cubierta por dos pagos se le descartó uno:
+    la plataforma dejó `valor_pago` en lo que quedó aplicado y en `diferencia`
+    un número POSITIVO (el saldo a favor del cliente). La cuota quedaba
+    debiendo $11.561 y en pantalla decía "saldo a favor $275.200".
+
+    El pase de reconciliación se saltaba la fila porque `valor_pago` ya
+    coincidía con lo asociado. Ahora también mira si la cuota está corta."""
+    capturado = mundo(ccp, tablas={
+        'cartera_cargas': [_carga(f'{_hoy_bogota()}T15:23:32+00:00')],
+        'cartera_preventiva': [
+            _cuota('INS4-A', 'INS4', '1002003007', 136_361, '2026-10-19',
+                   fecha_pago='2026-07-31', valor_pago=124_800,
+                   fecha_cruce='2026-08-03', diferencia=275_200),
+        ],
+        'pago_asociaciones': [
+            {'id': 9001, 'matching_key': 'PAGO-GRANDE', 'llave': 'INS4-A',
+             'monto': 124_800, 'origen': 'automatico'},
+        ],
+        'cartera_saldos_favor': [
+            {'id': 9101, 'matching_key': 'PAGO-GRANDE', 'llave_origen': 'INS4-A', 'monto': 275_200,
+             'disponible': 275_200, 'aplicado': False, 'origen': 'sobrante',
+             'documento': '1002003007', 'correo': 'alguien@example.com',
+             'inscrip': 'INS4', 'cliente': 'PERSONA DE PRUEBA', 'fecha': '2026-07-31'},
+        ],
+        'cruce_cartera': [_pago_cruzado('PAGO-GRANDE', '1002003007', 'INS4',
+                                        400_000, fecha='2026-07-31')],
+    })
+
+    # Una cuota se escribe en varias pasadas (cierre, saldo a favor,
+    # notificación) y cada una manda solo sus columnas. Lo que queda en la base
+    # es la acumulación, así que se juntan para leer la fila como se vería.
+    fila = {}
+    for f in capturado.get('cartera_preventiva', []):
+        if f.get('id') == _id_de('INS4-A'):
+            fila.update(f)
+    assert fila.get('diferencia') is not None, (
+        'la cuota corta no se recalculó: la fila conserva la diferencia '
+        'positiva que dejó el descarte, o sea "saldo a favor" sobre una deuda'
+    )
+    assert float(fila['diferencia']) == -11_561, (
+        f"la cuota debe $11.561 y la fila dice {fila['diferencia']}: "
+        'en pantalla parecería que sobra plata donde falta'
+    )

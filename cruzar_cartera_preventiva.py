@@ -1102,9 +1102,31 @@ def main():
         if not asociaciones_cuota:
             continue
         suma = round(sum(a['monto'] for a in asociaciones_cuota), 2)
+        # Idempotencia: si la cuota ya refleja esta suma no hay nada que
+        # hacer... salvo que esté DEBIENDO y su `diferencia` no lo diga.
+        #
+        # Caso real (3 de agosto, doc 1020838689): a una cuota cubierta por
+        # dos pagos se le descartó uno. fin-platform dejó `valor_pago` en lo
+        # que quedó aplicado —correcto— y en `diferencia` la suma de los
+        # saldos a favor del cliente, o sea un número POSITIVO. Mirando solo
+        # `valor_pago` esta pasada se saltaba la fila, y la cuota quedaba
+        # debiendo $11.561 mostrando "saldo a favor $275.200": la pantalla
+        # decía que sobraba plata justo donde faltaba, y por eso tampoco
+        # ofrecía asociarla.
+        #
+        # Solo se fuerza el recálculo cuando la cuota está CORTA. Si está
+        # cubierta, la `diferencia` positiva es el saldo a favor sin repartir
+        # y la escribe su propia pasada (§3.3.2) — pisarla acá la borraría en
+        # cada corrida.
+        faltante = round(_saldo_a_cobrar(cuota) - suma, 2)
+        diferencia_actual = cuota.get('diferencia')
+        refleja_faltante = faltante <= 0 or (
+            diferencia_actual is not None
+            and round(float(diferencia_actual), 2) == -faltante)
         valor_pago_actual = cuota.get('valor_pago')
         if (cuota.get('fecha_cruce') and valor_pago_actual is not None
-                and round(float(valor_pago_actual), 2) == suma):
+                and round(float(valor_pago_actual), 2) == suma
+                and refleja_faltante):
             continue  # ya refleja esta suma, nada que hacer (idempotencia)
 
         ultimo_pago = _pago_mas_reciente(asociaciones_cuota, pagos_por_matching_key)
@@ -1116,6 +1138,11 @@ def main():
         cuota['valor_pago']      = suma
         cuota['fecha_pago']      = fila.get('fecha_pago')
         cuota['fecha_cruce']     = hoy
+        # El cierre reescribe `notificacion`; sin reflejarlo en memoria, la
+        # pasada de avisos compara contra el valor viejo, cree que ya está
+        # puesto y no lo vuelve a escribir — la fila queda sin aviso hasta la
+        # corrida siguiente, que lo repone. Oscilaba entre dos corridas.
+        cuota['notificacion']    = fila.get('notificacion')
         # El recálculo deshace el cierre: si a la cuota se le descartó un
         # pago, no puede seguir marcada como pagada (punto #1).
         cuota['pago']            = fila['pago']
@@ -1251,19 +1278,68 @@ def main():
         cartera que está activa hoy."""
         return pago['matching_key'] in matching_keys_reaplicables
 
+    def _viejo_sin_oportunidad(pago: dict) -> bool:
+        """¿Es un pago que ya estaba disponible cuando se cargó la cartera
+        activa y no se aplicó ese día?
+
+        REGLA DEL USUARIO (3 de agosto): la carga de cartera es LA
+        oportunidad. Llega la cartera del mes, la plata de las semanas previas
+        se acomoda ese día, y lo que no encontró cuota entonces deja de
+        aplicarse solo — queda para que una persona lo asocie.
+
+        Nace de un caso real (doc 1020838689): un pago del 16 de julio, de un
+        ciclo de cartera anterior, se aplicó solo el 3 de agosto sobre una
+        cuota de la cartera de agosto, mezclándose con el pago que sí
+        correspondía. El área lo reportó como error, y con razón: qué se hace
+        con la plata de una cartera vieja lo decide una persona.
+
+        NO reemplaza a `_reaplicable`, que mira otra cosa: aquél bloquea lo
+        que YA se repartió bajo una cartera anterior; éste bloquea lo que
+        NUNCA se repartió y se quedó atrás. Hasta hoy ese caso entraba siempre
+        (excepción deliberada del 28 de julio, para que la plata no se
+        perdiera). Sigue sin perderse: el pago queda en `cruce_cartera` como
+        `cruzado`, visible con el filtro "Sin cruce con Cartera Preventiva", y
+        se asocia a mano desde financial-platform.
+
+        Medido antes de escribirla, contra todo lo que el pipeline repartió:
+        el día de la carga (30 de julio) se aplicaron 118 pagos anteriores a
+        esa fecha —el flujo normal, que esta regla no toca porque solo actúa
+        DESPUÉS del día de carga— y los repartos del 31 de julio (38) y del 3
+        de agosto (102) son todos de pagos posteriores a la carga. Cero daño
+        colateral; frenaba exactamente el caso reportado.
+
+        Se compara contra el día de la CARGA ACTIVA, no contra una ventana de
+        días, por el mismo motivo que `_reaplicable`: es el dato exacto y ya
+        está guardado en `cartera_cargas`."""
+        if hoy == dia_carga_activa:
+            return False            # el día de la carga se acomoda todo
+        fecha = pago.get('payment_date')
+        if not fecha:
+            return False            # sin fecha no se bloquea nada
+        return str(fecha) < dia_carga_activa
+
     pagos_nuevos = [
         p for p in pagos_cruzados
         if p['matching_key'] not in matching_keys_asociados
         and p['matching_key'] not in matching_keys_en_ledger
         and p['matching_key'] not in matching_keys_en_excel
         and (p['matching_key'] not in matching_keys_archivados or _reaplicable(p))
+        and not _viejo_sin_oportunidad(p)
     ]
     bloqueados = sum(1 for p in pagos_cruzados
                      if p['matching_key'] in matching_keys_archivados and not _reaplicable(p))
+    viejos_frenados = sum(1 for p in pagos_cruzados
+                          if p['matching_key'] not in matching_keys_asociados
+                          and p['matching_key'] not in matching_keys_en_ledger
+                          and p['matching_key'] not in matching_keys_en_excel
+                          and _viejo_sin_oportunidad(p))
     log.info('%d pagos cruzados totales, %d nuevos (sin asociación/ledger previo). '
               '%d bloqueados por venir aplicados de una cartera anterior '
               '(carga activa del %s).',
               len(pagos_cruzados), len(pagos_nuevos), bloqueados, dia_carga_activa)
+    if viejos_frenados:
+        log.info('%d pago(s) anteriores a la carga activa NO se auto-aplican '
+                  '(quedan para asociación manual).', viejos_frenados)
 
     # §4.1/4.2: cuotas pendientes = sin pago identificado, sin cierre manual
     # y con saldo real por cobrar.
