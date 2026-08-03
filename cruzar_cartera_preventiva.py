@@ -901,13 +901,21 @@ def main():
     # las filas que NO la tienen son las que trae el Excel, y son las únicas
     # que cuentan como memoria del proceso manual.
     log.info('Cargando códigos de pago de carteras archivadas...')
-    codigos_archivo_rows = [
-        r for r in select_all(
-            supabase_url, srk, 'cartera_preventiva_archivo',
-            select='codigo_transaccion_1,fecha_cruce',
-        )
-        if not r.get('fecha_cruce')
-    ]
+    # El filtro lo hace la base, no Python. De esta tabla solo interesan las
+    # filas que traen código y que NO tocó el pipeline (`fecha_cruce` vacía),
+    # y son una fracción: 6.269 de 18.503 el 2026-08-02, que se reducen a
+    # 1.559 códigos distintos.
+    #
+    # Traerlas todas y descartarlas acá costaba 8,7 s de los 18 s de la corrida
+    # — la lectura más cara del script. Filtrando en la base son 3,1 s, con el
+    # mismo conjunto de códigos (verificado). Y la diferencia crece sola: esta
+    # tabla acumula una cartera entera por cada versión archivada, para
+    # siempre, mientras que lo que hace falta leer casi no crece.
+    codigos_archivo_rows = select_all(
+        supabase_url, srk, 'cartera_preventiva_archivo',
+        select='codigo_transaccion_1',
+        filtros={'fecha_cruce': 'is.null', 'codigo_transaccion_1': 'not.is.null'},
+    )
 
     # Llaves que ya pertenecen a una cuota COBRADA (incluidas las líneas
     # partidas que el Excel trae cerradas con su pago anotado).
