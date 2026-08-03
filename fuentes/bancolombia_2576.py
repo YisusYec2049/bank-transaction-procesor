@@ -167,7 +167,7 @@ def parse_pdf(pdf_bytes: io.BytesIO) -> list[dict]:
     with pdfplumber.open(pdf_bytes) as pdf:
         texto = '\n'.join(p.extract_text() or '' for p in pdf.pages)
 
-    lineas   = [l.strip() for l in texto.split('\n') if l.strip()]
+    lineas   = [ln.strip() for ln in texto.split('\n') if ln.strip()]
     en_tabla = False
     i        = 0
     filas    = []

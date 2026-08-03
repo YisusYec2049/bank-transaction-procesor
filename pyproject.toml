@@ -30,6 +30,12 @@ select = [
 ignore = [
     "E501",  # largo de línea: los docstrings-changelog de este repo lo pasan a propósito
     "B008",  # llamada en default de argumento
+    # UP017 propone `datetime.UTC` en vez de `timezone.utc`. Es más corto, pero
+    # existe solo desde Python 3.11 y no está confirmado qué versión corre el
+    # VPS. `timezone.utc` funciona en todas y no cuesta nada; cambiarlo solo
+    # podría romper el despliegue. Se puede quitar este ignore el día que la
+    # versión del VPS esté verificada.
+    "UP017",
 ]
 
 [tool.ruff.lint.per-file-ignores]

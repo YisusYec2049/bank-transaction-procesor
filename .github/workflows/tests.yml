@@ -1,0 +1,38 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # El VPS y este equipo no corren la misma versión de Python. La matriz
+      # existe para enterarse acá y no en producción: `pyproject.toml` declara
+      # 3.11 como mínimo, así que si 3.11 falla, la declaración está mal.
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Linter
+        run: ruff check .
+
+      - name: Pruebas
+        # Sin credenciales a propósito: las pruebas no tocan la red ni la base.
+        # Si alguna necesitara un secreto para pasar, es que dejó de ser una
+        # prueba y se volvió una llamada a producción.
+        run: pytest -q

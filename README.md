@@ -1,5 +1,7 @@
 # matching-test — conciliación de pagos
 
+[![tests](https://github.com/YisusYec2049/bank-transaction-procesor/actions/workflows/tests.yml/badge.svg)](https://github.com/YisusYec2049/bank-transaction-procesor/actions/workflows/tests.yml)
+
 Pipeline en Python que toma los extractos que mandan los bancos y las pasarelas
 de pago, los normaliza a un formato común, y decide **a qué cuota de qué
 inscripción corresponde cada pago**.

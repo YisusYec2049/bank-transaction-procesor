@@ -587,7 +587,7 @@ def _sincronizar_lineas_falta_de_pago(
     updates: list[dict] = []
     a_borrar: list[str] = []
     bases = set(lineas_por_original) | {
-        l['_base'] for l in lineas_nuevas if l.get('_base') in por_llave
+        ln['_base'] for ln in lineas_nuevas if ln.get('_base') in por_llave
     }
     for base in sorted(bases):
         original = por_llave.get(base)
@@ -625,8 +625,8 @@ def _sincronizar_lineas_falta_de_pago(
     # que ya no llega al umbral) no debe llegar a escribirse.
     ya_cubiertas = {b for b in bases if lineas_por_original.get(b)}
     lineas_nuevas[:] = [
-        l for l in lineas_nuevas
-        if l.get('_base') not in ya_cubiertas and l['llave'] not in a_borrar
+        ln for ln in lineas_nuevas
+        if ln.get('_base') not in ya_cubiertas and ln['llave'] not in a_borrar
     ]
     return updates, a_borrar
 
@@ -1372,7 +1372,7 @@ def main():
     if lineas_nuevas:
         insert_cartera_preventiva_lineas(
             supabase_url, srk,
-            [{k: v for k, v in l.items() if not k.startswith('_')} for l in lineas_nuevas])
+            [{k: v for k, v in ln.items() if not k.startswith('_')} for ln in lineas_nuevas])
     if actualizaciones_cierre:
         batch_size = 500
         for i in range(0, len(actualizaciones_cierre), batch_size):
@@ -1413,7 +1413,7 @@ def main():
         if a['llave'] not in vistas:
             vistas.append(a['llave'])
     for vistas in llaves_vigentes_por_pago.values():
-        vistas.sort(key=lambda l: (venc_por_llave.get(l, _FECHA_MAX), l))
+        vistas.sort(key=lambda llave: (venc_por_llave.get(llave, _FECHA_MAX), llave))
 
     # El ledger se agrupa POR PAGO, no fila por fila: un mismo pago puede
     # tener varias filas (su sobrante original más lo que le devuelva un
@@ -1437,7 +1437,7 @@ def main():
             # contradictoria del caso 16079640. Se baja a la anterior que sí
             # tenga el pago; si TODAS están cerradas a mano, se queda en la
             # última antes que dejar la plata invisible.
-            abiertas = [l for l in vigentes if l not in llaves_cerradas_manual]
+            abiertas = [k for k in vigentes if k not in llaves_cerradas_manual]
             destino = (abiertas or vigentes)[-1]
         else:
             destino = acum['llave_origen']
