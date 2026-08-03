@@ -361,3 +361,68 @@ def test_una_cuota_corta_muestra_su_deuda_aunque_tenga_saldo_a_favor_encima(mund
         f"la cuota debe $11.561 y la fila dice {fila['diferencia']}: "
         'en pantalla parecería que sobra plata donde falta'
     )
+
+
+# ── El aviso de plata sin repartir (3 de agosto) ───────────────────────────
+#
+# Regla del usuario: el aviso vive mientras al pago le quede plata sin
+# repartir por encima del umbral, y se para en la última cuota a la que se le
+# asignó. Antes era todo o nada: repartir un peso lo apagaba entero.
+
+def _mundo_con_saldo(disponible: float, monto: float = 275_200):
+    """Una cuota de $136.361 cubierta por un pago que dejó `monto` de sobrante,
+    del cual ya se repartió lo que falte hasta `disponible`.
+
+    El monto del pago se deriva para que la plata CUADRE (lo aplicado + lo
+    disponible == lo que entró); si no, el chequeo de cuadre del propio
+    pipeline llena el log de errores y un descuadre de verdad pasaría
+    desapercibido entre ellos."""
+    return {
+        'cartera_cargas': [_carga(f'{_hoy_bogota()}T15:23:32+00:00')],
+        'cartera_preventiva': [
+            _cuota('INS5-A', 'INS5', '1002003008', 136_361, '2026-10-19',
+                   fecha_pago='2026-07-31', valor_pago=136_361,
+                   fecha_cruce='2026-08-03', diferencia=disponible),
+        ],
+        'pago_asociaciones': [
+            {'id': 9201, 'matching_key': 'PAGO-GRANDE', 'llave': 'INS5-A',
+             'monto': 136_361, 'origen': 'automatico'},
+        ],
+        'cartera_saldos_favor': [
+            {'id': 9301, 'matching_key': 'PAGO-GRANDE', 'llave_origen': 'INS5-A',
+             'monto': monto, 'disponible': disponible, 'aplicado': False,
+             'origen': 'sobrante', 'documento': '1002003008',
+             'correo': 'alguien@example.com', 'inscrip': 'INS5',
+             'cliente': 'PERSONA DE PRUEBA', 'fecha': '2026-07-31'},
+        ],
+        'cruce_cartera': [_pago_cruzado('PAGO-GRANDE', '1002003008', 'INS5',
+                                        136_361 + disponible, fecha='2026-07-31')],
+    }
+
+
+def _notificacion_de(capturado, llave):
+    valor = '__sin_escribir__'
+    for f in capturado.get('cartera_preventiva', []):
+        if f.get('id') == _id_de(llave) and 'notificacion' in f:
+            valor = f['notificacion']
+    return valor
+
+
+def test_el_aviso_sigue_aunque_se_haya_repartido_una_parte(mundo):
+    """Caso 1020838689: de $275.200 se asignaron $11.561 y el aviso se apagaba
+    con $263.639 —casi dos cuotas— todavía sin repartir."""
+    capturado = mundo(ccp, tablas=_mundo_con_saldo(263_639))
+
+    assert _notificacion_de(capturado, 'INS5-A') == '2 CUOTAS + ABONO', (
+        'el aviso se apagó teniendo $263.639 sin repartir'
+    )
+
+
+def test_el_aviso_se_apaga_cuando_lo_que_queda_no_vale_la_pena(mundo):
+    """El umbral de $1.000 sigue mandando: un resto de redondeo no avisa.
+    Sin esta prueba, quitar el "todo o nada" podría dejar avisos por $2."""
+    capturado = mundo(ccp, tablas=_mundo_con_saldo(500, monto=500))
+
+    assert _notificacion_de(capturado, 'INS5-A') in (None, '__sin_escribir__'), (
+        'avisó por $500, que es ruido de redondeo'
+    )

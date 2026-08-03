@@ -1580,22 +1580,27 @@ def main():
     # Es un aviso VIVO, no un texto que se escribe una vez: se recalcula
     # entero en cada corrida y se limpia cuando deja de aplicar.
     #
-    # Regla del usuario: mientras el sobrante de un pago siga ENTERO y sin
-    # asignar, la cuota que recibió ese pago avisa cuánto pagó la persona
-    # medido en cuotas. En cuanto alguien reparte una parte —así sea una
-    # sola— el texto desaparece y queda solo el saldo a favor actualizado.
+    # Regla del usuario (3 de agosto — REEMPLAZA la del 23 de julio): el aviso
+    # vive mientras al pago le quede plata sin repartir por encima del umbral,
+    # y se para en la ÚLTIMA cuota a la que se le asignó. Se mide sobre lo que
+    # QUEDA (`disponible`), así que si se asigna una parte el texto no
+    # desaparece: baja el número.
     #
-    # Los tres casos que pidió cubrir salen de la misma regla, sin código
-    # aparte: se asigna parte del saldo → `disponible` baja y el texto se va;
-    # se asigna todo → igual; el pago se repartió entre dos cuotas y a una se
-    # le descarta → esa parte vuelve a ser plata sin repartir (fila
-    # `origen='descarte'` en el ledger) y el texto se muda solo a la cuota que
-    # conservó el pago, la misma donde queda el saldo a favor (ver el bloque
-    # de arriba: los dos usan `destino_por_pago`).
+    # Antes era todo o nada — apenas se repartía un peso, la fila dejaba de
+    # avisar aunque quedara casi todo. Caso que lo destapó (doc 1020838689):
+    # de $275.200 de sobrante se asignaron $11.561 a la propia cuota y el
+    # aviso se apagaba con $263.639 —casi dos cuotas— todavía sin repartir.
+    # El umbral de $1.000 sigue siendo el que decide si vale la pena avisar,
+    # así que un resto de redondeo sigue sin generar ruido.
+    #
+    # El destino ya era reactivo desde el 28 de julio: si al pago se le
+    # descarta una cuota, el texto se muda solo a la que lo conservó, que es
+    # la misma donde se muestra el saldo a favor (los dos usan
+    # `destino_por_pago`).
     etiqueta_por_llave: dict[str, str] = {}
     for mk, acum in saldo_por_pago.items():
-        if acum['monto'] <= 0 or acum['disponible'] < acum['monto']:
-            continue  # ya se repartió algo: no se avisa nada
+        if acum['disponible'] <= 0:
+            continue  # no queda nada sin repartir: no hay nada que avisar
         destino = destino_por_pago.get(mk)
         cuota_id = id_por_llave.get(destino) if destino else None
         if cuota_id is None:
