@@ -56,11 +56,16 @@ def test_un_pago_ya_cruzado_SIN_cambios_sigue_sin_tocarse(mundo_filtrable):
     )
 
 
-def test_desmarcar_un_pago_apartado_lo_devuelve_al_cruce(mundo_filtrable):
-    """El caso de "Desmarcar" en Pagos Apartados.
+def test_guardar_el_incp_de_un_pago_apartado_lo_devuelve_al_cruce(mundo_filtrable):
+    """El caso de "Guardar INCP" en Pagos Apartados.
 
-    Un pago apartado está fuera del cruce. Al desmarcarlo con un INCP resuelto
-    tiene que volver, y cerrar con ese INCP forzado sin recalcularlo por lookup.
+    El pago **sigue apartado** (la fila no se borra): lo único que cambia es que
+    alguien le escribió el INCP a mano. Con eso tiene que volver al cruce y
+    cerrar con ese INCP forzado, sin recalcularlo por lookup.
+
+    ("Desmarcar" es el otro botón y borra la fila de `pagos_apartados`; ese caso
+    lo cubre el invariante de `test_modo_puntual`, porque el pago queda igual a
+    cualquier otro.)
     """
     mundo = {
         'consolidated_transactions': [_pago('PAGO-1', identification='1002003004')],
@@ -72,11 +77,49 @@ def test_desmarcar_un_pago_apartado_lo_devuelve_al_cruce(mundo_filtrable):
     fila = _fila(mundo_filtrable(mundo, solo='PAGO-1'), 'PAGO-1')
 
     assert fila is not None, (
-        'el modo puntual no reintegró el pago apartado: "Desmarcar" se quedaría '
-        'sin efecto hasta la corrida del día siguiente'
+        'el modo puntual no reintegró el pago apartado: "Guardar INCP" se '
+        'quedaría sin efecto hasta la corrida del día siguiente'
     )
     assert fila['incp'] == '9999PN', 'no respetó el INCP puesto a mano'
     assert fila['estado_cruce'] == 'cruzado'
+
+
+def test_guardar_una_correccion_manual_no_la_pisa(mundo_filtrable):
+    """El caso de "Guardar corrección" (INCP/Correo(2)) en Excepciones.
+
+    Era el único de los tres que nadie había medido, y el que más miedo daba:
+    la app deja la fila `cruzado` + `corregido_manual` **antes** de disparar el
+    reproceso, así que si el modo puntual la volviera a cruzar por lookup,
+    borraría lo que acabó de escribir una persona.
+
+    Lo correcto es que `cruzar.py` **no la toque** (es terminal y el documento
+    no cambió) y que el recálculo real lo haga la cartera preventiva, que corre
+    completa igual. Se comprueba contra la corrida completa para que la
+    afirmación sea "hace lo mismo", no solo "no escribe".
+    """
+    mundo = {
+        'consolidated_transactions': [
+            _pago('PAGO-1', identification='1002003004', email='ana@x.com'),
+        ],
+        # El documento SÍ está en cartera y resolvería a otro INCP por lookup:
+        # si el modo puntual recruzara, pisaría la corrección con '4321PN'.
+        'cartera_inscrip': [{'numero_id': '1002003004', 'id_inscripcion': '4321PN'}],
+        'cruce_cartera': [{'matching_key': 'PAGO-1', 'estado_cruce': 'cruzado',
+                           'incp': 'PUESTO-A-MANO', 'correo_2': 'PUESTO-A-MANO',
+                           'corregido_manual': True,
+                           'identification': '1002003004'}],
+    }
+
+    puntual = _fila(mundo_filtrable(mundo, solo='PAGO-1'), 'PAGO-1')
+    completo = _fila(mundo_filtrable(mundo), 'PAGO-1')
+
+    assert puntual is None, (
+        'el modo puntual reescribió una fila corregida a mano: "Guardar '
+        'corrección" perdería el INCP que acaba de poner una persona'
+    )
+    assert puntual == completo, (
+        'el modo puntual no se comporta igual que la corrida completa'
+    )
 
 
 def test_un_pago_apartado_sin_resolver_sigue_fuera_del_cruce(mundo_filtrable):
