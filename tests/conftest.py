@@ -110,6 +110,11 @@ def mundo(monkeypatch):
         def _select(_url, _srk, tabla, select=None, **_kw):
             return [dict(f) for f in tablas.get(tabla, [])]
 
+        # Que no se cuele el .env de la máquina: en CI no existe, y una prueba
+        # que pasa solo en el equipo de quien la escribió no sirve de nada.
+        if hasattr(modulo, 'load_dotenv'):
+            monkeypatch.setattr(modulo, 'load_dotenv', lambda *_a, **_k: None)
+
         monkeypatch.setattr(modulo, 'select_all', _select)
 
         capturado: dict[str, list] = {}

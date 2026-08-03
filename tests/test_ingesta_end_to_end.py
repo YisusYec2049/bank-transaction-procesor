@@ -58,9 +58,17 @@ def bandeja(monkeypatch):
             'GOOGLE_SA_JSON': '/dev/null',
         }.items():
             monkeypatch.setenv(clave, valor)
-        # Cada banco lee su carpeta de un id propio en el entorno.
-        for var in ('BC2576_INBOX_FOLDER_ID', 'BC2576_HIST_FOLDER_ID'):
+        # Cada banco lee su bandeja y su Histórico de un id propio en el
+        # entorno. Los nombres importan: la primera versión de este test usaba
+        # `..._HIST_...` en vez de `..._HISTORICO_...` y pasaba igual, porque el
+        # `.env` de la máquina traía el nombre bueno. Falló recién en CI, donde
+        # no hay `.env` — de ahí el `load_dotenv` neutralizado más abajo.
+        for var in ('BC2576_INBOX_FOLDER_ID', 'BC2576_HISTORICO_FOLDER_ID'):
             monkeypatch.setenv(var, 'carpeta')
+
+        # Nada de leer el .env real: una prueba que depende del entorno de quien
+        # la corre no prueba lo mismo en dos máquinas.
+        monkeypatch.setattr(procesar_todos, 'load_dotenv', lambda *_a, **_k: None)
 
         monkeypatch.setattr(procesar_todos, '_build_services', lambda: 'drive')
         monkeypatch.setattr(procesar_todos, 'list_files',
