@@ -179,3 +179,72 @@ def test_pago_sin_cuotas_pendientes_no_rompe_nada(mundo):
     })
 
     assert not capturado.get('pago_asociaciones')
+
+
+# ── El pago que se queda atrapado en la inscripción equivocada ───────────────
+#
+# Caso real reportado el 3 de agosto de 2026 (doc 1090462164, Dany Yurley):
+# una persona tiene DOS inscripciones —una en Access y otra en el sistema
+# nuevo— y el pago cruzó contra la que NO debe nada. La plata se queda quieta:
+# en Cruce de Cartera el pago se ve perfecto y en Cartera Preventiva la cuota
+# sigue diciendo "sin pago identificado". Nadie las une, y nada lo señala.
+#
+# Medido en producción ese día: 7 pagos, $6.795.184. No es solo "Access contra
+# sistema nuevo" — 2 de los 7 van al revés.
+
+
+def test_un_pago_no_paga_cuotas_de_otra_inscripcion_del_mismo_documento(mundo):
+    """Retrata el problema, no lo corrige.
+
+    La regla es deliberada (16 de julio): un pago solo cubre cuotas de SU
+    inscripción, para que la plata no caiga en el programa equivocado. El
+    efecto secundario es este caso, y por eso hace falta una salida manual.
+    """
+    capturado = mundo(ccp, tablas={
+        # La deuda vive en la inscripción de Access.
+        'cartera_preventiva': [_cuota('40313-A', '40313', '1090462164',
+                                      1_050_000, '2026-07-15')],
+        # El pago cruzó contra la del sistema nuevo, que no debe nada.
+        'cruce_cartera': [_pago_cruzado('PAGO-1', '1090462164', '4052PN', 1_050_000)],
+    })
+
+    assert not capturado.get('pago_asociaciones'), (
+        'el pago se aplicó a una inscripción que no es la suya'
+    )
+    assert '40313-A' not in _por_llave(capturado), 'la cuota no debería haberse tocado'
+
+
+def test_corregir_el_incp_a_mano_dirige_el_pago_a_la_cuota_correcta(mundo):
+    """La salida que pidió el usuario: corregir el INCP desde la plataforma.
+
+    Con el INCP apuntando a la inscripción que de verdad debe, la cascada
+    normal hace el resto — no hace falta ninguna regla nueva en el pipeline.
+
+    Comprueba además lo que el usuario preguntó expresamente: que el **cruce a
+    la inversa** quede lleno. Se calcula sobre la cuota que el pago cubrió de
+    verdad, no comparando el INCP con la inscripción, así que un INCP corregido
+    a mano cuenta igual que uno resuelto por el sistema.
+    """
+    capturado = mundo(ccp, tablas={
+        'cartera_preventiva': [_cuota('40313-A', '40313', '1090462164',
+                                      1_050_000, '2026-07-15')],
+        # Lo único que cambia respecto de la prueba anterior: el INCP corregido.
+        'cruce_cartera': [_pago_cruzado('PAGO-1', '1090462164', '40313', 1_050_000)],
+    })
+
+    cuota = _por_llave(capturado).get('40313-A')
+    assert cuota is not None, 'la cuota no se saldó con el INCP corregido'
+    assert float(cuota['valor_pago']) == 1_050_000
+    assert cuota['fecha_cruce'] is not None
+
+    assert any(a['matching_key'] == 'PAGO-1' and a['llave'] == '40313-A'
+               for a in capturado.get('pago_asociaciones', [])), (
+        'no quedó registro de qué cuota cubrió el pago'
+    )
+
+    inverso = {u['matching_key']: u.get('cruce')
+               for u in capturado.get('cruce_cartera_update', [])}
+    assert inverso.get('PAGO-1'), (
+        'el cruce a la inversa quedó vacío: en pantalla seguiría pareciendo '
+        'que el pago no llegó a ninguna cuota'
+    )
