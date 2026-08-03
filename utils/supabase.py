@@ -1,7 +1,7 @@
 """Cliente Supabase: upsert a consolidated_transactions."""
 
 import logging
-from datetime import datetime
+from datetime import date, datetime
 
 import pytz
 import requests
@@ -151,6 +151,52 @@ def existing_matching_keys(supabase_url: str, service_role_key: str, keys: list[
         _raise_for_status(resp)
         encontrados.update(r['matching_key'] for r in resp.json())
     return encontrados
+
+
+def keys_del_dia_anterior(supabase_url: str, service_role_key: str) -> set[str]:
+    """Llaves de los pagos que entraron el último día con actividad **antes de
+    hoy**. Es la lista contra la que se deduplica lo que llega.
+
+    Reemplaza a la lectura del tab de ayer del CONSOLIDADO en Google Sheets, y
+    reproduce su semántica: un tab de ese archivo contenía justo los pagos
+    escritos ese día, que es lo mismo que `registration_date`.
+
+    **No se usa "todo el histórico", y la diferencia importa.** Esta lista
+    alimenta la numeración de pagos repetidos (`(pago 2)`), que se asigna por
+    POSICIÓN dentro del archivo para que reprocesarlo dé siempre las mismas
+    llaves. Si se filtrara contra todo lo ya registrado, al reprocesar un
+    archivo desaparecerían las filas de arriba y las de abajo se renumerarían:
+    el mismo pago entraría de nuevo con otra identidad.
+
+    Comparado contra los tabs reales del 2026-08-02: coincide exacto salvo por
+    los pagos de Stripe, cuyo export es acumulado y reaparecía en el tab de un
+    día posterior al de su ingreso. Ahí la diferencia es cosmética — vuelven a
+    escribirse sobre su propia llave, sin duplicar nada.
+    """
+    # Consulta directa y no `select_all`: acá se quiere UNA fila, y `select_all`
+    # pagina con cabeceras Range que chocan con `limit` (PostgREST responde 416).
+    resp = http.get(
+        f'{supabase_url}/rest/v1/consolidated_transactions',
+        params={'select': 'registration_date',
+                'registration_date': f'lt.{date.today().isoformat()}',
+                'order': 'registration_date.desc',
+                'limit': '1'},
+        headers=_headers(service_role_key),
+        timeout=30,
+    )
+    _raise_for_status(resp)
+    ultimo = resp.json()
+    if not ultimo:
+        log.warning('No hay ingresos anteriores a hoy: se omite la dedup histórica.')
+        return set()
+
+    dia = ultimo[0]['registration_date']
+    filas = select_all(
+        supabase_url, service_role_key, 'consolidated_transactions',
+        select='matching_key', filtros={'registration_date': f'eq.{dia}'},
+    )
+    log.info('Dedup contra el último día con ingresos: %s (%d llaves).', dia, len(filas))
+    return {str(f['matching_key']).strip() for f in filas if f.get('matching_key')}
 
 
 def _headers(service_role_key: str, prefer: str | None = None) -> dict:

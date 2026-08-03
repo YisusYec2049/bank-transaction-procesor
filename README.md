@@ -129,8 +129,8 @@ Está pensado para comparar dos corridas con `diff`: si el archivo sale idéntic
 el cambio no movió ningún dato. Es la verificación que se usó para la escritura
 en lote — 107 filas, idénticas antes y después.
 
-El interruptor vive en las tres puertas al exterior (`utils/supabase.py`,
-`utils/drive.py`, `utils/sheets.py`), no en cada llamada. Así ninguna escritura
+El interruptor vive en las dos puertas al exterior (`utils/supabase.py`,
+`utils/drive.py`), no en cada llamada. Así ninguna escritura
 se escapa, ni las que se agreguen después: hay una prueba que lo verifica por
 introspección y falla si aparece una función de escritura sin guarda.
 
@@ -214,6 +214,13 @@ resueltas:
 | Escribir el cruce inverso (1.080 filas) | ~4,5 min | **una petición** |
 | Escribir el consolidado (825 filas WOMPI) | ~3,4 min | **una petición** |
 | Reprocesar un solo pago (`cruzar.py`) | 29 s | **10-12 s** |
+| Códigos de carteras archivadas | 8,7 s | **3,1 s** (filtro en la base) |
+
+Hasta el 2 de agosto de 2026 cada pago se escribía además a un Google Sheet
+("CONSOLIDADO", un tab por día). Se quitó porque nadie lo leía. La dedup que
+dependía de él —las llaves del tab anterior— sale ahora de `registration_date`
+en la propia base. **Ese archivo ya no se actualiza**; lo anterior queda ahí
+como estaba.
 
 El cálculo nunca fue lo lento: se abría una conexión TLS nueva por petición y se
 hacía una petición por fila.
@@ -269,7 +276,7 @@ activar_cartera.py            cambia de versión de cartera (manual)
 trigger_server.py             HTTP para reprocesos bajo demanda
 vigilante.py                  ¿llegó algo nuevo a Drive?
 fuentes/                      un módulo por banco/pasarela
-utils/                        las tres puertas al exterior: supabase, drive, sheets
+utils/                        las dos puertas al exterior: supabase y drive
 scripts/                      generación de fixtures anonimizados
 tests/                        pruebas de caracterización + snapshots
 sql/                          migraciones (se corren a mano en Supabase)

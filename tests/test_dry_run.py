@@ -18,7 +18,7 @@ import inspect
 
 import pytest
 
-from utils import drive, dry_run, sheets, supabase
+from utils import drive, dry_run, supabase
 
 
 @pytest.fixture
@@ -101,15 +101,6 @@ def test_no_mueve_archivos_en_drive(simulacion):
     assert 'archivo-1' in simulacion.read_text()
 
 
-def test_no_escribe_en_sheets(simulacion):
-    class _SheetsExplota:
-        def spreadsheets(self):
-            raise AssertionError('se intentó tocar Sheets en modo simulación')
-
-    sheets.append_rows(_SheetsExplota(), 'hoja-1', '02-08-2026', [[1, 2, 3]])
-    assert 'sheet:02-08-2026' in simulacion.read_text()
-
-
 def test_resumen_cuenta_las_filas(simulacion, sin_red):
     supabase.upsert_cruce('https://x', 'k', [{'matching_key': str(i)} for i in range(7)])
     supabase.upsert_cruce('https://x', 'k', [{'matching_key': 'z'}])
@@ -132,7 +123,7 @@ def test_apagado_no_intercepta(sin_red):
 
 
 # Funciones de `utils/supabase.py` que NO escriben, y por eso no llevan guarda.
-_SOLO_LECTURA = {'select_all', 'existing_matching_keys'}
+_SOLO_LECTURA = {'select_all', 'existing_matching_keys', 'keys_del_dia_anterior'}
 
 
 def test_toda_funcion_de_escritura_tiene_guarda():

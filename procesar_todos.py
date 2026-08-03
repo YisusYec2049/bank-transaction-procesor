@@ -9,16 +9,20 @@ Para cada banco:
   2. Descarga y parsea con el módulo fuentes/<banco>.py
   3. Normaliza al esquema estándar (11 columnas)
   4. Cheques → se apartan del proceso (tabla pagos_apartados, tipo='cheque');
-     nunca entran al CONSOLIDADO ni a Supabase consolidated_transactions
-  5. Escribe al tab del día en CONSOLIDADO (Google Sheets) — siempre
-  6. Upsert en Supabase consolidated_transactions (si SKIP_SUPABASE != true)
-  7. Mueve el archivo a la carpeta HISTORICO
+     nunca entran a consolidated_transactions
+  5. Upsert en Supabase consolidated_transactions (si SKIP_SUPABASE != true)
+  6. Mueve el archivo a la carpeta HISTORICO
+
+Hasta el 2 de agosto de 2026 esto también escribía cada pago a un Google Sheet
+("CONSOLIDADO"), con un tab por día. Se quitó: nadie lo leía, y la dedup que
+dependía de él —las llaves del tab anterior— ahora sale de `registration_date`
+en la propia base, que es el mismo dato sin el intermediario.
 
 PayU necesita DOS archivos (PayU + Moneda). Si solo hay uno, espera.
 
 Flags:
   --bank <nombre>   Procesa solo ese banco (default: todos)
-  --dry-run         Loguea sin escribir a Sheets/Supabase ni mover archivos
+  --dry-run         Loguea sin escribir a Supabase ni mover archivos
 """
 
 import argparse
@@ -44,8 +48,13 @@ from utils import dry_run
 from utils.drive import download_pdf as download_file
 from utils.drive import list_files, move_file
 from utils.parser import valor_str
-from utils.sheets import append_rows, ensure_tab, get_yesterday_keys
-from utils.supabase import existing_matching_keys, select_all, upsert, upsert_pagos_apartados
+from utils.supabase import (
+    existing_matching_keys,
+    keys_del_dia_anterior,
+    select_all,
+    upsert,
+    upsert_pagos_apartados,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -57,7 +66,6 @@ log = logging.getLogger(__name__)
 
 SCOPES = [
     'https://www.googleapis.com/auth/drive',
-    'https://www.googleapis.com/auth/spreadsheets',
 ]
 
 BANCOS = {
@@ -96,9 +104,7 @@ def _build_services():
     creds  = service_account.Credentials.from_service_account_file(
         os.environ['GOOGLE_SA_JSON'], scopes=SCOPES
     )
-    drive  = build('drive',  'v3', credentials=creds, cache_discovery=False)
-    sheets = build('sheets', 'v4', credentials=creds, cache_discovery=False)
-    return drive, sheets
+    return build('drive', 'v3', credentials=creds, cache_discovery=False)
 
 
 # ── Dedup / colisiones de matching_key ────────────────────────────────────────
@@ -316,8 +322,7 @@ def _apartar_cheques(cheques: list[tuple], banco: str, supabase_url: str, srk: s
 
 # ── Procesamiento genérico ────────────────────────────────────────────────────
 
-def _procesar_banco(drive, sheets, banco: str, cfg: dict,
-                    today_tab: str, consolidado_id: str,
+def _procesar_banco(drive, banco: str, cfg: dict,
                     yesterday_keys: set[str], dry_run: bool,
                     correcciones: dict[str, str]):
     mod    = cfg['mod']
@@ -373,12 +378,8 @@ def _procesar_banco(drive, sheets, banco: str, cfg: dict,
             if not filtradas:
                 log.info('[%s] Sin filas nuevas tras dedup.', banco)
             else:
-                # Siempre escribe al CONSOLIDADO de Sheets
-                append_rows(sheets, consolidado_id, today_tab, filtradas)
-
-                # Supabase solo si no está desactivado
                 if skip_supa:
-                    log.info('[%s] SKIP_SUPABASE=true — solo Sheets.', banco)
+                    log.info('[%s] SKIP_SUPABASE=true — no se escribe nada.', banco)
                 else:
                     if usar_sufijos:
                         _alertar_colision_supabase(filtradas, banco, supabase_url, srk)
@@ -394,9 +395,8 @@ def _procesar_banco(drive, sheets, banco: str, cfg: dict,
 
 # ── Bancolombia (PDFs con lógica de cheques) ─────────────────────────────────
 
-def _procesar_bancolombia(drive, sheets, banco: str, cfg: dict,
-                          today_tab: str, consolidado_id: str,
-                          yesterday_keys: set[str], dry_run: bool,
+def _procesar_bancolombia(drive, banco: str, cfg: dict,
+                                yesterday_keys: set[str], dry_run: bool,
                           correcciones: dict[str, str]):
     mod    = cfg['mod']
     prefix = cfg['prefix']
@@ -450,12 +450,11 @@ def _procesar_bancolombia(drive, sheets, banco: str, cfg: dict,
                 continue
 
             if filtradas:
-                append_rows(sheets, consolidado_id, today_tab, filtradas)
                 if not skip_supa:
                     _alertar_colision_supabase(filtradas, banco, supabase_url, srk)
                     upsert(supabase_url, srk, filtradas)
                 else:
-                    log.info('[%s] SKIP_SUPABASE=true — solo Sheets.', banco)
+                    log.info('[%s] SKIP_SUPABASE=true — no se escribe nada.', banco)
 
             if hist:
                 move_file(drive, fid, hist)
@@ -467,7 +466,7 @@ def _procesar_bancolombia(drive, sheets, banco: str, cfg: dict,
 
 # ── PayU (caso especial: dos archivos) ────────────────────────────────────────
 
-def _procesar_payu(drive, sheets, today_tab: str, consolidado_id: str,
+def _procesar_payu(drive,
                    yesterday_keys: set[str], dry_run: bool,
                    correcciones: dict[str, str]):
     payu_inbox   = os.environ.get('PAYU_INBOX_FOLDER_ID', '')
@@ -525,11 +524,10 @@ def _procesar_payu(drive, sheets, today_tab: str, consolidado_id: str,
                 continue
 
             if filtradas:
-                append_rows(sheets, consolidado_id, today_tab, filtradas)
                 if not skip_supa:
                     upsert(supabase_url, srk, filtradas)
                 else:
-                    log.info('[PAYU] SKIP_SUPABASE=true — solo Sheets.')
+                    log.info('[PAYU] SKIP_SUPABASE=true — no se escribe nada.')
 
             if payu_hist:
                 move_file(drive, pf['id'], payu_hist)
@@ -574,23 +572,11 @@ def main():
     if args.dry_run:
         log.info('=== DRY RUN activado ===')
 
-    consolidado_id = os.environ.get('CONSOLIDADO_SHEET_ID', '')
-    if not consolidado_id:
-        log.error('CONSOLIDADO_SHEET_ID no configurado en .env')
-        sys.exit(1)
+    drive = _build_services()
 
-    drive, sheets = _build_services()
-
-    tz_bogota = pytz.timezone('America/Bogota')
-    today_tab = datetime.now(tz_bogota).strftime('%d-%m-%Y')
-    log.info('Tab del día: %s', today_tab)
-
-    # Crear tab del día si no existe (idempotente)
-    if not args.dry_run:
-        ensure_tab(sheets, consolidado_id, today_tab, mod_placetopay.HEADERS)
-
-    # Cargar llaves de ayer para dedup
-    yesterday_keys = get_yesterday_keys(sheets, consolidado_id)
+    # Llaves del último día con ingresos, para no re-escribir lo que ya entró.
+    yesterday_keys = keys_del_dia_anterior(
+        os.environ['SUPABASE_URL'], os.environ['SUPABASE_SERVICE_ROLE_KEY'])
     log.info('Llaves históricas cargadas: %d', len(yesterday_keys))
 
     # Fase 5 (F.2): correcciones de documento por NIT, memoria por documento
@@ -604,15 +590,15 @@ def main():
         if args.bank and args.bank != banco:
             continue
         if tipo == 'payu':
-            _procesar_payu(drive, sheets, today_tab, consolidado_id, yesterday_keys,
+            _procesar_payu(drive, yesterday_keys,
                             args.dry_run, correcciones)
         elif tipo == 'bancolombia':
-            _procesar_bancolombia(drive, sheets, banco, BANCOS_BANCOLOMBIA[banco],
-                                  today_tab, consolidado_id, yesterday_keys,
+            _procesar_bancolombia(drive, banco, BANCOS_BANCOLOMBIA[banco],
+                                  yesterday_keys,
                                   args.dry_run, correcciones)
         else:
-            _procesar_banco(drive, sheets, banco, BANCOS[banco],
-                            today_tab, consolidado_id, yesterday_keys,
+            _procesar_banco(drive, banco, BANCOS[banco],
+                            yesterday_keys,
                             args.dry_run, correcciones)
 
     log.info('procesar_todos.py completado.')

@@ -2,7 +2,7 @@
 Piezas compartidas por los tests.
 
 La idea de fondo: este pipeline solo toca el mundo exterior por tres puertas —
-`utils/supabase.py`, `utils/drive.py` y `utils/sheets.py`. Ningún script llama a
+`utils/supabase.py` y `utils/drive.py`. Ningún script llama a
 la red por su cuenta. Eso permite correr el código **de verdad** (los `main()`
 completos, no una réplica) contra datos fijos, sustituyendo únicamente esas
 puertas. Es la técnica que se usó a mano para validar el arreglo del ledger el
