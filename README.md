@@ -84,7 +84,9 @@ transacción único, se usa ese; donde no (los bancos), se compone con
 ## Garantías del sistema
 
 Vale la pena tenerlas presentes antes de tocar nada, porque varias se
-aprendieron rompiéndolas:
+aprendieron rompiéndolas. El **por qué** de cada una está en
+[`docs/decisiones/`](docs/decisiones/README.md), y cómo trabajar en este repo en
+[`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 - **Correr dos veces no cobra dos veces.** El pipeline es idempotente: escribe
   por llave, no acumula. Una corrida interrumpida se arregla volviéndola a
@@ -278,6 +280,7 @@ vigilante.py                  ¿llegó algo nuevo a Drive?
 fuentes/                      un módulo por banco/pasarela
 utils/                        las dos puertas al exterior: supabase y drive
 scripts/                      generación de fixtures anonimizados
+docs/decisiones/              por qué el sistema es así (ADRs)
 tests/                        pruebas de caracterización + snapshots
 sql/                          migraciones (se corren a mano en Supabase)
 deploy/                       unidad systemd del servicio de trigger
