@@ -73,17 +73,24 @@ _state_cartera = {
 }
 
 
-def _correr_cadena(sync: bool):
+def _correr_cadena(sync: bool, solo: str | None = None):
     """Corre los scripts en orden, cortando en el primero que falle.
     Devuelve (exit_code, log). El orden importa: `cruzar.py` deja
-    `cruce_cartera` al día y `cruzar_cartera_preventiva.py` lee de ahí."""
-    scripts = ["sync_cartera.py"] if sync else []
-    scripts += ["cruzar.py", "cruzar_cartera_preventiva.py"]
+    `cruce_cartera` al día y `cruzar_cartera_preventiva.py` lee de ahí.
+
+    Con `solo`, `cruzar.py` trabaja únicamente ese pago: trae de cada tabla lo
+    que ese pago necesita en vez de leerlas enteras, y omite los pases
+    globales. `cruzar_cartera_preventiva.py` todavía no tiene modo puntual, así
+    que corre completo — es lo que queda por hacer para que un botón responda
+    en segundos."""
+    scripts = [["sync_cartera.py"]] if sync else []
+    scripts += [["cruzar.py"] + (["--solo", solo] if solo else []),
+                ["cruzar_cartera_preventiva.py"]]
 
     log = ""
     for script in scripts:
         result = subprocess.run(
-            [PYTHON, script],
+            [PYTHON, *script],
             cwd=REPO_DIR, capture_output=True, text=True, timeout=600,
         )
         log += result.stdout + result.stderr
@@ -92,7 +99,7 @@ def _correr_cadena(sync: bool):
     return 0, log
 
 
-def _run_pipeline(sync: bool):
+def _run_pipeline(sync: bool, solo: str | None = None):
     """Carril único del pipeline. Al terminar revisa si se encoló otra
     petición mientras corría y, si la hay, vuelve a correr sin soltar el
     estado a `done` — así el frontend que está haciendo polling ve una sola
@@ -108,7 +115,7 @@ def _run_pipeline(sync: bool):
         )
     while True:
         try:
-            returncode, log = _correr_cadena(sync)
+            returncode, log = _correr_cadena(sync, solo)
         except Exception as exc:
             returncode, log = -1, str(exc)
 
@@ -117,7 +124,7 @@ def _run_pipeline(sync: bool):
                 # Alguien disparó mientras corríamos: volver a correr en vez
                 # de perder ese cambio. Varias peticiones encoladas se
                 # colapsan en esta única re-corrida.
-                sync = _pendiente
+                sync, solo = _pendiente["sync"], _pendiente["solo"]
                 _pendiente = None
                 continue
             _state.update(
@@ -199,17 +206,27 @@ def trigger_activar_cartera_status():
         return jsonify(**_state_cartera)
 
 
-def _disparar(sync: bool):
+def _disparar(sync: bool, solo: str | None = None):
     """Arranca el pipeline, o encola una re-corrida si ya hay una en curso.
     Nunca descarta la petición: el llamador siempre puede asumir que su
-    cambio va a reprocesarse."""
+    cambio va a reprocesarse.
+
+    Al colapsar varias peticiones encoladas **gana siempre el alcance más
+    amplio**: si se encolan dos pagos distintos, la re-corrida los cubre a los
+    dos corriendo completa. Preferir uno de los dos dejaría el otro cambio sin
+    aplicar, que es exactamente lo que esta cola existe para evitar."""
     global _pendiente
     with _lock:
         if _state["status"] == "running":
-            # Si ya había algo encolado, gana el alcance más amplio (con sync).
-            _pendiente = sync or bool(_pendiente)
+            if _pendiente is None:
+                _pendiente = {"sync": sync, "solo": solo}
+            else:
+                _pendiente = {
+                    "sync": sync or _pendiente["sync"],
+                    "solo": solo if solo == _pendiente["solo"] else None,
+                }
             return jsonify({**_state, "status": "queued"}), 202
-    threading.Thread(target=_run_pipeline, args=(sync,), daemon=True).start()
+    threading.Thread(target=_run_pipeline, args=(sync, solo), daemon=True).start()
     return jsonify(status="started"), 202
 
 
@@ -227,10 +244,16 @@ def trigger_reproceso():
     """Reproceso tras una acción manual en la UI (corregir documento, marcar
     matrícula/cesantías, asociar un pago, cerrar una cuota). No baja nada de
     Drive: los archivos de referencia no cambiaron por apretar un botón, y
-    `sync_cartera.py` es la parte lenta de la cadena."""
+    `sync_cartera.py` es la parte lenta de la cadena.
+
+    Acepta `matching_key` (en el cuerpo JSON o como parámetro) para reprocesar
+    **solo ese pago**: es lo que corresponde cuando el botón corrigió una fila
+    concreta. Sin él, se recalcula todo, como antes."""
     if not _autorizado():
         return jsonify(error="unauthorized"), 401
-    return _disparar(sync=False)
+    cuerpo = request.get_json(silent=True) or {}
+    solo = (cuerpo.get("matching_key") or request.args.get("matching_key") or "").strip()
+    return _disparar(sync=False, solo=solo or None)
 
 
 @app.get("/trigger/reproceso/status")

@@ -169,6 +169,38 @@ ACTUALIZAR_SNAPSHOTS=1 pytest
 y **revisar el diff de `tests/snapshots/` antes de comitear**: ahí se ve, en
 números, qué cambió de verdad. Un diff más grande de lo esperado es la señal.
 
+## Modo puntual
+
+Cuando alguien corrige una cédula en la plataforma, no hace falta recalcular
+todo: cambió un pago.
+
+```bash
+python cruzar.py --solo 190093-1784244218-79528
+```
+
+Trae de cada tabla **solo lo que ese pago necesita** en vez de leerlas enteras,
+y omite los pases globales (la re-evaluación de WOMPI, el archivado de reportes
+en Drive). El servicio HTTP lo expone pasando `matching_key`:
+
+```bash
+curl -X POST .../trigger/reproceso -H "Authorization: Bearer $TOKEN" \
+     -H 'Content-Type: application/json' -d '{"matching_key":"190093-..."}'
+```
+
+Sin ese campo, se recalcula todo, como antes.
+
+**La regla que gobierna esto: recortar una lectura no es neutral.** Los índices
+de ambigüedad se construyen sobre las filas leídas, así que un universo más
+chico puede hacer que el sistema decida donde antes se abstenía. Ya pasó una vez
+al diseñarlo: filtrar `cartera_inscrip` por documento hacía que una inscripción
+con dos candidatos reales apareciera con uno solo, y el pago se habría asignado
+a la equivocada en silencio (por eso existe `_IdInscripcionPorBaseLazy`).
+
+Por eso la prueba que respalda el modo puntual no mide velocidad: verifica que
+**produce exactamente la misma fila que la corrida completa**
+(`tests/test_modo_puntual.py`), y eso mismo se comprobó contra producción con un
+pago real, comparando las dos salidas de `--dry-run`.
+
 ## Rendimiento
 
 Dos cosas explican casi todo el tiempo de una corrida, y las dos están
@@ -179,6 +211,7 @@ resueltas:
 | Leer las 8 tablas de referencia | 24,1 s | **14,7 s** (una sola conexión reusada) |
 | Escribir el cruce inverso (1.080 filas) | ~4,5 min | **una petición** |
 | Escribir el consolidado (825 filas WOMPI) | ~3,4 min | **una petición** |
+| Reprocesar un solo pago (`cruzar.py`) | 29 s | **10-12 s** |
 
 El cálculo nunca fue lo lento: se abría una conexión TLS nueva por petición y se
 hacía una petición por fila.

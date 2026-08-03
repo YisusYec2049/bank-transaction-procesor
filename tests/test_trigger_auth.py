@@ -106,3 +106,85 @@ def test_todos_los_endpoints_que_escriben_piden_token():
             sin_proteger.append(str(regla))
 
     assert not sin_proteger, f'endpoints que escriben sin pedir token: {sin_proteger}'
+
+
+# ── Cola de reprocesos con modo puntual ──────────────────────────────────────
+
+def test_la_cadena_pasa_el_pago_a_cruzar(monkeypatch):
+    """`--solo` tiene que llegar a `cruzar.py`, y solo a él."""
+    ejecutados = []
+
+    class _Res:
+        returncode, stdout, stderr = 0, '', ''
+
+    monkeypatch.setattr(trigger_server.subprocess, 'run',
+                        lambda cmd, **_kw: ejecutados.append(cmd) or _Res())
+
+    trigger_server._correr_cadena(sync=False, solo='PAGO-1')
+
+    assert ['--solo', 'PAGO-1'] == ejecutados[0][2:], 'cruzar.py no recibió el pago'
+    assert '--solo' not in ejecutados[1], (
+        'se le pasó --solo a cartera preventiva, que no lo soporta'
+    )
+
+
+def test_sin_pago_la_cadena_corre_completa(monkeypatch):
+    ejecutados = []
+
+    class _Res:
+        returncode, stdout, stderr = 0, '', ''
+
+    monkeypatch.setattr(trigger_server.subprocess, 'run',
+                        lambda cmd, **_kw: ejecutados.append(cmd) or _Res())
+
+    trigger_server._correr_cadena(sync=True, solo=None)
+
+    assert len(ejecutados) == 3, 'con sync deben correr los tres scripts'
+    assert all('--solo' not in cmd for cmd in ejecutados)
+
+
+def test_dos_pagos_encolados_obligan_a_correr_completo():
+    """Si mientras corre uno se encolan dos pagos distintos, la re-corrida
+    tiene que cubrir a los dos.
+
+    Quedarse con uno dejaría el otro cambio sin aplicar — justo lo que esta
+    cola existe para evitar. Ante la duda, gana el alcance más amplio.
+    """
+    trigger_server._state['status'] = 'running'
+    trigger_server._pendiente = None
+    try:
+        with trigger_server.app.test_request_context('/'):
+            trigger_server._disparar(sync=False, solo='PAGO-1')
+            trigger_server._disparar(sync=False, solo='PAGO-2')
+        assert trigger_server._pendiente == {'sync': False, 'solo': None}
+    finally:
+        trigger_server._state['status'] = 'idle'
+        trigger_server._pendiente = None
+
+
+def test_el_mismo_pago_encolado_dos_veces_sigue_siendo_puntual():
+    trigger_server._state['status'] = 'running'
+    trigger_server._pendiente = None
+    try:
+        with trigger_server.app.test_request_context('/'):
+            trigger_server._disparar(sync=False, solo='PAGO-1')
+            trigger_server._disparar(sync=False, solo='PAGO-1')
+        assert trigger_server._pendiente == {'sync': False, 'solo': 'PAGO-1'}
+    finally:
+        trigger_server._state['status'] = 'idle'
+        trigger_server._pendiente = None
+
+
+def test_un_pedido_con_sync_gana_sobre_uno_puntual():
+    """"Actualizar cruce" (que baja archivos) es más amplio que un reproceso de
+    un pago: si los dos se encolan, tiene que ganar el completo."""
+    trigger_server._state['status'] = 'running'
+    trigger_server._pendiente = None
+    try:
+        with trigger_server.app.test_request_context('/'):
+            trigger_server._disparar(sync=False, solo='PAGO-1')
+            trigger_server._disparar(sync=True, solo=None)
+        assert trigger_server._pendiente == {'sync': True, 'solo': None}
+    finally:
+        trigger_server._state['status'] = 'idle'
+        trigger_server._pendiente = None

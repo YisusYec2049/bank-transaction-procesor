@@ -660,6 +660,80 @@ def _tiene_senal_de_cruce(t: dict, lookup_inscrip: dict, lookup_bc2576: dict,
     return False
 
 
+def _filtros_puntual(pago: dict) -> dict[str, dict[str, str]]:
+    """Qué traer de cada tabla de referencia cuando solo importa UN pago.
+
+    Cada filtro tiene que ser **suficiente para la decisión que alimenta**, no
+    solo pequeño. Los tres criterios, y por qué alcanzan:
+
+    * `cartera_inscrip` por documento: el INCP se resuelve buscando el
+      documento del pago, y la ambigüedad se mide entre las inscripciones de
+      **ese** documento. Traer las de los demás no cambiaría nada.
+    * `cartera_ingresos_*` por el correo/referencia del pago: CORREO(2) es un
+      BUSCARV por esa llave; las demás filas nunca se consultan.
+    * Se usa `like.<valor>*` y no `eq.` porque la cartera guarda el NIT con
+      dígito de verificación (`860004922-4`) y el banco nunca lo trae. Trae
+      alguna fila de más, y eso es inofensivo: quedan bajo otra llave del
+      índice, que nadie consulta.
+
+    Lo que **no** está acá es `id_inscripcion_por_base`: no se puede recortar
+    por documento sin cambiar el resultado. Ver `_IdInscripcionPorBaseLazy`.
+    """
+    documento = str(pago.get('identification') or '').strip()
+    correo = str(pago.get('email') or '').strip()
+
+    filtros: dict[str, dict[str, str]] = {}
+    if documento:
+        filtros['cartera_inscrip'] = {'numero_id': f'like.{documento}*'}
+    if correo:
+        para_ingresos = {'referencia_1': f'like.{correo}*'}
+        filtros['cartera_ingresos_bancolombia_2576'] = para_ingresos
+        filtros['cartera_ingresos_bancolombia_2833'] = para_ingresos
+        filtros['cartera_ingresos_wompi'] = {'email': f'like.{correo}*'}
+        filtros['cartera_ingresos_stripe_usa'] = {'email_cliente': f'like.{correo}*'}
+    return filtros
+
+
+class _IdInscripcionPorBaseLazy:
+    """Igual que `_build_id_inscripcion_por_base`, pero consultando la base solo
+    cuando se pregunta por un número concreto.
+
+    Existe por una trampa del modo puntual. `_resolver_incp_wompi_link` busca
+    por **número de inscripción**, no por documento, y solo resuelve cuando
+    encuentra **un único** candidato para esa base — si hay dos, se niega, que
+    es lo correcto.
+
+    Si el modo puntual leyera `cartera_inscrip` filtrado por el documento del
+    pago, una base que de verdad tiene dos candidatos aparecería con uno solo, y
+    el pago se asignaría a una inscripción equivocada **en silencio**. Recortar
+    una lectura no es neutral: cambia el universo sobre el que se decide.
+
+    Por eso acá se consulta por la base pedida, sin filtrar por documento: el
+    conjunto que devuelve es exactamente el mismo que vería la corrida completa.
+    """
+
+    def __init__(self, supabase_url: str, srk: str):
+        self._url = supabase_url
+        self._srk = srk
+        self._cache: dict[str, set[str]] = {}
+
+    def get(self, base: str) -> set[str] | None:
+        if base in self._cache:
+            return self._cache[base] or None
+        filas = select_all(
+            self._url, self._srk, 'cartera_inscrip', select='id_inscripcion',
+            filtros={'id_inscripcion': f'like.{base}*'},
+        )
+        # `like.<base>*` trae de más ("330" trae "3300"): se queda solo con las
+        # que de verdad normalizan a esta base, igual que el índice completo.
+        encontrados = {
+            v for v in (str(f.get('id_inscripcion') or '').strip() for f in filas)
+            if v and (_normalizar_sufijo(v) or v) == base
+        }
+        self._cache[base] = encontrados
+        return encontrados or None
+
+
 def _build_id_inscripcion_por_base(inscrip_rows: list[dict]) -> dict[str, set[str]]:
     """Índice inverso de cartera_inscrip.id_inscripcion: número base (sin
     sufijo PN/PJ) -> conjunto de valores completos vistos con esa base.
@@ -798,6 +872,11 @@ def _build_lookup(rows: list[dict], key_field: str, value_field: str,
 
 def main():
     parser = argparse.ArgumentParser(description='Identifica a qué inscripción corresponde cada pago.')
+    parser.add_argument(
+        '--solo', metavar='MATCHING_KEY',
+        help='Modo puntual: procesa un solo pago. Trae de cada tabla de '
+             'referencia únicamente lo que ese pago necesita, y omite los '
+             'pases globales (reproceso disparado por un botón).')
     dry_run.agregar_flags(parser)
     args = parser.parse_args()
     dry_run.desde_args(args, 'cruzar')
@@ -810,9 +889,35 @@ def main():
         log.error('SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY no configurados.')
         sys.exit(1)
 
-    log.info('Cargando tablas de referencia...')
+    # ── Modo puntual ─────────────────────────────────────────────────────────
+    # Se lee PRIMERO el pago, porque de él salen los filtros del resto. Medido
+    # el 2026-08-02: de los 28 s de un reproceso, 22 son leer tablas enteras
+    # para tocar una fila.
+    #
+    # Los pases globales quedan fuera a propósito (la re-evaluación de WOMPI, la
+    # reapertura de filas cerradas, el barrido de apartados): son revisiones de
+    # TODA la tabla y no tienen nada que ver con el pago que cambió. Un modo
+    # puntual que además recalcula todo es exactamente por donde se colaron los
+    # bugs de julio.
+    solo = getattr(args, 'solo', None)
+    pago_puntual = None
+    if solo:
+        encontrados = select_all(supabase_url, srk, 'consolidated_transactions',
+                                  select='identification,email,payment_method,matching_key',
+                                  filtros={'matching_key': f'eq.{solo}'})
+        if not encontrados:
+            log.error('Modo puntual: no existe el pago %s en consolidated_transactions.', solo)
+            sys.exit(1)
+        pago_puntual = encontrados[0]
+        log.info('Modo puntual: solo el pago %s (documento %s).',
+                 solo, pago_puntual.get('identification') or '—')
+
+    filtros = _filtros_puntual(pago_puntual) if pago_puntual else {}
+
+    log.info('Cargando tablas de referencia%s...', ' (recortadas)' if filtros else '')
     inscrip_rows = select_all(supabase_url, srk, 'cartera_inscrip',
-                               select='numero_id,id_inscripcion')
+                               select='numero_id,id_inscripcion',
+                               filtros=filtros.get('cartera_inscrip'))
     for row in inscrip_rows:
         row['numero_id'] = _normalizar_nit(str(row.get('numero_id') or ''))
 
@@ -828,17 +933,26 @@ def main():
         log.info('%d filas de cartera_inscrip descartadas por exclusión manual.', antes - len(inscrip_rows))
 
     bc2576_rows  = select_all(supabase_url, srk, 'cartera_ingresos_bancolombia_2576',
-                               select='referencia_1,incp,fecha')
+                               select='referencia_1,incp,fecha',
+                               filtros=filtros.get('cartera_ingresos_bancolombia_2576'))
     bc2833_rows  = select_all(supabase_url, srk, 'cartera_ingresos_bancolombia_2833',
-                               select='referencia_1,incp,fecha')
+                               select='referencia_1,incp,fecha',
+                               filtros=filtros.get('cartera_ingresos_bancolombia_2833'))
     wompi_rows   = select_all(supabase_url, srk, 'cartera_ingresos_wompi',
-                               select='email,inscrip,fecha')
+                               select='email,inscrip,fecha',
+                               filtros=filtros.get('cartera_ingresos_wompi'))
     stripe_rows  = select_all(supabase_url, srk, 'cartera_ingresos_stripe_usa',
-                               select='email_cliente,incp,nombre_cliente,fecha')
+                               select='email_cliente,incp,nombre_cliente,fecha',
+                               filtros=filtros.get('cartera_ingresos_stripe_usa'))
 
     lookup_inscrip, ambiguos_inscrip, _, valores_inscrip       = _build_lookup(
         inscrip_rows, 'numero_id', 'id_inscripcion', preferir_sufijo_financiero=True)
-    id_inscripcion_por_base = _build_id_inscripcion_por_base(inscrip_rows)
+    # En modo puntual no se puede derivar de `inscrip_rows`: esas filas están
+    # filtradas por documento y este índice se consulta por número de
+    # inscripción. Ver _IdInscripcionPorBaseLazy.
+    id_inscripcion_por_base = (
+        _IdInscripcionPorBaseLazy(supabase_url, srk) if pago_puntual
+        else _build_id_inscripcion_por_base(inscrip_rows))
     lookup_bc2576, ambiguos_bc2576, historial_bc2576, valores_bc2576 = _build_lookup(
         bc2576_rows, 'referencia_1', 'incp', fecha_field='fecha')
     lookup_bc2833, ambiguos_bc2833, historial_bc2833, valores_bc2833 = _build_lookup(
@@ -873,8 +987,14 @@ def main():
     # _tiene_deuda_pendiente). "resuelta" = tiene fecha_pago; no toca a
     # cartera_preventiva ni requiere que cruzar_cartera_preventiva.py haya
     # corrido en este mismo ciclo (usa el estado tal cual está ahora mismo).
-    preventiva_rows_arbitro = select_all(supabase_url, srk, 'cartera_preventiva',
-                                          select='inscrip,cruce_access,fecha_pago')
+    # En modo puntual alcanza con las cuotas del documento de ESE pago: los dos
+    # índices que salen de acá (deuda pendiente e inscripciones por documento)
+    # solo se consultan con su propio documento.
+    preventiva_rows_arbitro = select_all(
+        supabase_url, srk, 'cartera_preventiva',
+        select='inscrip,cruce_access,fecha_pago',
+        filtros=({'cruce_access': f"like.{pago_puntual.get('identification') or ''}*"}
+                 if pago_puntual else None))
     bases_con_deuda: set[str] = set()
     # Documento del deudor -> inscripciones (valor tal cual, con sufijo) que le
     # pertenecen en cartera preventiva. Se usa para desempatar por IDENTIDAD
@@ -896,8 +1016,19 @@ def main():
 
     sa_json = os.environ.get('GOOGLE_SA_JSON', '')
     wompi_reporte_folder_id = os.environ.get('WOMPI_REPORTE_DRIVE_FOLDER_ID', '')
-    lookup_wompi_reporte, wompi_reporte_disponible, reportes_wompi = _cargar_lookup_wompi_reporte(
-        sa_json, wompi_reporte_folder_id)
+
+    # El reporte solo aporta datos a los pagos de WOMPI, y bajarlo de Drive
+    # cuesta ~2 s. En modo puntual sobre un pago de otro banco no hace falta
+    # ni mirarlo — y las correcciones de documento, que son el botón más usado,
+    # casi nunca son de WOMPI.
+    necesita_reporte = not pago_puntual or str(
+        pago_puntual.get('payment_method') or '').upper().startswith('WOMPI')
+    if necesita_reporte:
+        lookup_wompi_reporte, wompi_reporte_disponible, reportes_wompi = (
+            _cargar_lookup_wompi_reporte(sa_json, wompi_reporte_folder_id))
+    else:
+        log.info('Modo puntual sobre un pago que no es WOMPI: se omite el reporte.')
+        lookup_wompi_reporte, wompi_reporte_disponible, reportes_wompi = {}, False, []
 
     correcciones_documento = _cargar_correcciones_documento(supabase_url, srk)
     log.info('%d corrección(es) de documento cargadas.', len(correcciones_documento))
@@ -923,6 +1054,7 @@ def main():
         select='identification,payment_date,transaction_code_1,transaction_code_2,'
                'email,payment_method,program,phone,payment_amount,matching_key,'
                'registration_date,metodo_de_pago',
+        filtros={'matching_key': f'eq.{solo}'} if solo else None,
     )
     transacciones = _aplicar_correcciones_documento(transacciones, correcciones_documento)
 
@@ -1402,7 +1534,11 @@ def main():
     # excepcion_motivo, y nunca filas 'no_identificable'. Se corre siempre
     # que el reporte esté disponible, sin importar si hubo transacciones
     # nuevas para cruzar esta corrida.
-    if wompi_reporte_disponible:
+    if wompi_reporte_disponible and not pago_puntual:
+        # Pase GLOBAL: revisa todas las filas WOMPI ya cruzadas contra el
+        # reporte del día. No tiene relación con el pago que disparó un
+        # reproceso puntual, así que ahí no corre — se hace en la corrida
+        # diaria, que es donde vive todo lo global.
         log.info('Fase 9.4: re-evaluando filas WOMPI ya cruzadas (corregido_manual=false)...')
         actualizaciones_9_4 = []
         for r in existentes:
@@ -1447,7 +1583,10 @@ def main():
         log.info('Sin transacciones para cruzar.')
 
     # Al final y pase lo que pase con el cruce: los reportes ya se leyeron.
-    _archivar_reportes_wompi(sa_json, reportes_wompi)
+    # Mantenimiento GLOBAL de la carpeta de Drive: no corresponde a un reproceso
+    # de un solo pago. Un botón de la plataforma no debe mover archivos.
+    if not pago_puntual:
+        _archivar_reportes_wompi(sa_json, reportes_wompi)
 
 
 if __name__ == '__main__':

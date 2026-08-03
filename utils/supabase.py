@@ -165,8 +165,21 @@ def _headers(service_role_key: str, prefer: str | None = None) -> dict:
 
 
 def select_all(supabase_url: str, service_role_key: str, table: str,
-                select: str = '*', page_size: int = 1000) -> list[dict]:
+                select: str = '*', page_size: int = 1000,
+                filtros: dict[str, str] | None = None) -> list[dict]:
     """Trae TODAS las filas de `table`, paginando.
+
+    `filtros` son condiciones de PostgREST tal cual, por columna:
+
+        filtros={'numero_id': 'in.("123","456")'}
+        filtros={'matching_key': 'eq.190093-1784...'}
+
+    Existen para el modo puntual (ver `cruzar.py --solo`): traer las 3 filas
+    que hacen falta en vez de las 23.000 de la tabla. **Recortar la lectura no
+    es neutral** — cambia el universo sobre el que se construyen los índices de
+    ambigüedad, así que cada filtro tiene que ser suficiente para la decisión
+    que alimenta. Eso se verifica comparando modo completo contra modo puntual,
+    no razonando (ver tests/test_modo_puntual.py).
 
     El avance se hace por **lo que el servidor devolvió**, no por lo que se le
     pidió, y se corta solo con una página vacía. Parece un detalle y no lo es:
@@ -187,7 +200,7 @@ def select_all(supabase_url: str, service_role_key: str, table: str,
         hdrs['Range'] = f'{offset}-{offset + page_size - 1}'
         resp = http.get(
             f'{supabase_url}/rest/v1/{table}',
-            params={'select': select},
+            params={'select': select, **(filtros or {})},
             headers=hdrs,
             timeout=30,
         )
