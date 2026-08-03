@@ -1028,7 +1028,8 @@ def main():
     log.info('Cargando cruce_cartera (solo estado_cruce=cruzado)...')
     pagos_rows = select_all(
         supabase_url, srk, 'cruce_cartera',
-        select='matching_key,identification,payment_date,transaction_code_1,transaction_code_2,'
+        select='matching_key,identification,payment_date,registration_date,'
+               'transaction_code_1,transaction_code_2,'
                'email,payment_method,payment_amount,estado_cruce,incp,metodo_de_pago',
     )
     pagos_cruzados = [p for p in pagos_rows if p.get('estado_cruce') == 'cruzado' and p.get('incp')]
@@ -1278,45 +1279,53 @@ def main():
         cartera que está activa hoy."""
         return pago['matching_key'] in matching_keys_reaplicables
 
-    def _viejo_sin_oportunidad(pago: dict) -> bool:
-        """¿Es un pago que ya estaba disponible cuando se cargó la cartera
-        activa y no se aplicó ese día?
+    def _fuera_de_su_dia(pago: dict) -> bool:
+        """¿Es un pago que ya tuvo su oportunidad y no la usó?
 
-        REGLA DEL USUARIO (3 de agosto): la carga de cartera es LA
-        oportunidad. Llega la cartera del mes, la plata de las semanas previas
-        se acomoda ese día, y lo que no encontró cuota entonces deja de
-        aplicarse solo — queda para que una persona lo asocie.
+        REGLA DEL USUARIO (3 de agosto): **un pago se reparte el día que entra
+        al sistema. Si ese día no encontró cuota, no se reparte nunca más
+        solo** — se queda quieto hasta que una persona lo asigne.
 
-        Nace de un caso real (doc 1020838689): un pago del 16 de julio, de un
-        ciclo de cartera anterior, se aplicó solo el 3 de agosto sobre una
-        cuota de la cartera de agosto, mezclándose con el pago que sí
-        correspondía. El área lo reportó como error, y con razón: qué se hace
-        con la plata de una cartera vieja lo decide una persona.
+        Textual: *"si un pago no se asignó el día que entraba, no se va a
+        asignar al día siguiente a menos que me lo pidan"*.
 
-        NO reemplaza a `_reaplicable`, que mira otra cosa: aquél bloquea lo
-        que YA se repartió bajo una cartera anterior; éste bloquea lo que
-        NUNCA se repartió y se quedó atrás. Hasta hoy ese caso entraba siempre
-        (excepción deliberada del 28 de julio, para que la plata no se
-        perdiera). Sigue sin perderse: el pago queda en `cruce_cartera` como
-        `cruzado`, visible con el filtro "Sin cruce con Cartera Preventiva", y
-        se asocia a mano desde financial-platform.
+        El porqué es del negocio, no técnico: la cartera del mes la arma una
+        persona en Excel y ahí ya ajusta los pagos. Si además el pipeline le
+        mete plata vieja encima cuando aparecen las cuotas nuevas, esa plata se
+        cuenta dos veces y la cuota del mes queda pagada con dinero de otro mes.
 
-        Medido antes de escribirla, contra todo lo que el pipeline repartió:
-        el día de la carga (30 de julio) se aplicaron 118 pagos anteriores a
-        esa fecha —el flujo normal, que esta regla no toca porque solo actúa
-        DESPUÉS del día de carga— y los repartos del 31 de julio (38) y del 3
-        de agosto (102) son todos de pagos posteriores a la carga. Cero daño
-        colateral; frenaba exactamente el caso reportado.
+        Caso que la disparó (doc 1022389618): pagó el 16 de julio sin tener
+        ninguna cuota; el 30 de julio llegó la cartera de agosto con su cuota y
+        el pago de julio cayó ahí solo. Cuando el 2 de agosto pagó de verdad esa
+        cuota, su pago ya no tenía dónde entrar. La cuota de agosto quedaba
+        pagada con plata de julio.
 
-        Se compara contra el día de la CARGA ACTIVA, no contra una ventana de
-        días, por el mismo motivo que `_reaplicable`: es el dato exacto y ya
-        está guardado en `cartera_cargas`."""
-        if hoy == dia_carga_activa:
-            return False            # el día de la carga se acomoda todo
-        fecha = pago.get('payment_date')
-        if not fecha:
-            return False            # sin fecha no se bloquea nada
-        return str(fecha) < dia_carga_activa
+        REEMPLAZA a la excepción del 28 de julio ("un pago que nunca se pudo
+        aplicar sigue entrando cuando aparezca"), que existía para que la plata
+        no se perdiera. No se pierde igual: el pago sigue en `cruce_cartera`
+        como `cruzado`, se ve con el filtro "Sin cruce con Cartera Preventiva",
+        y se asigna a mano.
+
+        NO reemplaza a `_reaplicable`, que mira otra cosa: aquél bloquea lo que
+        YA se repartió bajo una cartera anterior; éste bloquea lo que nunca se
+        repartió y se quedó atrás.
+
+        Medido contra los 258 repartos vivos: 173 se hicieron el mismo día en
+        que entró el pago (el flujo normal, intacto) y 85 después — 84 de ellos
+        el 30 de julio, el día en que se cargó la cartera, y 1 el 3 de agosto.
+        O sea que en un día normal esta regla no cambia nada; muerde el día del
+        cambio de cartera, que es justo donde el usuario no la quiere.
+
+        Se mide con `registration_date` (cuándo entró al sistema), no con
+        `payment_date` (cuándo pagó la persona): entre las dos hay hasta 2+ días
+        de desfase en el 34% de los pagos por los fines de semana de WOMPI, y un
+        pago del viernes que entra el lunes tiene que poder aplicarse el lunes.
+        Sin `registration_date` no se bloquea nada: no hay dato con que decidir
+        y perder plata en silencio es peor."""
+        entrada = pago.get('registration_date')
+        if not entrada:
+            return False
+        return str(entrada)[:10] != hoy
 
     pagos_nuevos = [
         p for p in pagos_cruzados
@@ -1324,22 +1333,22 @@ def main():
         and p['matching_key'] not in matching_keys_en_ledger
         and p['matching_key'] not in matching_keys_en_excel
         and (p['matching_key'] not in matching_keys_archivados or _reaplicable(p))
-        and not _viejo_sin_oportunidad(p)
+        and not _fuera_de_su_dia(p)
     ]
     bloqueados = sum(1 for p in pagos_cruzados
                      if p['matching_key'] in matching_keys_archivados and not _reaplicable(p))
-    viejos_frenados = sum(1 for p in pagos_cruzados
+    fuera_de_su_dia = sum(1 for p in pagos_cruzados
                           if p['matching_key'] not in matching_keys_asociados
                           and p['matching_key'] not in matching_keys_en_ledger
                           and p['matching_key'] not in matching_keys_en_excel
-                          and _viejo_sin_oportunidad(p))
+                          and _fuera_de_su_dia(p))
     log.info('%d pagos cruzados totales, %d nuevos (sin asociación/ledger previo). '
               '%d bloqueados por venir aplicados de una cartera anterior '
               '(carga activa del %s).',
               len(pagos_cruzados), len(pagos_nuevos), bloqueados, dia_carga_activa)
-    if viejos_frenados:
-        log.info('%d pago(s) anteriores a la carga activa NO se auto-aplican '
-                  '(quedan para asociación manual).', viejos_frenados)
+    if fuera_de_su_dia:
+        log.info('%d pago(s) NO se auto-aplican: no entraron hoy y su día ya pasó '
+                  '(quedan para asignación manual).', fuera_de_su_dia)
 
     # §4.1/4.2: cuotas pendientes = sin pago identificado, sin cierre manual
     # y con saldo real por cobrar.

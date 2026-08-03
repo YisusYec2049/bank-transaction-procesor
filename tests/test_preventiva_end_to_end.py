@@ -12,6 +12,12 @@ import cruzar_cartera_preventiva as ccp
 _IDS: dict[str, int] = {}
 
 
+def _hoy_bogota() -> str:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    return datetime.now(ZoneInfo('America/Bogota')).strftime('%Y-%m-%d')
+
+
 def _id_de(llave: str) -> int:
     """Id estable por llave. No se usa `hash()`: Python lo aleatoriza entre
     procesos, así que los ids cambiarían de una corrida de pytest a otra."""
@@ -32,9 +38,13 @@ def _cuota(llave, inscrip, documento, valor, vence, **extra):
 
 
 def _pago_cruzado(matching_key, documento, incp, monto, fecha='2026-08-01'):
+    # `registration_date` = hoy por defecto: un pago se reparte el día que entra
+    # al sistema (regla del 3 de agosto), así que el pago "normal" de un test es
+    # uno que entró hoy. Los tests de esa regla lo sobrescriben a propósito.
     return {
         'matching_key': matching_key, 'identification': documento, 'incp': incp,
         'estado_cruce': 'cruzado', 'payment_amount': monto, 'payment_date': fecha,
+        'registration_date': _hoy_bogota(),
         'email': 'alguien@example.com', 'payment_method': 'BANCOLOMBIA',
         'transaction_code_1': 'PAGO QR', 'transaction_code_2': '',
         'metodo_de_pago': None, 'program': '',
@@ -250,70 +260,89 @@ def test_corregir_el_incp_a_mano_dirige_el_pago_a_la_cuota_correcta(mundo):
     )
 
 
-# ── Pagos anteriores a la carga de cartera activa (3 de agosto) ────────────
+# ── Un pago se reparte el día que entra (3 de agosto) ─────────────────────
 #
-# Regla del usuario: la carga de cartera es LA oportunidad. Lo que no encontró
-# cuota ese día deja de aplicarse solo y queda para que una persona lo asocie.
-# Nace del caso 1020838689: un pago del 16 de julio, de un ciclo de cartera
-# anterior, se aplicó solo el 3 de agosto y se mezcló con el pago que sí
-# correspondía.
+# Regla del usuario: si un pago no se asignó el día que entró al sistema, no se
+# asigna solo nunca más. Nace del caso 1022389618: pagó el 16 de julio sin tener
+# cuota, y el 30 de julio la cartera nueva le trajo una — el pago viejo cayó ahí
+# solo, y cuando pagó de verdad esa cuota el 2 de agosto su plata ya no tenía
+# dónde entrar.
+
 
 def _carga(fecha_utc: str, estado: str = 'activa'):
     return {'fecha': fecha_utc, 'estado': estado}
 
 
-def _hoy_bogota() -> str:
-    from datetime import datetime
-    from zoneinfo import ZoneInfo
-    return datetime.now(ZoneInfo('America/Bogota')).strftime('%Y-%m-%d')
-
-
-def test_un_pago_anterior_a_la_carga_no_se_aplica_solo(mundo):
-    """El caso reportado. La cartera se cargó el 30 de julio y el pago es del
-    16: hoy ya no es el día de la carga, así que no se toca la cuota."""
+def test_un_pago_que_no_entro_hoy_no_se_aplica_solo(mundo):
+    """El caso reportado: el pago entró hace días y hoy le aparece una cuota."""
+    pago = _pago_cruzado('PAGO-VIEJO', '1002003004', 'INS1', 503_125,
+                         fecha='2026-07-16')
+    pago['registration_date'] = '2026-07-17'
     capturado = mundo(ccp, tablas={
-        'cartera_cargas': [_carga('2026-07-30T15:23:32+00:00')],
-        'cartera_preventiva': [_cuota('INS1-A', 'INS1', '1002003004', 136_361, '2026-10-19')],
-        'cruce_cartera': [_pago_cruzado('PAGO-VIEJO', '1002003004', 'INS1',
-                                        11_561, fecha='2026-07-16')],
+        'cartera_cargas': [_carga(f'{_hoy_bogota()}T15:23:32+00:00')],
+        'cartera_preventiva': [_cuota('INS1-A', 'INS1', '1002003004', 503_125,
+                                      '2026-08-13')],
+        'cruce_cartera': [pago],
     })
 
     assert not capturado.get('pago_asociaciones'), (
-        'un pago de un ciclo de cartera anterior se aplicó solo'
+        'un pago que entró hace días cayó solo sobre una cuota que apareció después'
     )
     assert 'INS1-A' not in _por_llave(capturado), 'la cuota no debía tocarse'
 
 
-def test_un_pago_posterior_a_la_carga_se_aplica_normal(mundo):
-    """La contraparte, con el MISMO mundo: lo único que cambia es la fecha del
-    pago. Sin esta prueba, la regla podría estar bloqueando todo."""
+def test_un_pago_que_entro_hoy_se_aplica_normal(mundo):
+    """La contraparte, con el MISMO mundo: lo único que cambia es el día en que
+    el pago entró al sistema. Sin esto, la regla podría estar bloqueando todo."""
+    pago = _pago_cruzado('PAGO-DE-HOY', '1002003005', 'INS2', 503_125,
+                         fecha='2026-08-02')
+    pago['registration_date'] = _hoy_bogota()
     capturado = mundo(ccp, tablas={
-        'cartera_cargas': [_carga('2026-07-30T15:23:32+00:00')],
-        'cartera_preventiva': [_cuota('INS2-A', 'INS2', '1002003005', 136_361, '2026-10-19')],
-        'cruce_cartera': [_pago_cruzado('PAGO-NUEVO', '1002003005', 'INS2',
-                                        136_361, fecha='2026-07-31')],
+        'cartera_cargas': [_carga(f'{_hoy_bogota()}T15:23:32+00:00')],
+        'cartera_preventiva': [_cuota('INS2-A', 'INS2', '1002003005', 503_125,
+                                      '2026-08-13')],
+        'cruce_cartera': [pago],
     })
 
     cuota = _por_llave(capturado).get('INS2-A')
-    assert cuota is not None, 'un pago posterior a la carga no se aplicó'
-    assert float(cuota['valor_pago']) == 136_361
+    assert cuota is not None, 'un pago que entró hoy no se aplicó'
+    assert float(cuota['valor_pago']) == 503_125
 
 
-def test_el_dia_de_la_carga_si_entran_los_pagos_viejos(mundo):
-    """El flujo normal del cambio de cartera: llega la cartera del mes y la
-    plata de las semanas previas se acomoda ese día. Medido en producción — el
-    30 de julio se aplicaron así 118 pagos. Si esta prueba se cae, la regla se
-    comió el cambio de cartera entero."""
+def test_el_dia_de_la_carga_tampoco_rescata_un_pago_viejo(mundo):
+    """La puerta que el usuario mandó cerrar. Antes, el día en que se cargaba la
+    cartera del mes entraba toda la plata vieja de golpe (84 pagos el 30 de
+    julio) — justo cuando el área ya ajustó los pagos a mano en ese Excel."""
+    pago = _pago_cruzado('PAGO-VIEJO', '1002003006', 'INS3', 500_000,
+                         fecha='2026-07-16')
+    pago['registration_date'] = '2026-07-17'
     capturado = mundo(ccp, tablas={
+        # La cartera se carga HOY: aun así el pago viejo no entra.
         'cartera_cargas': [_carga(f'{_hoy_bogota()}T15:23:32+00:00')],
-        'cartera_preventiva': [_cuota('INS3-A', 'INS3', '1002003006', 500_000, '2026-10-19')],
-        'cruce_cartera': [_pago_cruzado('PAGO-VIEJO', '1002003006', 'INS3',
-                                        500_000, fecha='2026-07-16')],
+        'cartera_preventiva': [_cuota('INS3-A', 'INS3', '1002003006', 500_000,
+                                      '2026-08-13')],
+        'cruce_cartera': [pago],
     })
 
-    cuota = _por_llave(capturado).get('INS3-A')
-    assert cuota is not None, (
-        'el día de la carga no se aplicó un pago viejo: se rompe el cambio de cartera'
+    assert not capturado.get('pago_asociaciones'), (
+        'el día de la carga volvió a entrar plata vieja'
+    )
+
+
+def test_un_pago_sin_fecha_de_ingreso_no_se_bloquea(mundo):
+    """Sin el dato no se decide en contra: perder plata en silencio es peor que
+    aplicarla de más, que al menos se ve."""
+    pago = _pago_cruzado('PAGO-SIN-FECHA', '1002003009', 'INS6', 500_000)
+    pago['registration_date'] = None
+    capturado = mundo(ccp, tablas={
+        'cartera_cargas': [_carga(f'{_hoy_bogota()}T15:23:32+00:00')],
+        'cartera_preventiva': [_cuota('INS6-A', 'INS6', '1002003009', 500_000,
+                                      '2026-08-13')],
+        'cruce_cartera': [pago],
+    })
+
+    assert _por_llave(capturado).get('INS6-A') is not None, (
+        'se bloqueó un pago por no traer fecha de ingreso'
     )
 
 
