@@ -6,6 +6,8 @@ trigger_server.py — dispara operaciones bajo demanda vía HTTP.
                                cruzar_cartera_preventiva.py
   - POST /trigger/reproceso  → cruzar.py && cruzar_cartera_preventiva.py
     (mismo carril que /trigger/cruce, sin volver a bajar los Excel de Drive)
+  - POST /trigger/sync       → sync_cartera.py y nada más (botón "Buscar
+    archivos nuevos": solo mira Drive, no recalcula)
   - POST /trigger/cartera/activar → activar_cartera.py (Spec C, el swap
     manual de versión de Cartera Preventiva, botón "Cargar Cartera")
 
@@ -73,7 +75,7 @@ _state_cartera = {
 }
 
 
-def _correr_cadena(sync: bool, solo: str | None = None):
+def _correr_cadena(sync: bool, solo: str | None = None, solo_sync: bool = False):
     """Corre los scripts en orden, cortando en el primero que falle.
     Devuelve (exit_code, log). El orden importa: `cruzar.py` deja
     `cruce_cartera` al día y `cruzar_cartera_preventiva.py` lee de ahí.
@@ -83,9 +85,15 @@ def _correr_cadena(sync: bool, solo: str | None = None):
     globales. `cruzar_cartera_preventiva.py` todavía no tiene modo puntual, así
     que corre completo — es lo que queda por hacer para que un botón responda
     en segundos."""
-    scripts = [["sync_cartera.py"]] if sync else []
-    scripts += [["cruzar.py"] + (["--solo", solo] if solo else []),
-                ["cruzar_cartera_preventiva.py"]]
+    if solo_sync:
+        # Solo bajar archivos de Drive y refrescar las tablas de referencia. No
+        # se recalcula nada: la cartera nueva queda EN ESPERA hasta que alguien
+        # aprete "Cargar Cartera", así que no hay nada que recalcular todavía.
+        scripts = [["sync_cartera.py"]]
+    else:
+        scripts = [["sync_cartera.py"]] if sync else []
+        scripts += [["cruzar.py"] + (["--solo", solo] if solo else []),
+                    ["cruzar_cartera_preventiva.py"]]
 
     log = ""
     for script in scripts:
@@ -99,7 +107,7 @@ def _correr_cadena(sync: bool, solo: str | None = None):
     return 0, log
 
 
-def _run_pipeline(sync: bool, solo: str | None = None):
+def _run_pipeline(sync: bool, solo: str | None = None, solo_sync: bool = False):
     """Carril único del pipeline. Al terminar revisa si se encoló otra
     petición mientras corría y, si la hay, vuelve a correr sin soltar el
     estado a `done` — así el frontend que está haciendo polling ve una sola
@@ -115,7 +123,7 @@ def _run_pipeline(sync: bool, solo: str | None = None):
         )
     while True:
         try:
-            returncode, log = _correr_cadena(sync, solo)
+            returncode, log = _correr_cadena(sync, solo, solo_sync)
         except Exception as exc:
             returncode, log = -1, str(exc)
 
@@ -124,7 +132,9 @@ def _run_pipeline(sync: bool, solo: str | None = None):
                 # Alguien disparó mientras corríamos: volver a correr en vez
                 # de perder ese cambio. Varias peticiones encoladas se
                 # colapsan en esta única re-corrida.
-                sync, solo = _pendiente["sync"], _pendiente["solo"]
+                sync = _pendiente["sync"]
+                solo = _pendiente["solo"]
+                solo_sync = _pendiente["solo_sync"]
                 _pendiente = None
                 continue
             _state.update(
@@ -206,7 +216,7 @@ def trigger_activar_cartera_status():
         return jsonify(**_state_cartera)
 
 
-def _disparar(sync: bool, solo: str | None = None):
+def _disparar(sync: bool, solo: str | None = None, solo_sync: bool = False):
     """Arranca el pipeline, o encola una re-corrida si ya hay una en curso.
     Nunca descarta la petición: el llamador siempre puede asumir que su
     cambio va a reprocesarse.
@@ -219,14 +229,17 @@ def _disparar(sync: bool, solo: str | None = None):
     with _lock:
         if _state["status"] == "running":
             if _pendiente is None:
-                _pendiente = {"sync": sync, "solo": solo}
+                _pendiente = {"sync": sync, "solo": solo, "solo_sync": solo_sync}
             else:
                 _pendiente = {
                     "sync": sync or _pendiente["sync"],
                     "solo": solo if solo == _pendiente["solo"] else None,
+                    # Solo sigue siendo "solo sync" si TODO lo encolado lo era.
+                    # Si alguien pidió también un recálculo, hay que hacerlo.
+                    "solo_sync": solo_sync and _pendiente["solo_sync"],
                 }
             return jsonify({**_state, "status": "queued"}), 202
-    threading.Thread(target=_run_pipeline, args=(sync, solo), daemon=True).start()
+    threading.Thread(target=_run_pipeline, args=(sync, solo, solo_sync), daemon=True).start()
     return jsonify(status="started"), 202
 
 
@@ -254,6 +267,29 @@ def trigger_reproceso():
     cuerpo = request.get_json(silent=True) or {}
     solo = (cuerpo.get("matching_key") or request.args.get("matching_key") or "").strip()
     return _disparar(sync=False, solo=solo or None)
+
+
+@app.post("/trigger/sync")
+def trigger_sync():
+    """Solo trae archivos de Drive: NO recalcula nada.
+
+    Es lo que necesita el botón "Buscar archivos nuevos" de Cartera Preventiva.
+    Ese botón usaba `/trigger/cruce`, que además cruza y reparte pagos — minutos
+    de trabajo para responder una pregunta que se contesta en segundos: ¿llegó
+    una cartera nueva?
+
+    No hace falta recalcular después, y esa es la razón de que pueda ser solo
+    sync: la cartera nueva queda **en espera**, y solo entra en vivo cuando
+    alguien aprieta "Cargar Cartera" (que sí dispara su propio reproceso).
+
+    Comparte el carril del pipeline a propósito: `sync_cartera.py` reemplaza las
+    tablas de referencia que `cruzar.py` lee, y correrlos a la vez le daría al
+    cruce tablas a medio actualizar. Es el mismo motivo por el que el cron los
+    encadena en vez de lanzarlos en paralelo.
+    """
+    if not _autorizado():
+        return jsonify(error="unauthorized"), 401
+    return _disparar(sync=True, solo_sync=True)
 
 
 @app.get("/trigger/reproceso/status")

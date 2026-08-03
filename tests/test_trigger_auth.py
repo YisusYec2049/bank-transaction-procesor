@@ -156,7 +156,8 @@ def test_dos_pagos_encolados_obligan_a_correr_completo():
         with trigger_server.app.test_request_context('/'):
             trigger_server._disparar(sync=False, solo='PAGO-1')
             trigger_server._disparar(sync=False, solo='PAGO-2')
-        assert trigger_server._pendiente == {'sync': False, 'solo': None}
+        assert trigger_server._pendiente['solo'] is None
+        assert trigger_server._pendiente['sync'] is False
     finally:
         trigger_server._state['status'] = 'idle'
         trigger_server._pendiente = None
@@ -169,7 +170,7 @@ def test_el_mismo_pago_encolado_dos_veces_sigue_siendo_puntual():
         with trigger_server.app.test_request_context('/'):
             trigger_server._disparar(sync=False, solo='PAGO-1')
             trigger_server._disparar(sync=False, solo='PAGO-1')
-        assert trigger_server._pendiente == {'sync': False, 'solo': 'PAGO-1'}
+        assert trigger_server._pendiente['solo'] == 'PAGO-1'
     finally:
         trigger_server._state['status'] = 'idle'
         trigger_server._pendiente = None
@@ -184,7 +185,77 @@ def test_un_pedido_con_sync_gana_sobre_uno_puntual():
         with trigger_server.app.test_request_context('/'):
             trigger_server._disparar(sync=False, solo='PAGO-1')
             trigger_server._disparar(sync=True, solo=None)
-        assert trigger_server._pendiente == {'sync': True, 'solo': None}
+        assert trigger_server._pendiente['sync'] is True
+        assert trigger_server._pendiente['solo'] is None
+    finally:
+        trigger_server._state['status'] = 'idle'
+        trigger_server._pendiente = None
+
+
+# ── /trigger/sync: solo traer archivos ───────────────────────────────────────
+
+def test_sync_solo_corre_sync_cartera(monkeypatch):
+    """El botón "Buscar archivos nuevos" no debe recalcular nada.
+
+    Antes usaba el disparador que además cruza y reparte pagos: minutos de
+    trabajo para responder "¿llegó una cartera nueva?".
+    """
+    ejecutados = []
+
+    class _Res:
+        returncode, stdout, stderr = 0, '', ''
+
+    monkeypatch.setattr(trigger_server.subprocess, 'run',
+                        lambda cmd, **_kw: ejecutados.append(cmd) or _Res())
+
+    trigger_server._correr_cadena(sync=True, solo_sync=True)
+
+    assert len(ejecutados) == 1, f'corrió de más: {[c[-1] for c in ejecutados]}'
+    assert ejecutados[0][-1] == 'sync_cartera.py'
+
+
+def test_si_se_encola_un_recalculo_deja_de_ser_solo_sync():
+    """Ante la duda, el alcance más amplio.
+
+    Si mientras corre un sync alguien pide un reproceso, la re-corrida tiene que
+    incluirlo: quedarse en "solo sync" dejaría ese cambio sin aplicar.
+    """
+    trigger_server._state['status'] = 'running'
+    trigger_server._pendiente = None
+    try:
+        with trigger_server.app.test_request_context('/'):
+            trigger_server._disparar(sync=True, solo_sync=True)
+            trigger_server._disparar(sync=False, solo=None)
+        assert trigger_server._pendiente['solo_sync'] is False
+    finally:
+        trigger_server._state['status'] = 'idle'
+        trigger_server._pendiente = None
+
+
+def test_dos_syncs_encolados_siguen_siendo_solo_sync():
+    trigger_server._state['status'] = 'running'
+    trigger_server._pendiente = None
+    try:
+        with trigger_server.app.test_request_context('/'):
+            trigger_server._disparar(sync=True, solo_sync=True)
+            trigger_server._disparar(sync=True, solo_sync=True)
+        assert trigger_server._pendiente['solo_sync'] is True
+    finally:
+        trigger_server._state['status'] = 'idle'
+        trigger_server._pendiente = None
+
+
+def test_sync_comparte_el_carril_del_pipeline():
+    """`sync_cartera.py` reemplaza las tablas que `cruzar.py` lee. Correrlos a
+    la vez le daría al cruce tablas a medio actualizar — el mismo motivo por el
+    que el cron los encadena en vez de lanzarlos en paralelo."""
+    trigger_server._state['status'] = 'running'
+    trigger_server._pendiente = None
+    try:
+        with trigger_server.app.test_request_context('/'):
+            resp, codigo = trigger_server._disparar(sync=True, solo_sync=True)
+        assert codigo == 202
+        assert resp.get_json()['status'] == 'queued', 'no se encoló: correría en paralelo'
     finally:
         trigger_server._state['status'] = 'idle'
         trigger_server._pendiente = None

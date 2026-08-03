@@ -48,8 +48,10 @@ Fuera del cron:
 
 - **`activar_cartera.py`** — cambia la cartera del mes por la nueva, archivando
   la saliente. Lo dispara una persona desde la app, nunca solo.
-- **`trigger_server.py`** — servicio HTTP para que la app pida un reproceso sin
-  esperar a la corrida del día siguiente.
+- **`trigger_server.py`** — servicio HTTP para que la app pida trabajo sin
+  esperar a la corrida del día siguiente. Tres carriles: `/trigger/cruce`
+  (todo), `/trigger/reproceso` (recalcular, opcionalmente **un solo pago**) y
+  `/trigger/sync` (solo mirar Drive, sin recalcular).
 - **`vigilante.py`** — mira si llegó algo a Drive fuera de hora. Devuelve código
   de salida 1 cuando no hay nada, para que la cadena ni arranque.
 
