@@ -1591,9 +1591,21 @@ def main():
     # `disponible` al asociar; acá solo se refleja, nunca se recalcula. Va
     # DESPUÉS de los cierres (no depende de su orden, es idempotente y de
     # solo lectura sobre el ledger cargado al inicio).
+    #
+    # Solo se pinta el saldo de los pagos que SÍ pagaron esa cuota — mismo
+    # criterio que el aviso (3 de agosto). La plata de un pago que no cubre
+    # ninguna cuota no se muestra encima de una cuota ajena: caso 1022389618,
+    # donde la cuota la pagó exacto el pago del 2 de agosto y encima aparecía
+    # "Saldo a favor $503.125" de un pago de julio que se había descartado de
+    # esa misma cuota. Regla del usuario: un pago que no es del día no debe
+    # contarse como saldo a favor. La plata no se pierde — el pago sigue en
+    # Cruce de Cartera y su registro en el ledger, que es lo que impide que se
+    # vuelva a aplicar solo.
     diferencia_deseada: dict[str, float] = {}
     for mk, destino in destino_por_pago.items():
         if destino not in id_por_llave:
+            continue
+        if not llaves_vigentes_por_pago.get(mk):
             continue
         diferencia_deseada[destino] = round(
             diferencia_deseada.get(destino, 0.0) + saldo_por_pago[mk]['disponible'], 2)

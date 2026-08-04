@@ -495,6 +495,16 @@ def test_un_pago_que_no_paga_ninguna_cuota_no_avisa_nada(mundo):
         'la cuota avisa sobre un pago que ya no la paga'
     )
 
+    # Tampoco le pinta el saldo a favor encima: la cuota está pagada exacto y
+    # esa plata es de un pago que no la pagó (regla del usuario, 3 de agosto).
+    fila = {}
+    for f in capturado.get('cartera_preventiva', []):
+        if f.get('id') == _id_de('INS7-A'):
+            fila.update(f)
+    assert float(fila.get('diferencia') or 0) == 0, (
+        f"la cuota muestra saldo a favor {fila.get('diferencia')} de un pago que no la pagó"
+    )
+
 
 # ── `valor_pago` muestra lo que entró por ese pago (3 de agosto) ───────────
 #
