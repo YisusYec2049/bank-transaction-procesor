@@ -1441,7 +1441,24 @@ def main():
 
     pagos_nuevos_por_doc: dict[str, list[dict]] = {}
     for p in pagos_nuevos:
-        doc = str(p.get('identification') or '').strip()
+        # Mismo criterio que las cuotas (4.2): el documento se compara por su
+        # número base, sin dígito de verificación. Hasta el 4 de agosto acá se
+        # usaba el valor crudo mientras las cuotas ya venían normalizadas, así
+        # que un NIT con DV nunca encontraba su bolsa: el pago decía
+        # "901317423-2" y su cuota estaba archivada bajo "901317423". Los datos
+        # de las dos tablas eran idénticos; la diferencia la creaba este bucle.
+        #
+        # Normalizar de los DOS lados es lo correcto, no un atajo: el DV se
+        # calcula a partir del número base (fórmula DIAN), así que no distingue
+        # empresas — dos NIT no pueden compartir base y diferir solo en el
+        # dígito. Y cubre las cuatro combinaciones, incluida la que motivó la
+        # normalización original del 8 de julio (cartera con DV, banco sin él).
+        # Medido antes de aplicarlo: 0 documentos colapsan al normalizar, ni en
+        # cuotas ni en pagos.
+        #
+        # `doc` es solo llave de búsqueda en memoria: no se escribe en ninguna
+        # tabla, así que el documento sigue guardándose con su DV intacto.
+        doc = _normalizar_documento(p.get('identification'))
         if doc and p.get('payment_amount'):
             pagos_nuevos_por_doc.setdefault(doc, []).append(p)
 

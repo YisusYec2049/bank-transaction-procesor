@@ -645,3 +645,70 @@ def test_el_valor_pago_inflado_no_oscila_entre_corridas(mundo):
     assert not escrituras, (
         f'la fila ya estaba correcta y se reescribió igual: {escrituras}'
     )
+
+
+# ---------------------------------------------------------------------------
+# NIT con dígito de verificación (4 de agosto)
+#
+# Caso real que lo destapó: AMCH SAS, NIT 901317423-2, inscripción 293PJ. Pagó
+# $802.125 por WOMPI y su cuota seguía diciendo "Sin pago identificado". Las dos
+# tablas guardaban el documento IDÉNTICO, con su DV — la diferencia la creaba el
+# propio bucle de agrupación, que normalizaba el lado de las cuotas y no el de
+# los pagos. Eran 4 pagos por $4.010.625 esperando desde el 16 de julio.
+#
+# El DV se calcula a partir del número base (fórmula DIAN), así que no distingue
+# empresas: comparar por la base es la comparación correcta, no un atajo.
+# ---------------------------------------------------------------------------
+
+def test_nit_con_digito_de_verificacion_de_los_dos_lados(mundo):
+    """El caso real: cuota y pago traen el MISMO documento, con DV. Antes del
+    4 de agosto no se juntaban, y no había forma de verlo en pantalla porque los
+    dos datos se veían iguales."""
+    capturado = mundo(ccp, tablas={
+        'cartera_preventiva': [_cuota('293PJ-A', '293PJ', '901317423-2', 802_125, '2026-07-10')],
+        'cruce_cartera': [_pago_cruzado('PAGO-NIT', '901317423-2', '293PJ', 802_125)],
+    })
+
+    cuota = _por_llave(capturado).get('293PJ-A')
+    assert cuota is not None, 'la cuota no se tocó: el pago no encontró su documento'
+    assert float(cuota['valor_pago']) == 802_125
+
+
+def test_nit_con_digito_solo_en_la_cuota(mundo):
+    """La combinación que motivó la normalización original (8 de julio): el
+    Excel de cartera trae el NIT completo y el banco lo manda sin DV."""
+    capturado = mundo(ccp, tablas={
+        'cartera_preventiva': [_cuota('INS20-A', 'INS20', '860004922-4', 300_000, '2026-07-01')],
+        'cruce_cartera': [_pago_cruzado('PAGO-N2', '860004922', 'INS20', 300_000)],
+    })
+
+    assert _por_llave(capturado).get('INS20-A') is not None, (
+        'un pago sin DV dejó de encontrar su cuota con DV'
+    )
+
+
+def test_nit_con_digito_solo_en_el_pago(mundo):
+    """La combinación inversa: el documento se corrigió a mano con el NIT
+    completo y la cuota quedó sin DV."""
+    capturado = mundo(ccp, tablas={
+        'cartera_preventiva': [_cuota('INS21-A', 'INS21', '860004922', 300_000, '2026-07-01')],
+        'cruce_cartera': [_pago_cruzado('PAGO-N3', '860004922-4', 'INS21', 300_000)],
+    })
+
+    assert _por_llave(capturado).get('INS21-A') is not None, (
+        'un pago con DV dejó de encontrar su cuota sin DV'
+    )
+
+
+def test_normalizar_el_dv_no_junta_dos_documentos_distintos(mundo):
+    """Salvaguarda: quitar el DV no puede hacer que el pago de una empresa caiga
+    en la cuota de otra. Sin `-<un dígito>` al final no se toca nada, así que
+    "9013174232" (diez dígitos, sin guion) sigue siendo otro documento."""
+    capturado = mundo(ccp, tablas={
+        'cartera_preventiva': [_cuota('INS22-A', 'INS22', '9013174232', 500_000, '2026-07-01')],
+        'cruce_cartera': [_pago_cruzado('PAGO-N4', '901317423-2', 'INS22', 500_000)],
+    })
+
+    assert _por_llave(capturado).get('INS22-A') is None, (
+        'el pago cayó en la cuota de un documento distinto'
+    )
