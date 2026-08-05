@@ -1882,6 +1882,15 @@ def main():
     # decisión del usuario: mientras están sin identificar no son un pago listo
     # que se ignoró, son trabajo pendiente, y corregirles el INCP tiene que
     # seguir sirviendo. Al 5 de agosto son 78 pagos por $73.220.106.
+    # Se sella únicamente lo que NUNCA se aplicó, en ningún lado. Los cuatro
+    # conjuntos tienen que ser los mismos que decidieron la elegibilidad, y en
+    # particular `matching_keys_archivados` NO puede faltar: un pago que pagó
+    # cuotas bajo la cartera anterior sí usó su oportunidad, y marcarlo como si
+    # nunca la hubiera usado es mentir sobre lo que pasó. Medido con la
+    # simulación del 5 de agosto contra producción: sin ese conjunto se sellaban
+    # **550 pagos en vez de 0** — 534 ya aplicados bajo la cartera de julio, y el
+    # resto cobrados a mano en un Excel archivado. El error no lo encontró
+    # ninguna prueba: lo encontró correr el script de verdad y mirar el número.
     if args.cierre_diario:
         con_cuota = set(llaves_por_pago)
         en_ledger = {s['matching_key'] for s in saldos_favor_rows if s.get('matching_key')}
@@ -1892,6 +1901,8 @@ def main():
             and str(p['registration_date'])[:10] < hoy
             and p['matching_key'] not in con_cuota
             and p['matching_key'] not in en_ledger
+            and p['matching_key'] not in matching_keys_en_excel
+            and p['matching_key'] not in matching_keys_archivados
         ]
         if a_sellar:
             marcar_aplicacion_cerrada(supabase_url, srk, a_sellar, hoy)

@@ -471,6 +471,48 @@ def test_el_cierre_diario_no_sella_un_pago_con_sobrante(mundo):
     assert not capturado.get('sellados'), 'se selló un pago que todavía tiene sobrante'
 
 
+def test_el_cierre_diario_no_sella_un_pago_aplicado_bajo_la_cartera_ANTERIOR(mundo):
+    """Un pago que pagó cuotas bajo la cartera de julio SÍ usó su oportunidad:
+    su registro vive en `pago_asociaciones_archivo` porque el swap lo archivó.
+    Sellarlo sería decir que nunca la usó.
+
+    Lo cazó la simulación en el VPS (5 de agosto): sin este descarte se sellaban
+    550 pagos en vez de 16, y 534 eran justamente estos."""
+    pago = _pago_cruzado('PAGO-DE-CARTERA-VIEJA', '1002003109', 'INS19', 500_000)
+    pago['registration_date'] = _dia_relativo(-1)
+    tablas = _mundo_de_un_pago(pago)
+    tablas['pago_asociaciones_archivo'] = [{
+        'matching_key': 'PAGO-DE-CARTERA-VIEJA',
+        'created_at': f'{_dia_relativo(-15)}T15:00:00+00:00',
+    }]
+    capturado = mundo(ccp, tablas=tablas, argv=['--cierre-diario'])
+
+    assert not capturado.get('sellados'), (
+        'se selló un pago que ya había pagado cuotas bajo la cartera anterior'
+    )
+
+
+def test_el_cierre_diario_no_sella_un_pago_que_el_excel_VIEJO_trae_cobrado(mundo):
+    """El proceso manual anota en el Excel el pago que cobró
+    (`codigo_transaccion_1`). Ese pago está aplicado, solo que su registro no
+    vive en `pago_asociaciones` — y cuando esa cartera se archiva, la única
+    memoria de que se cobró queda en `cartera_preventiva_archivo`.
+
+    La cartera VIVA no sirve para probar esto: por ahí el pago ya queda cubierto
+    al armar las llaves de cada pago, así que el test pasaría igual con el
+    descarte quitado. Lo destapó una mutación."""
+    pago = _pago_cruzado('PAGO-COBRADO-EN-EXCEL', '1002003110', 'INS20', 500_000)
+    pago['registration_date'] = _dia_relativo(-1)
+    tablas = _mundo_de_un_pago(pago)
+    tablas['cartera_preventiva_archivo'] = [
+        {'codigo_transaccion_1': 'PAGO-COBRADO-EN-EXCEL'}]
+    capturado = mundo(ccp, tablas=tablas, argv=['--cierre-diario'])
+
+    assert not capturado.get('sellados'), (
+        'se selló un pago que una cartera anterior ya traía cobrado a mano'
+    )
+
+
 def test_el_cierre_diario_no_sella_los_pagos_de_excepciones(mundo):
     """Decisión del usuario (5 de agosto): mientras un pago está sin identificar
     no es un pago listo que se ignoró, es trabajo pendiente — y corregirle el
