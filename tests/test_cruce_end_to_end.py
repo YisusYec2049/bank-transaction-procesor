@@ -192,3 +192,101 @@ def test_ninguna_pasarela_revienta_el_cruce(mundo, metodo):
     })
 
     assert 'PAGO-1' in _filas(capturado)
+
+
+# ── Correcciones de documento (5 de agosto) ───────────────────────────────────
+#
+# Las tres pruebas de acá vienen de un mismo día en producción, en el que dos
+# personas perdieron su pago por cómo se guardaban las correcciones.
+
+
+def test_una_correccion_no_toca_el_pago_de_otra_persona(mundo):
+    """El caso real del 5 de agosto, con sus documentos.
+
+    Al pago de Fabián le escribieron 1115187678 por error y lo corrigieron seis
+    minutos después a 98698854. Pero 1115187678 es el documento REAL de
+    Alexander: como la corrección se guardaba por número y se aplicaba a todos
+    los pagos que lo trajeran, el pago de Alexander quedó con el documento de
+    Fabián y se fue a buscar cuotas que no eran. $695.284 que calzaban exacto
+    con su cuota y no la pagaron.
+    """
+    capturado = mundo(cruzar, tablas={
+        'consolidated_transactions': [
+            _pago('PAGO-FABIAN', identification='98698854'),
+            _pago('PAGO-ALEXANDER', identification='1115187678'),
+        ],
+        'cartera_inscrip': [
+            {'numero_id': '98698854', 'id_inscripcion': '4620PN'},
+            {'numero_id': '1115187678', 'id_inscripcion': '3530PN'},
+        ],
+        'documento_correcciones': [
+            {'documento_original': '1115187678', 'documento_corregido': '98698854',
+             'matching_key_original': 'PAGO-FABIAN',
+             'created_at': '2026-08-05T16:19:37', 'updated_at': '2026-08-05T16:19:37'},
+        ],
+    })
+
+    filas = _filas(capturado)
+    assert filas['PAGO-ALEXANDER']['incp'] == '3530PN', (
+        'la corrección hecha en el pago de Fabián se le aplicó al de Alexander: '
+        f"quedó en {filas['PAGO-ALEXANDER']['incp']!r} en vez de su propia inscripción"
+    )
+    assert filas['PAGO-FABIAN']['incp'] == '4620PN'
+
+
+def test_manda_la_ultima_correccion_del_pago(mundo):
+    """Corregir dos veces tiene que dejar el último número, no el primero.
+
+    El 4 de agosto corrigieron un pago a un documento equivocado, lo aplicó a
+    la cuota de otra persona, y seis minutos después intentaron devolverlo. No
+    se pudo: la corrección vieja seguía viva y volvía a pisar el número en cada
+    corrida. $650.614 pagando la cuota de quien no era.
+    """
+    capturado = mundo(cruzar, tablas={
+        'consolidated_transactions': [_pago('PAGO-1', identification='71275931')],
+        'cartera_inscrip': [
+            {'numero_id': '43186459', 'id_inscripcion': '2492PN'},
+            {'numero_id': '71275931', 'id_inscripcion': '9001PN'},
+        ],
+        'documento_correcciones': [
+            {'documento_original': '71275931',
+             'documento_corregido': '43186459', 'matching_key_original': 'PAGO-1',
+             'created_at': '2026-08-04T17:55:32', 'updated_at': '2026-08-04T17:55:32'},
+            {'documento_original': '43186459',
+             'documento_corregido': '71275931', 'matching_key_original': 'PAGO-1',
+             'created_at': '2026-08-04T18:01:34', 'updated_at': '2026-08-04T18:01:34'},
+        ],
+    })
+
+    fila = _filas(capturado)['PAGO-1']
+    assert fila['incp'] == '9001PN', (
+        f'ganó la corrección vieja: el pago quedó en {fila["incp"]!r}, o sea que '
+        'devolver un documento mal corregido sigue sin funcionar'
+    )
+
+
+def test_la_correccion_de_un_pago_si_se_le_aplica_a_ese_pago(mundo):
+    """La contracara: acotarlo al pago no puede dejarlo sin efecto.
+
+    En Bancolombia 2576/2833 el correo es una copia literal del documento, y la
+    plataforma solo corrige el documento — así que sin este paso CORREO(2)
+    seguiría buscando con el número viejo.
+    """
+    capturado = mundo(cruzar, tablas={
+        'consolidated_transactions': [
+            _pago('PAGO-1', identification='11111111', email='11111111')],
+        'cartera_inscrip': [{'numero_id': '22222222', 'id_inscripcion': '4321PN'}],
+        'cartera_ingresos_bancolombia_2576': [
+            {'referencia_1': '22222222', 'incp': '4321PN'}],
+        'documento_correcciones': [
+            {'documento_original': '11111111',
+             'documento_corregido': '22222222', 'matching_key_original': 'PAGO-1',
+             'created_at': '2026-08-05T10:00:00', 'updated_at': '2026-08-05T10:00:00'},
+        ],
+    })
+
+    fila = _filas(capturado)['PAGO-1']
+    assert fila['incp'] == '4321PN', 'la corrección no se aplicó a su propio pago'
+    assert fila['correo_2'] == '4321PN', (
+        'el correo quedó con el documento viejo: CORREO(2) seguiría buscando mal'
+    )

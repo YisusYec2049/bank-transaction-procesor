@@ -295,50 +295,82 @@ def _es_pago_compartido(valor: str) -> bool:
 
 
 def _cargar_correcciones_documento(supabase_url: str, srk: str) -> dict[str, str]:
-    """Mapa documento_original -> documento_corregido (tabla que llena
-    financial-platform cuando alguien edita un documento a mano)."""
+    """Mapa matching_key -> documento_corregido, con la ÚLTIMA corrección de
+    cada pago (tabla que llena financial-platform cuando alguien edita un
+    documento a mano).
+
+    **Una corrección vale solo para el pago en el que se hizo** (5 de agosto).
+    Antes la memoria era por número de documento y se aplicaba a todos los
+    pagos que lo trajeran, para siempre. Rompía de dos formas, las dos vistas
+    en producción el mismo día:
+
+    1. Si el número mal digitado era el documento REAL de otra persona, los
+       pagos de esa persona quedaban con el documento ajeno. Pasó: al pago de
+       Fabián le escribieron 1115187678 por error y lo corrigieron seis
+       minutos después; 1115187678 es el documento de Alexander, así que su
+       pago ($695.284, que calzaba exacto con su cuota) quedó con el documento
+       de Fabián y no pagó nada.
+    2. No se podía revertir. La corrección vieja seguía viva y volvía a pisar
+       el valor en cada corrida, así que el primer número escrito ganaba para
+       siempre. Pasó: $650.614 pagando la cuota de otra persona, con dos
+       intentos de devolverlo que no sirvieron de nada.
+
+    De ahí las dos reglas de acá: **por pago** (se ignora todo el que no sea
+    el suyo) y **manda la más reciente** (corregir dos veces deja el último
+    número que escribió la persona, no el primero).
+    """
     rows = select_all(supabase_url, srk, 'documento_correcciones',
-                       select='documento_original,documento_corregido')
-    return {
-        str(r['documento_original']).strip(): str(r['documento_corregido']).strip()
-        for r in rows
-        if str(r.get('documento_original') or '').strip()
-        and str(r.get('documento_corregido') or '').strip()
-    }
+                       select='documento_original,documento_corregido,'
+                              'matching_key_original,created_at,updated_at')
+    ultima: dict[str, tuple[str, str, str]] = {}
+    for r in rows:
+        pago = str(r.get('matching_key_original') or '').strip()
+        nuevo = str(r.get('documento_corregido') or '').strip()
+        if not pago or not nuevo:
+            continue
+        cuando = str(r.get('updated_at') or r.get('created_at') or '')
+        anterior = ultima.get(pago)
+        if anterior is None or cuando >= anterior[0]:
+            ultima[pago] = (cuando, nuevo, str(r.get('documento_original') or '').strip())
+    return {pago: (nuevo, viejo) for pago, (_, nuevo, viejo) in ultima.items()}
 
 
 def _aplicar_correcciones_documento(transacciones: list[dict],
                                      correcciones: dict[str, str]) -> list[dict]:
-    """Aplica las correcciones de documento al leer el consolidado, para que
-    INCP y CORREO(2) busquen con el número bueno.
+    """Aplica a cada pago SU corrección de documento, para que INCP y CORREO(2)
+    busquen con el número bueno.
 
-    procesar_todos.py ya las aplica al ingresar cada archivo, pero eso solo
-    cubre los pagos que entran DESPUÉS de la corrección. Las transacciones ya
-    guardadas las corrige financial-platform escribiendo `identification`
-    directo en la tabla — y ahí estaba el hueco: en Bancolombia 2576/2833
-    `email` es una copia literal del documento (ver normalize() de cada
-    módulo), y esa app no lo sabe ni tiene por qué saberlo, así que solo
-    corregía `identification`. CORREO(2) seguía buscando con el número viejo.
+    financial-platform ya escribe el documento corregido en la fila del
+    consolidado, así que casi siempre esto no cambia nada. Sigue haciendo
+    falta por dos motivos:
 
-    Acá se corrigen los dos campos. `email` solo se toca cuando su valor ES
-    el documento original (nunca un correo de verdad), así que aplicarlo a
-    todos los bancos es inofensivo: en los demás `email` trae un correo y no
-    coincide con la llave. `matching_key` no se recalcula a propósito — la
-    fila ya existe con esa llave en las 3 tablas y renombrarla la duplicaría.
+    - En Bancolombia 2576/2833 `email` es una copia literal del documento (ver
+      normalize() de cada módulo). Esa app no lo sabe ni tiene por qué
+      saberlo, así que solo corrige `identification` y CORREO(2) seguiría
+      buscando con el valor viejo.
+    - Es lo que hace que **revertir funcione**: si corrigieron dos veces, acá
+      manda la última, aunque el consolidado hubiera quedado con otra.
+
+    `email` solo se toca cuando su valor ES el documento (nunca un correo de
+    verdad), así que aplicarlo a todos los bancos es inofensivo. `matching_key`
+    no se recalcula a propósito — la fila ya existe con esa llave en las 3
+    tablas y renombrarla la duplicaría.
     """
     if not correcciones:
         return transacciones
     corregidas = 0
     for t in transacciones:
+        correccion = correcciones.get(t.get('matching_key'))
+        if not correccion:
+            continue
+        nuevo_doc, doc_anterior = correccion
         documento = str(t.get('identification') or '').strip()
         email     = str(t.get('email') or '').strip()
-        nuevo_doc = correcciones.get(documento)
-        if nuevo_doc:
+        if documento != nuevo_doc:
             t['identification'] = nuevo_doc
             corregidas += 1
-        nuevo_email = correcciones.get(email)
-        if nuevo_email:
-            t['email'] = nuevo_email
+        if email and email in (documento, doc_anterior):
+            t['email'] = nuevo_doc
     if corregidas:
         log.info('%d transacción(es) con documento corregido a mano.', corregidas)
     return transacciones

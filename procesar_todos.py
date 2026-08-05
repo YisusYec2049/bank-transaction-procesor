@@ -47,7 +47,6 @@ import fuentes.wompi as mod_wompi
 from utils import dry_run
 from utils.drive import download_pdf as download_file
 from utils.drive import list_files, move_file
-from utils.parser import valor_str
 from utils.supabase import (
     existing_matching_keys,
     keys_del_dia_anterior,
@@ -174,64 +173,25 @@ def _alertar_colision_supabase(filtradas: list[tuple], banco: str,
         log.warning('[%s] matching_key ya existe en Supabase (colisión entre lotes/días): %s', banco, k)
 
 
-# ── Correcciones de documento (Fase 5, F.2) ───────────────────────────────────
-
-# Bancos cuyo matching_key incluye el documento — necesitan recalcular la
-# llave cuando se corrige (los demás usan un id de transacción, sin cambios).
-_FORMULA_MATCHING_KEY = {
-    # fecha/DD/MM/YYYY_ident_valor — igual que fuentes/bancolombia_2576.py y
-    # fuentes/bancolombia_2833.py (mismo formato en ambos).
-    'bc2576':     lambda fecha_slash, ident, row: f'{fecha_slash}_{ident}_{valor_str(row[9])}',
-    'bc2833':     lambda fecha_slash, ident, row: f'{fecha_slash}_{ident}_{valor_str(row[9])}',
-    # fecha/DD/MM/YYYY_valor_ident — igual que fuentes/colpatria.py.
-    'colpatria':  lambda fecha_slash, ident, row: f'{fecha_slash}_{valor_str(row[9])}_{ident}',
-    # fecha/DD/MM/YYYY_documento_referencia1 — igual que fuentes/davivienda.py.
-    'davivienda': lambda fecha_slash, ident, row: f'{fecha_slash}_{ident}_{row[4]}',
-}
-
-
-def _cargar_correcciones_documento(supabase_url: str, srk: str) -> dict[str, str]:
-    rows = select_all(supabase_url, srk, 'documento_correcciones',
-                       select='documento_original,documento_corregido')
-    return {
-        r['documento_original']: r['documento_corregido']
-        for r in rows if r.get('documento_original') and r.get('documento_corregido')
-    }
-
-
-def _aplicar_correcciones_documento(rows: list[tuple], banco: str,
-                                     correcciones: dict[str, str]) -> list[tuple]:
-    """Si `identification` de una fila está en documento_correcciones (F.2),
-    la reemplaza por el documento corregido ANTES de que la fila se escriba
-    a ningún lado, y recalcula matching_key para los bancos cuya llave lo
-    incluye (ver _FORMULA_MATCHING_KEY) — así no se duplica el pago ni hay
-    que corregirlo dos veces. La memoria es por documento, no por
-    transacción: una corrección se aplica a todos los pagos futuros con ese
-    mismo documento, sin que nadie tenga que repetirla."""
-    if not correcciones:
-        return rows
-    resultado = []
-    for row in rows:
-        documento_original = row[1]
-        documento_corregido = correcciones.get(documento_original)
-        if not documento_corregido:
-            resultado.append(row)
-            continue
-        row = list(row)
-        row[1] = documento_corregido
-        if banco in ('bc2576', 'bc2833'):
-            # En estos dos bancos "email" (índice 5) es una copia literal
-            # del documento (ver normalize() de cada módulo) — corregirlo
-            # también, si no CORREO(2) seguiría buscando con el valor malo.
-            row[5] = documento_corregido
-        formula = _FORMULA_MATCHING_KEY.get(banco)
-        if formula:
-            fecha_slash = str(row[2]).replace('-', '/')
-            row[10] = formula(fecha_slash, documento_corregido, row)
-        log.info('[%s] Documento corregido: %s -> %s (matching_key: %s)',
-                 banco, documento_original, documento_corregido, row[10])
-        resultado.append(tuple(row))
-    return resultado
+# ── Correcciones de documento: por qué acá ya no se aplican ───────────────────
+#
+# Hasta el 5 de agosto, al ingresar un archivo se reescribía el documento de
+# toda fila que trajera un número ya corregido antes ("memoria por documento":
+# una corrección se aplicaba sola a todos los pagos futuros con ese número).
+# La idea era no tener que repetir la corrección cuando el banco manda mal el
+# mismo documento varias veces.
+#
+# Se quitó porque el costo era mucho mayor que el ahorro. El número que queda
+# guardado como "malo" es el que **tecleó una persona**, y si resulta ser el
+# documento real de alguien más, los pagos de esa persona quedan con la
+# identidad ajena sin que nadie lo note. Pasó en producción el 5 de agosto:
+# corrigieron el pago de Fabián a los seis minutos, pero el número mal
+# digitado era el de Alexander, y su pago ($695.284, que calzaba exacto con su
+# cuota) quedó marcado como de Fabián.
+#
+# Desde entonces una corrección vale SOLO para el pago en el que se hizo, y la
+# aplica `cruzar.py` leyendo `matching_key_original`. Un pago nuevo entra
+# siempre con el documento que mandó el banco; si viene mal, se corrige.
 
 
 # ── Cheques (Fase 2E): se apartan del proceso por completo ────────────────────
@@ -323,8 +283,7 @@ def _apartar_cheques(cheques: list[tuple], banco: str, supabase_url: str, srk: s
 # ── Procesamiento genérico ────────────────────────────────────────────────────
 
 def _procesar_banco(drive, banco: str, cfg: dict,
-                    yesterday_keys: set[str], dry_run: bool,
-                    correcciones: dict[str, str]):
+                    yesterday_keys: set[str], dry_run: bool):
     mod    = cfg['mod']
     prefix = cfg['prefix']
     inbox  = os.environ.get(f'{prefix}_INBOX_FOLDER_ID', '')
@@ -358,7 +317,6 @@ def _procesar_banco(drive, banco: str, cfg: dict,
                 continue
 
             normalized = mod.normalize(raw_rows)
-            normalized = _aplicar_correcciones_documento(normalized, banco, correcciones)
             candidatos, cheques = mod.cheque_logic(normalized)
 
             usar_sufijos = cfg.get('dedup_sufijo', False)
@@ -396,8 +354,7 @@ def _procesar_banco(drive, banco: str, cfg: dict,
 # ── Bancolombia (PDFs con lógica de cheques) ─────────────────────────────────
 
 def _procesar_bancolombia(drive, banco: str, cfg: dict,
-                                yesterday_keys: set[str], dry_run: bool,
-                          correcciones: dict[str, str]):
+                          yesterday_keys: set[str], dry_run: bool):
     mod    = cfg['mod']
     prefix = cfg['prefix']
     inbox  = os.environ.get(f'{prefix}_INBOX_FOLDER_ID', '')
@@ -431,7 +388,6 @@ def _procesar_bancolombia(drive, banco: str, cfg: dict,
                 continue
 
             normalized = mod.normalize(raw_rows)
-            normalized = _aplicar_correcciones_documento(normalized, banco, correcciones)
             candidatos, cheques = mod.cheque_logic(normalized)
 
             # Bancolombia (2576/2833): matching_key = fecha_documento_monto,
@@ -466,9 +422,7 @@ def _procesar_bancolombia(drive, banco: str, cfg: dict,
 
 # ── PayU (caso especial: dos archivos) ────────────────────────────────────────
 
-def _procesar_payu(drive,
-                   yesterday_keys: set[str], dry_run: bool,
-                   correcciones: dict[str, str]):
+def _procesar_payu(drive, yesterday_keys: set[str], dry_run: bool):
     payu_inbox   = os.environ.get('PAYU_INBOX_FOLDER_ID', '')
     moneda_inbox = os.environ.get('PAYU_MONEDA_INBOX_FOLDER_ID', '')
     payu_hist    = os.environ.get('PAYU_HISTORICO_FOLDER_ID', '')
@@ -506,7 +460,6 @@ def _procesar_payu(drive,
                 continue
 
             normalized = mod_payu.normalize(raw_rows)
-            normalized = _aplicar_correcciones_documento(normalized, 'payu', correcciones)
 
             seen, filtradas = set(), []
             for row in normalized:
@@ -579,27 +532,17 @@ def main():
         os.environ['SUPABASE_URL'], os.environ['SUPABASE_SERVICE_ROLE_KEY'])
     log.info('Llaves históricas cargadas: %d', len(yesterday_keys))
 
-    # Fase 5 (F.2): correcciones de documento por NIT, memoria por documento
-    # — se aplican antes de escribir, en todos los bancos.
-    correcciones = _cargar_correcciones_documento(
-        os.environ['SUPABASE_URL'], os.environ['SUPABASE_SERVICE_ROLE_KEY'])
-    if correcciones:
-        log.info('%d corrección(es) de documento cargadas.', len(correcciones))
-
     for banco, tipo in _PIPELINE:
         if args.bank and args.bank != banco:
             continue
         if tipo == 'payu':
-            _procesar_payu(drive, yesterday_keys,
-                            args.dry_run, correcciones)
+            _procesar_payu(drive, yesterday_keys, args.dry_run)
         elif tipo == 'bancolombia':
             _procesar_bancolombia(drive, banco, BANCOS_BANCOLOMBIA[banco],
-                                  yesterday_keys,
-                                  args.dry_run, correcciones)
+                                  yesterday_keys, args.dry_run)
         else:
             _procesar_banco(drive, banco, BANCOS[banco],
-                            yesterday_keys,
-                            args.dry_run, correcciones)
+                            yesterday_keys, args.dry_run)
 
     log.info('procesar_todos.py completado.')
     if dry_run.activo():
