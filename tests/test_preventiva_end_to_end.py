@@ -346,6 +346,144 @@ def test_un_pago_sin_fecha_de_ingreso_no_se_bloquea(mundo):
     )
 
 
+# ── El sello: la ventana de un pago y su cierre (5 de agosto) ────────────────
+#
+# La ventana va desde que el pago entra hasta la corrida diaria del día
+# siguiente. Al terminar esa corrida queda sellado y no vuelve a mover plata
+# nunca — ni solo, ni a mano, ni aunque después aparezca una cuota que calce
+# exacto. Sellar de más congela plata de gente que debe; sellar de menos deja
+# que la cartera del mes se pague con dinero de otro mes.
+
+def _dia_relativo(dias: int) -> str:
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+    return (datetime.now(ZoneInfo('America/Bogota'))
+            + timedelta(days=dias)).strftime('%Y-%m-%d')
+
+
+def _mundo_de_un_pago(pago, cuotas=None):
+    return {
+        'cartera_cargas': [_carga(f'{_hoy_bogota()}T15:23:32+00:00')],
+        'cartera_preventiva': cuotas if cuotas is not None else [],
+        'cruce_cartera': [pago],
+    }
+
+
+def test_un_pago_sellado_no_se_aplica_aunque_la_cuota_calce_exacto(mundo):
+    """El corazón de la regla. La cuota calza al peso y aun así no se paga."""
+    pago = _pago_cruzado('PAGO-SELLADO', '1002003100', 'INS10', 500_000)
+    pago['registration_date'] = _dia_relativo(-1)
+    pago['aplicacion_cerrada_at'] = _dia_relativo(-1)
+    capturado = mundo(ccp, tablas=_mundo_de_un_pago(
+        pago, [_cuota('INS10-A', 'INS10', '1002003100', 500_000, '2026-08-13')]))
+
+    assert not capturado.get('pago_asociaciones'), (
+        'un pago sellado volvió a pagar una cuota'
+    )
+    assert 'INS10-A' not in _por_llave(capturado), 'la cuota no debía tocarse'
+
+
+def test_un_pago_de_ayer_todavia_alcanza_la_corrida_de_hoy(mundo):
+    """La ventana llega hasta la corrida diaria del día siguiente: el pago de
+    ayer tiene acá su última oportunidad. Con el mismo mundo del test de arriba,
+    y lo único que cambia es el sello."""
+    pago = _pago_cruzado('PAGO-DE-AYER', '1002003101', 'INS11', 500_000)
+    pago['registration_date'] = _dia_relativo(-1)
+    capturado = mundo(ccp, tablas=_mundo_de_un_pago(
+        pago, [_cuota('INS11-A', 'INS11', '1002003101', 500_000, '2026-08-13')]))
+
+    cuota = _por_llave(capturado).get('INS11-A')
+    assert cuota is not None, 'el pago de ayer no alcanzó la corrida de hoy'
+    assert float(cuota['valor_pago']) == 500_000
+
+
+def test_un_pago_de_anteayer_ya_no_entra(mundo):
+    """El otro borde: dos días es tarde aunque nadie lo haya sellado todavía.
+    Es la red que evita que, el día que se agregue la columna, TODO lo viejo
+    quede elegible de golpe."""
+    pago = _pago_cruzado('PAGO-DE-ANTEAYER', '1002003102', 'INS12', 500_000)
+    pago['registration_date'] = _dia_relativo(-2)
+    capturado = mundo(ccp, tablas=_mundo_de_un_pago(
+        pago, [_cuota('INS12-A', 'INS12', '1002003102', 500_000, '2026-08-13')]))
+
+    assert not capturado.get('pago_asociaciones'), 'entró un pago de anteayer'
+
+
+def test_el_cierre_diario_sella_el_pago_que_se_quedo_sin_cuota(mundo):
+    pago = _pago_cruzado('PAGO-SIN-CUOTA', '1002003103', 'INS13', 500_000)
+    pago['registration_date'] = _dia_relativo(-1)
+    capturado = mundo(ccp, tablas=_mundo_de_un_pago(pago),
+                       argv=['--cierre-diario'])
+
+    assert capturado.get('sellados') == ['PAGO-SIN-CUOTA']
+    assert capturado.get('sellados_fecha') == _hoy_bogota()
+
+
+def test_un_reproceso_manual_no_sella_nada(mundo):
+    """La protección crítica: el mismo script lo corren los reprocesos que
+    dispara la plataforma y el vigilante de la tarde. Si sellaran, un reproceso
+    de las 08:00 mataría los pagos de ayer ANTES de que la corrida de las 10:30
+    les dé su última oportunidad — lo contrario de la regla."""
+    pago = _pago_cruzado('PAGO-SIN-CUOTA', '1002003104', 'INS14', 500_000)
+    pago['registration_date'] = _dia_relativo(-1)
+    capturado = mundo(ccp, tablas=_mundo_de_un_pago(pago))
+
+    assert not capturado.get('sellados'), 'un reproceso manual selló pagos'
+
+
+def test_el_cierre_diario_no_sella_un_pago_que_entro_hoy(mundo):
+    """Todavía le queda la corrida de mañana."""
+    pago = _pago_cruzado('PAGO-DE-HOY', '1002003105', 'INS15', 500_000)
+    pago['registration_date'] = _hoy_bogota()
+    capturado = mundo(ccp, tablas=_mundo_de_un_pago(pago),
+                       argv=['--cierre-diario'])
+
+    assert not capturado.get('sellados'), 'se selló un pago en su propio día'
+
+
+def test_el_cierre_diario_no_sella_un_pago_que_si_pago_su_cuota(mundo):
+    pago = _pago_cruzado('PAGO-APLICADO', '1002003106', 'INS16', 500_000)
+    pago['registration_date'] = _dia_relativo(-1)
+    capturado = mundo(ccp, tablas=_mundo_de_un_pago(
+        pago, [_cuota('INS16-A', 'INS16', '1002003106', 500_000, '2026-08-13')]),
+        argv=['--cierre-diario'])
+
+    assert _por_llave(capturado).get('INS16-A') is not None, 'el pago no se aplicó'
+    assert not capturado.get('sellados'), 'se selló un pago que sí pagó una cuota'
+
+
+def test_el_cierre_diario_no_sella_un_pago_con_sobrante(mundo):
+    """El sobrante tiene su propio reloj: vive mientras se opera y muere en el
+    cierre de cartera, no acá. Sellarlo con el pago apagaría el 'Asociar saldo'
+    que el área usa todos los días."""
+    pago = _pago_cruzado('PAGO-CON-SOBRANTE', '1002003107', 'INS17', 800_000)
+    pago['registration_date'] = _dia_relativo(-1)
+    tablas = _mundo_de_un_pago(pago)
+    tablas['cartera_saldos_favor'] = [{
+        'id': 900, 'inscrip': 'INS17', 'cliente': 'PERSONA DE PRUEBA',
+        'documento': '1002003107', 'correo': 'alguien@example.com',
+        'monto': 300_000, 'disponible': 300_000, 'origen': 'sobrante',
+        'llave_origen': 'INS17-A', 'matching_key': 'PAGO-CON-SOBRANTE',
+        'fecha': _dia_relativo(-1), 'aplicado': False,
+    }]
+    capturado = mundo(ccp, tablas=tablas, argv=['--cierre-diario'])
+
+    assert not capturado.get('sellados'), 'se selló un pago que todavía tiene sobrante'
+
+
+def test_el_cierre_diario_no_sella_los_pagos_de_excepciones(mundo):
+    """Decisión del usuario (5 de agosto): mientras un pago está sin identificar
+    no es un pago listo que se ignoró, es trabajo pendiente — y corregirle el
+    INCP días después tiene que seguir sirviendo."""
+    pago = _pago_cruzado('PAGO-EN-EXCEPCIONES', '1002003108', 'INS18', 500_000)
+    pago['registration_date'] = _dia_relativo(-1)
+    pago['estado_cruce'] = 'pendiente'
+    capturado = mundo(ccp, tablas=_mundo_de_un_pago(pago),
+                       argv=['--cierre-diario'])
+
+    assert not capturado.get('sellados'), 'se selló un pago que sigue en Excepciones'
+
+
 def test_una_cuota_corta_muestra_su_deuda_aunque_tenga_saldo_a_favor_encima(mundo):
     """Caso 1020838689. A una cuota cubierta por dos pagos se le descartó uno:
     la plataforma dejó `valor_pago` en lo que quedó aplicado y en `diferencia`

@@ -88,11 +88,16 @@ def mundo(monkeypatch):
         capturado = mundo(cruzar, tablas={'cartera_inscrip': [...], ...})
         assert capturado['cruce_cartera'][0]['estado_cruce'] == 'cruzado'
     """
-    def correr(modulo, tablas: dict, entorno: dict | None = None) -> dict:
+    def correr(modulo, tablas: dict, entorno: dict | None = None,
+                argv: list[str] | None = None) -> dict:
         # `main()` parsea sus propios flags desde sys.argv, y ahí están los de
         # pytest: sin esto, argparse se queja de "unrecognized arguments" y
         # tumba el test con SystemExit.
-        monkeypatch.setattr(sys, 'argv', [f'{modulo.__name__}.py'])
+        #
+        # `argv` deja pasar las banderas del script (ej. `--cierre-diario`), que
+        # cambian lo que hace de verdad: sin ellas se prueba siempre el camino
+        # por defecto y las banderas quedarían sin cobertura.
+        monkeypatch.setattr(sys, 'argv', [f'{modulo.__name__}.py'] + (argv or []))
 
         for clave, valor in {
             'SUPABASE_URL': 'https://falso.supabase.co',
@@ -138,6 +143,15 @@ def mundo(monkeypatch):
         ]:
             if hasattr(modulo, nombre):
                 monkeypatch.setattr(modulo, nombre, _capturar(destino))
+
+        # El sello recibe la lista de llaves en medio, no al final: `_capturar`
+        # se quedaría con la fecha y no con lo que interesa.
+        if hasattr(modulo, 'marcar_aplicacion_cerrada'):
+            def _sellar(_url, _srk, llaves, fecha, **_kw):
+                capturado.setdefault('sellados', []).extend(llaves)
+                capturado['sellados_fecha'] = fecha
+                return len(llaves)
+            monkeypatch.setattr(modulo, 'marcar_aplicacion_cerrada', _sellar)
 
         # delete_by_keys tiene la llave en otra posición (tabla, columna, valores).
         if hasattr(modulo, 'delete_by_keys'):

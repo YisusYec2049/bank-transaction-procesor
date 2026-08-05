@@ -642,6 +642,68 @@ def upsert_cartera_saldos_favor(supabase_url: str, service_role_key: str, rows: 
     log.info('Upsert cartera_saldos_favor OK: %d registros.', len(rows))
 
 
+def marcar_aplicacion_cerrada(supabase_url: str, service_role_key: str,
+                               matching_keys: list[str], fecha: str,
+                               batch_size: int = 200) -> int:
+    """Sella pagos: escribe `cruce_cartera.aplicacion_cerrada_at = fecha`.
+
+    REGLA DEL USUARIO (5 de agosto): un pago tiene su oportunidad desde que
+    entra hasta la corrida diaria del día siguiente. Si termina esa corrida sin
+    haberse aplicado a ninguna cuota, **queda sellado y no vuelve a mover plata
+    nunca** — ni solo, ni a mano desde la pantalla, ni aunque meses después
+    aparezca una cuota que calce al peso. Sigue registrado y visible; lo que se
+    apaga es su capacidad de pagar algo.
+
+    Textual: *"lo que quede ahí sin asociar, cruzar, ni editar antes de la
+    corrida de las 10:30am del día siguiente o del cierre de cartera, que quede
+    ahí, nunca más se menciona"*.
+
+    **Por qué se escribe en la base en vez de calcularse.** Hasta hoy la regla
+    vivía como una comparación de fechas en cada corrida
+    (`registration_date != hoy`), y eso la hacía depender de que esa fecha nunca
+    se re-selle: cualquier camino que le pusiera la fecha de hoy a un pago viejo
+    lo resucitaba, con la cuota del mes pagada con plata de otro mes. El sello
+    escrito no se puede recalcular mal.
+
+    **Un solo PATCH por lote**, no el camino en lote de `update_cruce_valores`:
+    todas las filas reciben el MISMO valor, y la función de base solo conoce las
+    columnas que le enseñaron — una columna nueva se le pasaría por alto sin un
+    solo error (ver docstring de `_actualizar_por_matching_key`).
+
+    Si la columna todavía no existe, avisa y devuelve 0 en vez de reventar: el
+    SQL y el despliegue son independientes a propósito (la lección del 24 de
+    julio, cuando código nuevo que exigía esquema nuevo dejó el motor caído un
+    día entero). Sin sello, la ventana de dos días sigue frenando lo viejo.
+
+    Devuelve cuántas llaves se sellaron.
+    """
+    if dry_run.registrar('cruce_cartera', 'sellar',
+                          [{'matching_key': k, 'aplicacion_cerrada_at': fecha}
+                           for k in matching_keys]):
+        return 0
+    if not matching_keys:
+        return 0
+    hdrs = _headers(service_role_key, prefer='return=minimal')
+    for i in range(0, len(matching_keys), batch_size):
+        batch = matching_keys[i:i + batch_size]
+        valores = ','.join(f'"{v}"' for v in batch)
+        resp = http.patch(
+            f'{supabase_url}/rest/v1/cruce_cartera',
+            params={'matching_key': f'in.({valores})'},
+            json={'aplicacion_cerrada_at': fecha},
+            headers=hdrs,
+            timeout=30,
+        )
+        if resp.status_code in (400, 404) and 'aplicacion_cerrada_at' in resp.text:
+            log.warning('cruce_cartera.aplicacion_cerrada_at no existe todavía: no se '
+                         'selló nada. Correr el ALTER TABLE y volver a intentar.')
+            return 0
+        _raise_for_status(resp)
+    log.info('Sellados %d pago(s): su ventana de aplicación cerró el %s.',
+              len(matching_keys), fecha)
+    return len(matching_keys)
+
+
 def delete_by_keys(supabase_url: str, service_role_key: str, table: str,
                     key_column: str, keys: list[str], batch_size: int = 200) -> None:
     """Borra de `table` todas las filas cuyo `key_column` esté en `keys`."""

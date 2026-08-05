@@ -133,9 +133,10 @@ import argparse
 import logging
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytz
+import requests
 from dotenv import load_dotenv
 
 from utils import dry_run
@@ -143,6 +144,7 @@ from utils.parser import normalizar_nit, normalizar_sufijo
 from utils.supabase import (
     delete_by_keys,
     insert_cartera_preventiva_lineas,
+    marcar_aplicacion_cerrada,
     select_all,
     update_cruce_valores,
     upsert_cartera_preventiva,
@@ -845,6 +847,12 @@ def _pago_mas_reciente(asociaciones: list[dict], pagos_por_matching_key: dict) -
 
 def main():
     parser = argparse.ArgumentParser(description='Aplica los pagos identificados sobre las cuotas pendientes.')
+    parser.add_argument(
+        '--cierre-diario', action='store_true',
+        help='Cierra el día: sella los pagos que ya tuvieron su oportunidad y siguen '
+             'sin aplicarse. SOLO la corrida diaria del cron debe pasarlo — si lo '
+             'pasara un reproceso manual de la mañana, mataría los pagos de ayer '
+             'antes de que la corrida de las 10:30 les dé su última oportunidad.')
     dry_run.agregar_flags(parser)
     args = parser.parse_args()
     dry_run.desde_args(args, 'preventiva')
@@ -859,6 +867,9 @@ def main():
 
     tz_bogota = pytz.timezone('America/Bogota')
     hoy = datetime.now(tz_bogota).strftime('%Y-%m-%d')
+    # La ventana de un pago llega hasta la corrida diaria del día siguiente, así
+    # que lo de ayer todavía es elegible: se sella recién al cerrar esta corrida.
+    ayer = (datetime.now(tz_bogota) - timedelta(days=1)).strftime('%Y-%m-%d')
 
     log.info('Cargando overrides y asociaciones existentes...')
     overrides_rows = select_all(supabase_url, srk, 'cartera_preventiva_overrides',
@@ -1026,12 +1037,20 @@ def main():
     )
 
     log.info('Cargando cruce_cartera (solo estado_cruce=cruzado)...')
-    pagos_rows = select_all(
-        supabase_url, srk, 'cruce_cartera',
-        select='matching_key,identification,payment_date,registration_date,'
-               'transaction_code_1,transaction_code_2,'
-               'email,payment_method,payment_amount,estado_cruce,incp,metodo_de_pago',
-    )
+    _columnas_pago = ('matching_key,identification,payment_date,registration_date,'
+                      'transaction_code_1,transaction_code_2,'
+                      'email,payment_method,payment_amount,estado_cruce,incp,metodo_de_pago')
+    # `aplicacion_cerrada_at` es el sello de "este pago ya tuvo su oportunidad".
+    # Se pide aparte y con red: si la columna todavía no existe, la corrida
+    # sigue con la ventana de fechas en vez de caerse. El SQL y el despliegue
+    # son independientes a propósito (lección del 24 de julio).
+    try:
+        pagos_rows = select_all(supabase_url, srk, 'cruce_cartera',
+                                 select=_columnas_pago + ',aplicacion_cerrada_at')
+    except requests.HTTPError:
+        log.warning('cruce_cartera.aplicacion_cerrada_at no existe todavía: se sigue solo '
+                     'con la ventana de fechas. Correr el ALTER TABLE para activar el sello.')
+        pagos_rows = select_all(supabase_url, srk, 'cruce_cartera', select=_columnas_pago)
     pagos_cruzados = [p for p in pagos_rows if p.get('estado_cruce') == 'cruzado' and p.get('incp')]
     pagos_por_matching_key = {p['matching_key']: p for p in pagos_cruzados}
 
@@ -1338,8 +1357,30 @@ def main():
         cartera que está activa hoy."""
         return pago['matching_key'] in matching_keys_reaplicables
 
-    def _fuera_de_su_dia(pago: dict) -> bool:
+    def _fuera_de_su_ventana(pago: dict) -> bool:
         """¿Es un pago que ya tuvo su oportunidad y no la usó?
+
+        REGLA VIGENTE (5 de agosto): la ventana de un pago va desde que entra
+        hasta **la corrida diaria del día siguiente** — esa corrida todavía
+        puede aplicarlo. Al terminarla queda **sellado**
+        (`cruce_cartera.aplicacion_cerrada_at`, ver `marcar_aplicacion_cerrada`)
+        y no vuelve a mover plata nunca: ni solo, ni a mano, ni aunque después
+        aparezca una cuota que calce exacto.
+
+        Se decide con dos candados, y hacen falta los dos:
+
+        1. **El sello**, que es el que manda. Está escrito en la base, así que
+           no se puede recalcular mal ni depende de que ninguna fecha se
+           conserve.
+        2. **La ventana de fechas** (hoy o ayer), que es la red mientras el
+           sello no exista o mientras la corrida diaria no haya pasado. Sin
+           ella, el día que se agregue la columna y todavía no se haya sellado
+           nada, TODO lo viejo quedaría elegible de golpe — medido el 5 de
+           agosto: 267 pagos por $247.448.773 cayendo sobre las cuotas nuevas.
+
+        Amplía en un día lo que regía desde el 3 de agosto (que cortaba a la
+        medianoche): un pago que entra el lunes por la tarde por el vigilante
+        alcanza la corrida del martes. Decisión explícita del usuario.
 
         REGLA DEL USUARIO (3 de agosto): **un pago se reparte el día que entra
         al sistema. Si ese día no encontró cuota, no se reparte nunca más
@@ -1381,10 +1422,12 @@ def main():
         pago del viernes que entra el lunes tiene que poder aplicarse el lunes.
         Sin `registration_date` no se bloquea nada: no hay dato con que decidir
         y perder plata en silencio es peor."""
+        if pago.get('aplicacion_cerrada_at'):
+            return True
         entrada = pago.get('registration_date')
         if not entrada:
             return False
-        return str(entrada)[:10] != hoy
+        return str(entrada)[:10] not in (hoy, ayer)
 
     pagos_nuevos = [
         p for p in pagos_cruzados
@@ -1392,22 +1435,24 @@ def main():
         and p['matching_key'] not in matching_keys_en_ledger
         and p['matching_key'] not in matching_keys_en_excel
         and (p['matching_key'] not in matching_keys_archivados or _reaplicable(p))
-        and not _fuera_de_su_dia(p)
+        and not _fuera_de_su_ventana(p)
     ]
     bloqueados = sum(1 for p in pagos_cruzados
                      if p['matching_key'] in matching_keys_archivados and not _reaplicable(p))
-    fuera_de_su_dia = sum(1 for p in pagos_cruzados
-                          if p['matching_key'] not in matching_keys_asociados
-                          and p['matching_key'] not in matching_keys_en_ledger
-                          and p['matching_key'] not in matching_keys_en_excel
-                          and _fuera_de_su_dia(p))
+    fuera_de_su_ventana = sum(1 for p in pagos_cruzados
+                              if p['matching_key'] not in matching_keys_asociados
+                              and p['matching_key'] not in matching_keys_en_ledger
+                              and p['matching_key'] not in matching_keys_en_excel
+                              and _fuera_de_su_ventana(p))
     log.info('%d pagos cruzados totales, %d nuevos (sin asociación/ledger previo). '
               '%d bloqueados por venir aplicados de una cartera anterior '
               '(carga activa del %s).',
               len(pagos_cruzados), len(pagos_nuevos), bloqueados, dia_carga_activa)
-    if fuera_de_su_dia:
-        log.info('%d pago(s) NO se auto-aplican: no entraron hoy y su día ya pasó '
-                  '(quedan para asignación manual).', fuera_de_su_dia)
+    if fuera_de_su_ventana:
+        sellados = sum(1 for p in pagos_cruzados if p.get('aplicacion_cerrada_at'))
+        log.info('%d pago(s) NO se auto-aplican: su ventana ya cerró (%d con sello '
+                  'escrito, el resto por fecha). Quedan solo como registro.',
+                  fuera_de_su_ventana, sellados)
 
     # §4.1/4.2: cuotas pendientes = sin pago identificado, sin cierre manual
     # y con saldo real por cobrar.
@@ -1821,6 +1866,37 @@ def main():
         update_cruce_valores(supabase_url, srk, cruce_updates)
         log.info('Cruce inverso: %d filas actualizadas (%d identificados, %d sin identificar).',
                   len(cruce_updates), con_match, len(cruce_updates) - con_match)
+
+    # ── Cierre del día: sellar lo que ya tuvo su oportunidad ────────────────
+    #
+    # Va DESPUÉS de aplicar los pagos de esta corrida, a propósito: un pago de
+    # ayer todavía podía aplicarse acá arriba, y solo si terminó sin cuota se
+    # sella. Sellar antes le quitaría la última oportunidad que la regla le da.
+    #
+    # Solo la corrida diaria (`--cierre-diario`, en la línea del cron). Los
+    # reprocesos que dispara la plataforma y el vigilante de la tarde corren
+    # este mismo script y NO deben sellar: un reproceso a las 08:00 mataría los
+    # pagos de ayer antes de la corrida de las 10:30.
+    #
+    # Los pagos en Excepciones (`estado_cruce != 'cruzado'`) quedan fuera por
+    # decisión del usuario: mientras están sin identificar no son un pago listo
+    # que se ignoró, son trabajo pendiente, y corregirles el INCP tiene que
+    # seguir sirviendo. Al 5 de agosto son 78 pagos por $73.220.106.
+    if args.cierre_diario:
+        con_cuota = set(llaves_por_pago)
+        en_ledger = {s['matching_key'] for s in saldos_favor_rows if s.get('matching_key')}
+        a_sellar = [
+            p['matching_key'] for p in pagos_cruzados
+            if not p.get('aplicacion_cerrada_at')
+            and p.get('registration_date')
+            and str(p['registration_date'])[:10] < hoy
+            and p['matching_key'] not in con_cuota
+            and p['matching_key'] not in en_ledger
+        ]
+        if a_sellar:
+            marcar_aplicacion_cerrada(supabase_url, srk, a_sellar, hoy)
+        else:
+            log.info('Cierre del día: ningún pago quedó sin aplicar, no hay nada que sellar.')
 
     # Lo último de la corrida: comprobar que la plata cuadra. Va al final
     # porque relee lo que quedó escrito, no lo que se pensaba escribir.
