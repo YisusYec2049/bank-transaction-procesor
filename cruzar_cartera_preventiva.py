@@ -221,6 +221,17 @@ def _base_inscripcion(valor) -> str:
     return normalizar_sufijo(v) or v
 
 
+def _mismo_monto(a, b) -> bool:
+    """¿Los dos representan la misma plata? Compara montos que llegan como
+    número, texto o vacío — `pago` viene del Excel como cadena y `diferencia`
+    puede venir NULL, y `None != 0.0` daría falsos cambios en cada corrida."""
+    def _n(x) -> float:
+        if x is None or x == '':
+            return 0.0
+        return round(float(x), 2)
+    return _n(a) == _n(b)
+
+
 def _saldo_a_cobrar(cuota: dict) -> float:
     """Monto que la cuota debe HOY de verdad.
 
@@ -1151,17 +1162,32 @@ def main():
         abiertas = [k for k in llaves if k not in llaves_cerradas_manual]
         return (abiertas or llaves)[-1]
 
-    def _valor_pago_visible(llave: str, asociaciones_cuota: list[dict],
-                             por_pago: dict[str, list[str]]) -> float:
-        aplicado = round(sum(float(a['monto'] or 0) for a in asociaciones_cuota), 2)
+    def _excedente_sin_repartir(llave: str, asociaciones_cuota: list[dict],
+                                 por_pago: dict[str, list[str]]) -> float:
+        """Plata de esos pagos que sigue SIN repartir y que se muestra en esta
+        cuota (la §3.3.2 la escribe como `diferencia` positiva). Sale aparte
+        para que el pase de reconciliación pueda comparar contra lo que la fila
+        DEBE mostrar, que es su propio cálculo más este excedente."""
         extra = 0.0
         for mk in {a['matching_key'] for a in asociaciones_cuota}:
             if _destino_saldo(por_pago.get(mk) or []) == llave:
                 extra += disponible_por_pago.get(mk, 0.0)
-        return round(aplicado + extra, 2)
+        return round(extra, 2)
+
+    def _valor_pago_visible(llave: str, asociaciones_cuota: list[dict],
+                             por_pago: dict[str, list[str]]) -> float:
+        aplicado = round(sum(float(a['monto'] or 0) for a in asociaciones_cuota), 2)
+        return round(
+            aplicado + _excedente_sin_repartir(llave, asociaciones_cuota, por_pago), 2)
 
     log.info('Reconciliando cuotas contra sus asociaciones vigentes...')
     reconciliadas = 0
+    # Lo que ESTA pasada calculó como `diferencia` de cada cuota que reescribió.
+    # La §3.3.2 lo necesita para no pisarlo: las dos escriben la misma columna y
+    # el valor correcto es la suma (lo que la cuota deba o le sobre, más la
+    # plata del pago que siga sin repartir).
+    base_diferencia: dict[str, float] = {}
+    por_pago_vigentes = _llaves_por_pago(asociaciones_vigentes)
     for llave in list(asociaciones_por_llave.keys()):
         if llave in llaves_cerradas_manual:
             continue
@@ -1175,6 +1201,11 @@ def main():
         if not asociaciones_cuota:
             continue
         suma = round(sum(a['monto'] for a in asociaciones_cuota), 2)
+
+        ultimo_pago = _pago_mas_reciente(asociaciones_cuota, pagos_por_matching_key)
+        info = {'cuota': cuota, 'monto_aplicado': suma, 'ultimo_pago': ultimo_pago}
+        fila, linea = _cerrar_o_faltante(info, hoy, llaves_cobradas)
+
         # Idempotencia: si la cuota ya refleja esta suma no hay nada que
         # hacer... salvo que esté DEBIENDO y su `diferencia` no lo diga.
         #
@@ -1187,30 +1218,42 @@ def main():
         # decía que sobraba plata justo donde faltaba, y por eso tampoco
         # ofrecía asociarla.
         #
-        # Solo se fuerza el recálculo cuando la cuota está CORTA. Si está
-        # cubierta, la `diferencia` positiva es el saldo a favor sin repartir
-        # y la escribe su propia pasada (§3.3.2) — pisarla acá la borraría en
-        # cada corrida.
-        faltante = round(_saldo_a_cobrar(cuota) - suma, 2)
-        diferencia_actual = cuota.get('diferencia')
-        refleja_faltante = faltante <= 0 or (
-            diferencia_actual is not None
-            and round(float(diferencia_actual), 2) == -faltante)
-        # La comparación va contra lo que la fila DEBE mostrar (que incluye el
-        # excedente sin repartir), no contra lo aplicado: si no, esta pasada y
-        # la que ajusta `valor_pago` al final se pisarían entre sí y el número
-        # oscilaría en cada corrida.
+        # AMPLIADO el 6 de agosto: se compara EL RESULTADO, no el disparador.
+        # Antes solo se forzaba el recálculo cuando la cuota estaba CORTA, y
+        # eso dejaba pasar los cambios que no mueven plata: si una persona
+        # corrige el VALOR de la cuota, lo aplicado sigue coincidiendo con lo
+        # anotado y la fila se saltaba con su `diferencia` vieja congelada.
+        #
+        # Caso real (6 de agosto, llave 675PN46254): cuota de $962.500 con un
+        # pago de $625.000 → "falta $337.500". Le corrigieron el valor a
+        # $600.000 y le asociaron el saldo hasta cubrirla, y la fila siguió
+        # mostrando el faltante de $337.500 —de cuando valía otra cosa— con su
+        # línea de FALTA DE PAGO viva. Ninguna corrida la volvía a mirar.
+        #
+        # Regla del usuario: cuando alguien cambia algo que altera el
+        # resultado, esa cuota se recalcula. Comparando contra el resultado no
+        # hay que enumerar qué cosas lo alteran — se detectan solas.
+        #
+        # `diferencia` se compara contra lo que la fila DEBE mostrar: lo que
+        # esta pasada calcula MÁS el excedente sin repartir que escribe la
+        # §3.3.2. Sin sumarlo, las dos se pisarían y el número oscilaría en
+        # cada corrida (misma trampa que `valor_pago`, 3 de agosto).
+        #
+        # Y solo para cuotas SIN confirmar: en una confirmada, `_fila_cierre`
+        # deshace el cierre a propósito (punto #1), así que compararla contra
+        # él la reabriría en cada corrida. Ahí sigue mandando la comparación
+        # por plata, que es la que detecta un descarte.
         valor_pago_actual = cuota.get('valor_pago')
-        visible = _valor_pago_visible(llave, asociaciones_cuota,
-                                       _llaves_por_pago(asociaciones_vigentes))
+        visible   = _valor_pago_visible(llave, asociaciones_cuota, por_pago_vigentes)
+        excedente = _excedente_sin_repartir(llave, asociaciones_cuota, por_pago_vigentes)
+        confirmada = cuota.get('pago_confirmado') is not None
+        refleja_resultado = confirmada or _mismo_monto(
+            cuota.get('diferencia'), round(fila['diferencia'] + excedente, 2))
         if (cuota.get('fecha_cruce') and valor_pago_actual is not None
                 and round(float(valor_pago_actual), 2) in (suma, visible)
-                and refleja_faltante):
-            continue  # ya refleja esta suma, nada que hacer (idempotencia)
+                and refleja_resultado):
+            continue  # ya refleja este resultado, nada que hacer (idempotencia)
 
-        ultimo_pago = _pago_mas_reciente(asociaciones_cuota, pagos_por_matching_key)
-        info = {'cuota': cuota, 'monto_aplicado': suma, 'ultimo_pago': ultimo_pago}
-        fila, linea = _cerrar_o_faltante(info, hoy, llaves_cobradas)
         actualizaciones_cierre.append(fila)
         if linea:
             lineas_nuevas.append(linea)
@@ -1227,6 +1270,10 @@ def main():
         cuota['pago']            = fila['pago']
         cuota['pago_confirmado'] = None
         cuota['valor_a_cobrar']  = fila['valor_a_cobrar']
+        # En memoria y para la §3.3.2: sin esto, esa pasada compara contra el
+        # valor viejo y puede volver a escribirlo encima del recién calculado.
+        cuota['diferencia']      = fila['diferencia']
+        base_diferencia[llave]   = fila['diferencia']
         reconciliadas += 1
 
     # Cuotas que perdieron TODAS sus asociaciones vigentes por un descarte
@@ -1684,6 +1731,29 @@ def main():
             candidatas_saldo.add(acum['llave_origen'])
         candidatas_saldo.update(llaves_vigentes_por_pago.get(mk) or [])
 
+    def _base_calculada(llave: str, cuota: dict) -> float:
+        """Lo que la cuota tiene de más (o de menos) frente a lo que debe,
+        según sus asociaciones vigentes — el mismo número que calcula el pase
+        de reconciliación.
+
+        Se recalcula acá para las cuotas que ese pase NO tuvo que reescribir.
+        Sin esto, una cuota con excedente propio ya reflejado quedaba en cero
+        en la corrida siguiente y el número oscilaba: la reconciliación la veía
+        correcta y se la saltaba, y esta pasada —que solo conoce lo que queda
+        sin repartir— le escribía cero encima.
+
+        Las confirmadas quedan fuera: su `valor_a_cobrar` es 0 porque alguien
+        las cerró, y la resta daría todo lo aplicado como si sobrara."""
+        if llave in base_diferencia:
+            return base_diferencia[llave]
+        if cuota.get('pago_confirmado') is not None:
+            return 0.0
+        asocs = asociaciones_por_llave.get(llave) or []
+        if not asocs:
+            return 0.0
+        return round(sum(float(a['monto'] or 0) for a in asocs)
+                      - _saldo_a_cobrar(cuota), 2)
+
     sync_diferencia = []
     for llave in sorted(candidatas_saldo):
         cuota_id = id_por_llave.get(llave)
@@ -1694,7 +1764,14 @@ def main():
             continue
         actual  = round(float(cuota.get('diferencia') or 0), 2)
         deseada = diferencia_deseada.get(llave)
+        # Lo que la fila debe mostrar es la suma de las dos partes: lo que la
+        # cuota deba o le sobre (pase de reconciliación) más la plata del pago
+        # que siga sin repartir (esta pasada). Sin sumar la primera, una cuota
+        # recién recalculada con excedente propio volvía a quedar en cero acá
+        # (llave 675PN46254, 6 de agosto).
+        base = _base_calculada(llave, cuota)
         if deseada is not None:
+            deseada = round(deseada + base, 2)
             if actual == deseada:
                 continue
             if actual < 0:
@@ -1708,7 +1785,11 @@ def main():
                 continue
             sync_diferencia.append({'id': cuota_id, 'diferencia': deseada})
             cuota['diferencia'] = deseada
-        elif actual > 0 and cuota.get('fecha_cruce'):
+        elif actual > 0 and cuota.get('fecha_cruce') and not base:
+            # `not base`: si el pase de reconciliación acaba de calcular un
+            # excedente propio para esta cuota, ese número no es un saldo a
+            # favor viejo que haya que limpiar — es el resultado de esta misma
+            # corrida.
             sync_diferencia.append({'id': cuota_id, 'diferencia': 0})
             cuota['diferencia'] = 0
     if sync_diferencia:

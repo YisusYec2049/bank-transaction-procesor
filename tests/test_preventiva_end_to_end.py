@@ -892,3 +892,116 @@ def test_normalizar_el_dv_no_junta_dos_documentos_distintos(mundo):
     assert _por_llave(capturado).get('INS22-A') is None, (
         'el pago cayó en la cuota de un documento distinto'
     )
+
+
+# ── Corregir el valor de una cuota ya pagada (6 de agosto) ─────────────────
+#
+# Regla del usuario: cuando una persona cambia algo que altera el resultado,
+# esa cuota se recalcula. El pase de reconciliación comparaba solo la PLATA
+# (lo aplicado contra lo anotado), así que un cambio en el VALOR de la cuota
+# —que no mueve plata— pasaba desapercibido y la fila quedaba con su
+# `diferencia` vieja congelada, sin que ninguna corrida la volviera a mirar.
+
+def _mundo_cuota_corregida(**extra_cuota):
+    """El caso real 675PN46254 (6 de agosto), con los montos exactos.
+
+    La cuota valía $962.500 y el pago de $625.000 la dejó debiendo $337.500
+    (con su línea de FALTA DE PAGO). Después le corrigieron el valor a
+    $600.000 y le asociaron el saldo a favor completo, hasta dejar los
+    $625.000 aplicados sobre ella. La plata cuadra: aplicado 625.000 +
+    disponible 0 == lo que entró.
+    """
+    cuota = _cuota('INS30-A', 'INS30', '1002003030', 600_000, '2026-08-20',
+                   valor_pago=625_000, fecha_pago='2026-08-05',
+                   fecha_cruce='2026-08-06', diferencia=-337_500,
+                   notificacion='FALTA DE PAGO', **extra_cuota)
+    linea = _cuota('INS30-A (2026-08-05)', 'INS30', '1002003030', 337_500,
+                   '2026-08-20')
+    return {
+        'cartera_cargas': [_carga(f'{_hoy_bogota()}T15:23:32+00:00')],
+        'cartera_preventiva': [cuota, linea],
+        'pago_asociaciones': [
+            {'id': 9401, 'matching_key': 'PAGO-CORREGIDO', 'llave': 'INS30-A',
+             'monto': 625_000, 'origen': 'automatico'},
+        ],
+        'cartera_saldos_favor': [
+            {'id': 9402, 'matching_key': 'PAGO-CORREGIDO', 'llave_origen': 'INS30-A',
+             'monto': 362_500, 'disponible': 0, 'aplicado': True, 'origen': 'sobrante',
+             'documento': '1002003030', 'correo': 'alguien@example.com',
+             'inscrip': 'INS30', 'cliente': 'PERSONA DE PRUEBA', 'fecha': '2026-08-05'},
+        ],
+        'cruce_cartera': [_pago_cruzado('PAGO-CORREGIDO', '1002003030', 'INS30',
+                                         625_000, fecha='2026-08-05')],
+    }
+
+
+def _fila_final(capturado, llave):
+    """Una cuota se escribe en varias pasadas y cada una manda solo sus
+    columnas; lo que queda en la base es la acumulación."""
+    fila = {}
+    for f in capturado.get('cartera_preventiva', []):
+        if f.get('id') == _id_de(llave):
+            fila.update(f)
+    return fila
+
+
+def test_corregir_el_valor_de_la_cuota_recalcula_su_diferencia(mundo):
+    capturado = mundo(ccp, tablas=_mundo_cuota_corregida())
+
+    fila = _fila_final(capturado, 'INS30-A')
+    assert fila, (
+        'la cuota no se tocó: sigue mostrando el faltante de cuando valía '
+        '$962.500, y ninguna corrida la va a volver a mirar'
+    )
+    assert float(fila['diferencia']) == 25_000, (
+        f"la cuota vale $600.000 y tiene $625.000 aplicados: le sobran $25.000, "
+        f"pero la fila dice {fila['diferencia']}"
+    )
+    assert fila.get('notificacion') != 'FALTA DE PAGO', (
+        'la cuota quedó cubierta y sigue marcada como FALTA DE PAGO'
+    )
+
+
+def test_corregir_el_valor_borra_la_linea_de_falta_de_pago(mundo):
+    """La línea de deuda es el reflejo de lo que debe su original (30 de
+    julio). Si la original deja de deber, la línea desaparece — si no, queda
+    cobrando una deuda que ya no existe."""
+    capturado = mundo(ccp, tablas=_mundo_cuota_corregida())
+
+    llaves_borradas = set(capturado.get('borrado:cartera_preventiva', []) or [])
+    assert 'INS30-A (2026-08-05)' in llaves_borradas, (
+        'la línea de FALTA DE PAGO de $337.500 sigue viva sobre una cuota que '
+        f'ya no debe nada (borradas: {llaves_borradas})'
+    )
+
+
+def test_una_cuota_ya_correcta_no_se_reescribe(mundo):
+    """Idempotencia: con el resultado ya reflejado, la corrida no toca la fila.
+    Sin esto, comparar contra el resultado haría que TODA cuota se reescribiera
+    en cada corrida."""
+    tablas = _mundo_cuota_corregida()
+    tablas['cartera_preventiva'][0]['diferencia'] = 25_000
+    tablas['cartera_preventiva'][0]['notificacion'] = None
+    tablas['cartera_preventiva'] = [tablas['cartera_preventiva'][0]]
+
+    capturado = mundo(ccp, tablas=tablas)
+
+    assert not _fila_final(capturado, 'INS30-A'), (
+        'se reescribió una cuota que ya mostraba el resultado correcto'
+    )
+
+
+def test_el_recalculo_no_reabre_una_cuota_cerrada_a_mano(mundo):
+    """La trampa del cambio: `_fila_cierre` deshace el cierre a propósito
+    (punto #1, para el caso de un descarte). Si el recálculo se dispara por
+    comparar contra él, cada corrida reabriría todas las cuotas que alguien
+    cerró a mano."""
+    tablas = _mundo_cuota_corregida(pago='600000', pago_confirmado=600_000)
+    tablas['cartera_preventiva'][0]['valor_a_cobrar'] = 0
+
+    capturado = mundo(ccp, tablas=tablas)
+
+    fila = _fila_final(capturado, 'INS30-A')
+    assert fila.get('pago_confirmado', 600_000) is not None or not fila, (
+        'la corrida deshizo un cierre manual que nadie tocó'
+    )
