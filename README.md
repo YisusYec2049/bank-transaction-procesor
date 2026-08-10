@@ -253,10 +253,13 @@ UTC−5 y no tiene horario de verano):
 
 ```cron
 TZ=America/Bogota
-# La corrida del día: 15:30 UTC = 10:30 Colombia.
-30 15 * * * flock -n /tmp/matching.lock -c '... sync_cartera && procesar_todos && cruzar && cruzar_cartera_preventiva'
-# Excepción, por si algo llegó tarde: 11:00 a 19:00 de Colombia.
-5,20,35,50 16-23 * * * flock -n /tmp/matching.lock -c '... vigilante && <la misma cadena>'
+# La corrida del día: 14:30 UTC = 9:30 Colombia.
+30 14 * * * flock -n /tmp/matching.lock -c '... sync_cartera && procesar_todos && cruzar && cruzar_cartera_preventiva'
+# Excepción, por si algo llegó tarde: 9:50 a 18:50 de Colombia.
+# Son dos líneas porque a las 14 UTC solo entra el minuto :50 — los minutos
+# :05 y :20 caerían ANTES de la corrida del día, y :35 encima de ella.
+50 14 * * * flock -n /tmp/matching.lock -c '... vigilante && <la misma cadena>'
+5,20,35,50 15-23 * * * flock -n /tmp/matching.lock -c '... vigilante && <la misma cadena>'
 ```
 
 Tres detalles que ya costaron un día de trabajo cada uno:
