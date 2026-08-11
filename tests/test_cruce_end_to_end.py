@@ -290,3 +290,36 @@ def test_la_correccion_de_un_pago_si_se_le_aplica_a_ese_pago(mundo):
     assert fila['correo_2'] == '4321PN', (
         'el correo quedó con el documento viejo: CORREO(2) seguiría buscando mal'
     )
+
+
+def test_el_documento_corregido_no_se_guarda_en_la_columna_de_correo(mundo):
+    """El número corregido sirve para buscar; lo que se GUARDA es el consolidado.
+
+    Reportado el 11 de agosto sobre el documento 901759404-9: en Cartera
+    Preventiva el mismo número salía en Documento y en Correo Electrónico,
+    mientras el consolidado mostraba otra cosa. La causa era que la corrección
+    pisaba el correo y ese valor se guardaba, viajando al cruce y de ahí a la
+    cuota. Regla del usuario: *"los datos de la cartera preventiva deben ser
+    los mismos que se clasifican en el consolidado"*.
+    """
+    capturado = mundo(cruzar, tablas={
+        'consolidated_transactions': [
+            _pago('PAGO-1', identification='11111111', email='11111111')],
+        'cartera_inscrip': [{'numero_id': '22222222', 'id_inscripcion': '4321PN'}],
+        'cartera_ingresos_bancolombia_2576': [
+            {'referencia_1': '22222222', 'incp': '4321PN'}],
+        'documento_correcciones': [
+            {'documento_original': '11111111',
+             'documento_corregido': '22222222', 'matching_key_original': 'PAGO-1',
+             'created_at': '2026-08-05T10:00:00', 'updated_at': '2026-08-05T10:00:00'},
+        ],
+    })
+
+    fila = _filas(capturado)['PAGO-1']
+    assert fila['identification'] == '22222222', 'el documento sí se corrige'
+    assert fila['email'] == '11111111', (
+        f'el correo quedó en {fila["email"]!r}: se guardó el documento corregido '
+        'en vez de lo que dice el consolidado'
+    )
+    # Y el cruce no se degrada por guardar el original: sigue cerrando.
+    assert fila['correo_2'] == '4321PN'

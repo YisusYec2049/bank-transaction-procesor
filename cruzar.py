@@ -355,6 +355,15 @@ def _aplicar_correcciones_documento(transacciones: list[dict],
     verdad), así que aplicarlo a todos los bancos es inofensivo. `matching_key`
     no se recalcula a propósito — la fila ya existe con esa llave en las 3
     tablas y renombrarla la duplicaría.
+
+    **El documento corregido se usa para BUSCAR, no se guarda en la columna de
+    correo** (11 de agosto). Antes se guardaba, y entonces el número del
+    documento aparecía repetido en la columna de correo del cruce y, de ahí,
+    en la de Cartera Preventiva — que además dejaba de coincidir con lo que
+    muestra el consolidado (medido: 13 pagos, 17 cuotas). Lo que dice el
+    consolidado se aparta en `email_consolidado` y es lo que se escribe
+    (`_email_a_guardar`); la búsqueda sigue usando el número bueno, así que el
+    cruce no cambia en nada.
     """
     if not correcciones:
         return transacciones
@@ -370,10 +379,24 @@ def _aplicar_correcciones_documento(transacciones: list[dict],
             t['identification'] = nuevo_doc
             corregidas += 1
         if email and email in (documento, doc_anterior):
-            t['email'] = nuevo_doc
+            t['email_consolidado'] = email       # lo que se guarda
+            t['email']             = nuevo_doc   # lo que se busca
     if corregidas:
         log.info('%d transacción(es) con documento corregido a mano.', corregidas)
     return transacciones
+
+
+def _email_a_guardar(t: dict):
+    """Lo que va a la columna de correo de `cruce_cartera` / `pagos_apartados`.
+
+    Siempre lo que trae el consolidado. Las dos tablas son la misma
+    información clasificada, así que un dato no puede decir una cosa en una y
+    otra en la otra — y Cartera Preventiva copia de acá, de modo que cualquier
+    valor puesto por conveniencia interna termina en pantalla. El único que se
+    aparta es el correo que `_aplicar_correcciones` pisa con el documento para
+    poder buscar con el número corregido.
+    """
+    return t.get('email_consolidado', t.get('email'))
 
 
 def _es_valor_relleno(valor: str) -> bool:
@@ -1241,7 +1264,7 @@ def main():
             'payment_date':       t.get('payment_date'),
             'transaction_code_1': t.get('transaction_code_1'),
             'transaction_code_2': t.get('transaction_code_2'),
-            'email':              t.get('email'),
+            'email':              _email_a_guardar(t),
             'payment_method':     t.get('payment_method'),
             'program':            t.get('program'),
             'phone':              t.get('phone'),
@@ -1288,7 +1311,7 @@ def main():
             'payment_date':       t.get('payment_date'),
             'transaction_code_1': t.get('transaction_code_1'),
             'transaction_code_2': t.get('transaction_code_2'),
-            'email':              t.get('email'),
+            'email':              _email_a_guardar(t),
             'payment_method':     t.get('payment_method'),
             'program':            t.get('program'),
             'phone':              t.get('phone'),
@@ -1536,7 +1559,7 @@ def main():
             'payment_date':       t.get('payment_date'),
             'transaction_code_1': t.get('transaction_code_1'),
             'transaction_code_2': t.get('transaction_code_2'),
-            'email':              t.get('email'),
+            'email':              _email_a_guardar(t),
             'payment_method':     t.get('payment_method'),
             'program':            program,
             'phone':              t.get('phone'),
