@@ -617,9 +617,28 @@ def _sincronizar_lineas_falta_de_pago(
         if falta >= UMBRAL_LINEA_NUEVA and existentes:
             # Ya hay línea: se ajusta esa y no se crea ninguna otra.
             viva = existentes[0]
-            if round(float(viva.get('valor_a_cobrar') or 0), 2) != falta:
-                updates.append({'id': viva['id'], 'valor_cuota': falta, 'valor_a_cobrar': falta})
-                viva['valor_cuota'] = viva['valor_a_cobrar'] = falta
+            # La línea también sigue la FECHA de su madre (11 de agosto): si
+            # alguien corrige el vencimiento de la original, la línea lo
+            # arrastra. Regla del usuario: "la fecha debe ser igual a la cuota
+            # madre". Antes la línea copiaba la fecha SOLO al nacer, así que una
+            # corrección posterior dejaba dos renglones de la misma cuota con
+            # fechas distintas en pantalla y en las descargas.
+            venc = _campo(original, 'fecha_vencimiento') or viva.get('fecha_vencimiento')
+            cambia_valor = round(float(viva.get('valor_a_cobrar') or 0), 2) != falta
+            if cambia_valor or viva.get('fecha_vencimiento') != venc:
+                # Las claves van SIEMPRE las mismas: un array con dicts de
+                # distinto set de claves lo rechaza PostgREST (PGRST102, ver
+                # `_fila_reset`). Por eso, cuando lo único que cambia es la
+                # fecha, el valor se reescribe con el que ya tenía.
+                updates.append({
+                    'id': viva['id'],
+                    'valor_cuota':      falta if cambia_valor else round(float(viva.get('valor_cuota') or 0), 2),
+                    'valor_a_cobrar':   falta if cambia_valor else round(float(viva.get('valor_a_cobrar') or 0), 2),
+                    'fecha_vencimiento': venc,
+                })
+                if cambia_valor:
+                    viva['valor_cuota'] = viva['valor_a_cobrar'] = falta
+                viva['fecha_vencimiento'] = venc
             sobrantes = existentes[1:]
         else:
             sobrantes = existentes
@@ -884,7 +903,8 @@ def main():
 
     log.info('Cargando overrides y asociaciones existentes...')
     overrides_rows = select_all(supabase_url, srk, 'cartera_preventiva_overrides',
-                                 select='llave,cerrado_manual,fecha_pago_manual,valor_cuota_manual')
+                                 select='llave,cerrado_manual,fecha_pago_manual,valor_cuota_manual,'
+                                        'fecha_vencimiento_manual')
     llaves_cerradas_manual = {r['llave'] for r in overrides_rows if r.get('cerrado_manual')}
     cerrados_manual_por_llave = {r['llave']: r for r in overrides_rows if r.get('cerrado_manual')}
     overrides_por_llave = {r['llave']: r for r in overrides_rows if r.get('llave')}
@@ -975,6 +995,34 @@ def main():
     if ajustes_valor_cuota:
         upsert_cartera_preventiva(supabase_url, srk, ajustes_valor_cuota)
         log.info('%d cuota(s) con valor corregido a mano aplicado.', len(ajustes_valor_cuota))
+
+    # Fecha de vencimiento corregida a mano desde fin-platform
+    # (`cartera_preventiva_overrides.fecha_vencimiento_manual`, 11 de agosto).
+    # Va acá, ANTES de la cascada, porque el reparto es FIFO por esta fecha: una
+    # cuota que se mueve al pasado pasa a cobrarse primero, y eso tiene que valer
+    # en la misma corrida en que se corrige.
+    #
+    # NO mueve plata ya aplicada, y no hace falta ninguna guarda para eso: un
+    # pago se reparte UNA sola vez (queda escrito en `pago_asociaciones`) y
+    # ninguna corrida lo vuelve a repartir. Regla del usuario (11 de agosto):
+    # "si el pago ya fue aplicado y cambian la fecha no se reparte
+    # automáticamente; para eso el usuario debe descartar el pago de una y
+    # asociarlo en la otra si lo desea".
+    #
+    # Lista y POST propios: el set de claves no es el de `ajustes_valor_cuota`
+    # (ver la advertencia sobre PGRST102 en el docstring de `_fila_reset`).
+    ajustes_vencimiento: list[dict] = []
+    for cuota in cuotas_rows:
+        override = overrides_por_llave.get(cuota.get('llave') or '')
+        nueva = override.get('fecha_vencimiento_manual') if override else None
+        if not nueva or cuota.get('fecha_vencimiento') == nueva:
+            continue
+        cuota['fecha_vencimiento'] = nueva
+        ajustes_vencimiento.append({'id': cuota['id'], 'fecha_vencimiento': nueva})
+    if ajustes_vencimiento:
+        upsert_cartera_preventiva(supabase_url, srk, ajustes_vencimiento)
+        log.info('%d cuota(s) con fecha de vencimiento corregida a mano aplicada.',
+                  len(ajustes_vencimiento))
 
     # "Cerrar Cuota" (antes "Cerrar cartera"): cierre MANUAL de una cuota
     # puntual, fuera del proceso (fin-platform escribe cerrado_manual=true +

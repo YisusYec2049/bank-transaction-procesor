@@ -1005,3 +1005,123 @@ def test_el_recalculo_no_reabre_una_cuota_cerrada_a_mano(mundo):
     assert fila.get('pago_confirmado', 600_000) is not None or not fila, (
         'la corrida deshizo un cierre manual que nadie tocó'
     )
+
+
+# ── Fecha de vencimiento corregida a mano (11 de agosto) ──────────────────────
+# `cartera_preventiva_overrides.fecha_vencimiento_manual`. El reparto es FIFO
+# por esta fecha, así que corregirla cambia a qué cuota se va el próximo pago —
+# pero NO mueve plata ya aplicada (regla del usuario: para eso se descarta y se
+# asocia a mano).
+
+def _mundo_dos_cuotas_con_fecha_corregida(nueva_fecha: str | None,
+                                           asociacion_previa: bool = False):
+    """Dos cuotas de $500.000 de la MISMA inscripción: una vence el 13/08 y la
+    otra el 10/09. Un pago de $500.000 entra hoy. Sin corregir nada, el FIFO
+    paga la del 13/08 (la más vieja).
+    """
+    tablas = {
+        'cartera_cargas': [_carga(f'{_hoy_bogota()}T15:23:32+00:00')],
+        'cartera_preventiva': [
+            _cuota('INS50-A', 'INS50', '1002003050', 500_000, '2026-08-13'),
+            _cuota('INS50-B', 'INS50', '1002003050', 500_000, '2026-09-10'),
+        ],
+        'cruce_cartera': [_pago_cruzado('PAGO-VENC', '1002003050', 'INS50', 500_000)],
+    }
+    if nueva_fecha is not None:
+        tablas['cartera_preventiva_overrides'] = [
+            {'llave': 'INS50-B', 'cerrado_manual': False, 'fecha_pago_manual': None,
+             'valor_cuota_manual': None, 'fecha_vencimiento_manual': nueva_fecha},
+        ]
+    if asociacion_previa:
+        tablas['pago_asociaciones'] = [
+            {'id': 9501, 'matching_key': 'PAGO-VENC', 'llave': 'INS50-A',
+             'monto': 500_000, 'origen': 'automatico'},
+        ]
+        tablas['cartera_preventiva'][0].update(
+            valor_pago=500_000, fecha_pago='2026-08-01',
+            fecha_cruce=_hoy_bogota(), diferencia=0)
+    return tablas
+
+
+def test_sin_corregir_la_fecha_el_pago_se_va_a_la_cuota_mas_vieja(mundo):
+    """Línea base: sin esto, el test de abajo no demuestra nada."""
+    capturado = mundo(ccp, tablas=_mundo_dos_cuotas_con_fecha_corregida(None))
+
+    llaves = {a['llave'] for a in capturado.get('pago_asociaciones', [])}
+    assert llaves == {'INS50-A'}, f'el FIFO no pagó la cuota más vieja: {llaves}'
+
+
+def test_la_fecha_corregida_manda_en_el_reparto_del_proximo_pago(mundo):
+    """La cuota del 10/09 se corrige al 10/08 y pasa a ser la más vieja, así que
+    el pago que entra hoy se va a ELLA y no a la del 13/08. Es el ejemplo exacto
+    que definió el usuario el 11 de agosto."""
+    capturado = mundo(ccp, tablas=_mundo_dos_cuotas_con_fecha_corregida('2026-08-10'))
+
+    llaves = {a['llave'] for a in capturado.get('pago_asociaciones', [])}
+    assert llaves == {'INS50-B'}, (
+        'el pago no siguió la fecha corregida: la cuota INS50-B pasó a vencer el '
+        f'10/08, antes que INS50-A (13/08), y la plata quedó en {llaves}'
+    )
+    fila = _fila_final(capturado, 'INS50-B')
+    assert fila.get('fecha_vencimiento') == '2026-08-10', (
+        'la fecha corregida no quedó escrita en la cuota, así que la pantalla '
+        'seguiría mostrando la vieja'
+    )
+
+
+def test_corregir_la_fecha_no_mueve_plata_ya_aplicada(mundo):
+    """Guardo de regresión (pasa con y sin el cambio, y por eso está): la cuota
+    del 10/09 se corrige al 10/08 y pasa a ser la más vieja, pero el pago ya
+    está aplicado en la otra. No se reparte de nuevo — para moverlo hay que
+    descartarlo y asociarlo a mano."""
+    capturado = mundo(ccp, tablas=_mundo_dos_cuotas_con_fecha_corregida(
+        '2026-08-10', asociacion_previa=True))
+
+    nuevas = capturado.get('pago_asociaciones', [])
+    assert not nuevas, (
+        f'un pago ya aplicado se volvió a repartir al corregir una fecha: {nuevas}'
+    )
+    assert not _fila_final(capturado, 'INS50-B').get('valor_pago'), (
+        'le entró plata a la cuota corregida sin que nadie la asociara'
+    )
+
+
+def test_la_linea_de_falta_de_pago_toma_la_fecha_de_su_cuota_madre(mundo):
+    """Regla del usuario: "la fecha debe ser igual a la cuota madre". La línea
+    solo copiaba la fecha al NACER, así que una corrección posterior dejaba dos
+    renglones de la misma cuota con fechas distintas.
+
+    Acá el faltante no cambia ($300.000 antes y después), así que lo ÚNICO que
+    mueve la fila es la fecha.
+    """
+    tablas = {
+        'cartera_cargas': [_carga(f'{_hoy_bogota()}T15:23:32+00:00')],
+        'cartera_preventiva': [
+            _cuota('INS51-A', 'INS51', '1002003051', 600_000, '2026-08-20',
+                   valor_pago=300_000, fecha_pago='2026-08-05',
+                   fecha_cruce='2026-08-06', diferencia=-300_000,
+                   notificacion='FALTA DE PAGO'),
+            _cuota('INS51-A (2026-08-05)', 'INS51', '1002003051', 300_000, '2026-08-20'),
+        ],
+        'pago_asociaciones': [
+            {'id': 9502, 'matching_key': 'PAGO-MADRE', 'llave': 'INS51-A',
+             'monto': 300_000, 'origen': 'automatico'},
+        ],
+        'cruce_cartera': [_pago_cruzado('PAGO-MADRE', '1002003051', 'INS51',
+                                         300_000, fecha='2026-08-05')],
+        'cartera_preventiva_overrides': [
+            {'llave': 'INS51-A', 'cerrado_manual': False, 'fecha_pago_manual': None,
+             'valor_cuota_manual': None, 'fecha_vencimiento_manual': '2026-09-15'},
+        ],
+    }
+
+    capturado = mundo(ccp, tablas=tablas)
+
+    linea = _fila_final(capturado, 'INS51-A (2026-08-05)')
+    assert linea.get('fecha_vencimiento') == '2026-09-15', (
+        'la línea de deuda se quedó con la fecha vieja (2026-08-20): en pantalla '
+        'se verían dos renglones de la misma cuota venciendo en fechas distintas'
+    )
+    assert float(linea.get('valor_a_cobrar')) == 300_000, (
+        'al arrastrar la fecha se movió el faltante, que no cambió'
+    )
