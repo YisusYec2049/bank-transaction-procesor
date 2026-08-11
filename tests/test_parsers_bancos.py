@@ -123,6 +123,51 @@ def test_wompi_columnas_no_intercambiadas(abrir_fixture):
         assert '@' not in fila[8], f'[8] parece un correo, no un nombre: {fila[8]!r}'
 
 
+def test_wompi_guarda_la_hora_del_pago(abrir_fixture):
+    """La hora viaja en [11], y el día de [2] no se mueve.
+
+    El CSV trae `fecha` = '2026-07-21 21:45:48' y hasta el 11 de agosto se
+    cortaba en los 10 primeros caracteres: el día se guardaba y la hora se
+    perdía en el acto, sin quedar en ninguna tabla. El área la pide en la
+    descarga del "Reporte WOMPI del día", pegada a la fecha en la misma celda.
+    """
+    filas = wompi.normalize(wompi.parse_file(abrir_fixture('wompi_reporte.csv')))
+    assert filas, 'el fixture de WOMPI no produjo filas'
+
+    sin_hora = [f for f in filas if not f[11]]
+    assert not sin_hora, f'{len(sin_hora)} fila(s) de WOMPI quedaron sin hora'
+
+    for fila in filas[:20]:
+        hh, mm, ss = fila[11].split(':')
+        assert len(hh) == len(mm) == len(ss) == 2 and (hh + mm + ss).isdigit()
+        assert int(hh) < 24 and int(mm) < 60 and int(ss) < 60
+        # El día sigue siendo DD-MM-YYYY: la hora se suma, no reemplaza nada.
+        assert len(fila[2].split('-')) == 3 and len(fila[2]) == 10
+
+
+@pytest.mark.parametrize('celda', [
+    '',                      # celda vacía
+    '2026-07-21',            # fecha sin hora
+    '2026-07-21 21:45',      # hora a medias
+    '2026-07-21 ab:cd:ef',   # basura donde va la hora
+    '2026-07-21 99:99:99',   # con forma de hora, pero no es una hora
+])
+def test_una_hora_a_medias_se_guarda_vacia(celda):
+    """Ante cualquier cosa que no sea una hora completa, la celda va vacía.
+
+    Vacío se lee como "el archivo no lo trajo"; un '21:45' recortado se lee
+    como un dato y nadie vuelve a mirarlo.
+    """
+    assert wompi._hora(celda) == ''
+
+
+def test_el_separador_de_la_fecha_no_importa():
+    """Con espacio o con T, la hora es la misma y es real. Solo el formato de
+    la celda cambiaría si WOMPI exportara en ISO; el dato, no."""
+    assert wompi._hora('2026-07-21 21:45:48') == '21:45:48'
+    assert wompi._hora('2026-07-21T21:45:48') == '21:45:48'
+
+
 def test_matching_key_unica_por_archivo(abrir_fixture):
     """Dentro de un mismo archivo de pasarela, la llave no se repite.
 

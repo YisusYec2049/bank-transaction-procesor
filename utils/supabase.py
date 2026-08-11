@@ -66,20 +66,65 @@ def _raise_for_status(resp: requests.Response) -> None:
     resp.raise_for_status()
 
 
+# ¿Esta base ya tiene consolidated_transactions.payment_time? None = todavía no
+# se preguntó. Se recuerda por corrida para no gastar una petición por archivo.
+_PAYMENT_TIME_DISPONIBLE: bool | None = None
+
+
+def _hay_payment_time(supabase_url: str, service_role_key: str) -> bool:
+    """¿Existe ya la columna de la hora del pago?
+
+    Se pregunta una vez y se decide si el payload la incluye, en vez de
+    mandarla y ver qué pasa: un POST con una columna inexistente se rechaza
+    ENTERO (PGRST204), así que el día que alguien despliegue este código antes
+    de correr el ALTER TABLE no entraría **ningún** pago de esa corrida. Es la
+    lección del 24 de julio (código nuevo que exigía esquema nuevo dejó el
+    motor caído un día entero), y el mismo criterio de `_LOTE_DISPONIBLE` y de
+    `marcar_aplicacion_cerrada`: el SQL y el despliegue van en el orden que sea.
+
+    Sin la columna, la ingesta sigue igual que siempre y lo único que se pierde
+    es la hora.
+    """
+    global _PAYMENT_TIME_DISPONIBLE
+    if _PAYMENT_TIME_DISPONIBLE is not None:
+        return _PAYMENT_TIME_DISPONIBLE
+
+    resp = http.get(
+        f'{supabase_url}/rest/v1/consolidated_transactions',
+        params={'select': 'payment_time', 'limit': 1},
+        headers=_headers(service_role_key),
+        timeout=30,
+    )
+    _PAYMENT_TIME_DISPONIBLE = resp.ok
+    if not resp.ok:
+        log.warning('consolidated_transactions.payment_time todavía no existe (HTTP %s): '
+                     'la hora del pago no se guarda en esta corrida, el resto entra '
+                     'igual. Correr el ALTER TABLE.', resp.status_code)
+    return _PAYMENT_TIME_DISPONIBLE
+
+
 def upsert(supabase_url: str, service_role_key: str, rows: list[list]) -> None:
     """
     rows: filas normalizadas [identification, payment_date(DD-MM-YYYY), ...]
     registration_date se agrega aquí como la fecha de hoy en Bogotá.
+
+    La columna 11 (`payment_time`, la hora del pago) es OPCIONAL: hoy solo la
+    trae WOMPI, cuyo CSV la reporta; los demás parsers devuelven 11 columnas y
+    la celda queda vacía. Se escribe con la misma clave en TODAS las filas del
+    lote —vacía donde no hay dato— porque un array de merge exige que todos
+    los objetos tengan el mismo set de claves (PGRST102), el mismo motivo por
+    el que `nuevos` y `ya_estan` van en dos POST separados.
     """
     if dry_run.registrar('consolidated_transactions', 'upsert', rows):
         return
     tz_bogota = pytz.timezone('America/Bogota')
     today_iso = datetime.now(tz_bogota).strftime('%Y-%m-%d')
+    guardar_hora = _hay_payment_time(supabase_url, service_role_key)
 
     payload = []
     for r in rows:
         dd, mm, yyyy = str(r[2]).split('-')
-        payload.append({
+        fila = {
             'registration_date':  today_iso,
             'identification':     r[1],
             'payment_date':       f'{yyyy}-{mm}-{dd}',
@@ -91,7 +136,11 @@ def upsert(supabase_url: str, service_role_key: str, rows: list[list]) -> None:
             'phone':              r[8],
             'payment_amount':     r[9],
             'matching_key':       r[10],
-        })
+        }
+        if guardar_hora:
+            hora = str(r[11]).strip() if len(r) > 11 else ''
+            fila['payment_time'] = hora or None
+        payload.append(fila)
 
     hdrs = {
         'apikey':        service_role_key,

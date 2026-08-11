@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 import procesar_todos
+from utils import dry_run, supabase
 
 FIXTURES = Path(__file__).parent / 'fixtures'
 
@@ -144,6 +145,99 @@ def test_los_cheques_no_llegan_al_consolidado(bandeja):
     escrito = bandeja('bc2576', 'bc2576_extracto.json')
     for fila in escrito.get('consolidado', []):
         assert 'CHEQUE' not in str(fila[3]).upper()
+
+
+class _Resp:
+    def __init__(self, ok=True, texto=''):
+        self.status_code = 200 if ok else 400
+        self.text = texto
+        self.url = 'https://x'
+        self.request = None
+
+    @property
+    def ok(self):
+        return self.status_code < 400
+
+    def raise_for_status(self):
+        if not self.ok:
+            raise AssertionError(f'HTTP {self.status_code}: {self.text}')
+
+
+@pytest.fixture
+def escribir_consolidado(monkeypatch):
+    """Corre el `upsert` real y devuelve lo que le habría mandado a Supabase.
+
+    `con_columna=False` simula una base donde el ALTER TABLE de
+    `payment_time` todavía no se corrió.
+    """
+    def correr(filas, con_columna=True):
+        # El test de simulación de este mismo archivo deja el modo dry-run
+        # prendido (es global), y con él `upsert` no escribe nada.
+        dry_run.desactivar()
+        supabase._PAYMENT_TIME_DISPONIBLE = None
+        enviados: list[dict] = []
+
+        def _get(*_a, **_kw):
+            return _Resp(con_columna,
+                         '' if con_columna else
+                         'column consolidated_transactions.payment_time does not exist')
+
+        def _post(_url, json=None, **_kw):
+            enviados.extend(json or [])
+            return _Resp()
+
+        monkeypatch.setattr(supabase.http, 'get', _get)
+        monkeypatch.setattr(supabase.http, 'post', _post)
+        monkeypatch.setattr(supabase, 'existing_matching_keys', lambda *_a, **_k: set())
+
+        supabase.upsert('https://x', 'k', filas)
+        return enviados
+
+    yield correr
+    supabase._PAYMENT_TIME_DISPONIBLE = None
+
+
+def _fila_wompi(hora='21:45:48'):
+    fila = ['190093-1', '62694707', '21-07-2026', '7l5Lun_1', '500534673',
+            'quien.paga@example.com', 'WOMPI PSE', 'CUOTA 1 DE 4',
+            'JULIAN TORRES', 503125.0, '190093-1']
+    return fila + [hora] if hora is not None else fila
+
+
+def test_la_hora_de_wompi_llega_al_consolidado(escribir_consolidado):
+    enviados = escribir_consolidado([_fila_wompi()])
+    assert enviados[0]['payment_time'] == '21:45:48'
+    assert enviados[0]['payment_date'] == '2026-07-21', 'el día no debe cambiar'
+
+
+def test_un_banco_sin_hora_no_rompe_el_lote(escribir_consolidado):
+    """Todas las filas del lote llevan la misma clave, aunque solo una tenga hora.
+
+    PostgREST rechaza el array entero si los objetos no comparten el set de
+    claves (PGRST102) — es la razón por la que los pagos nuevos y los que ya
+    existen van en dos POST separados. Un extracto de Bancolombia (11 columnas,
+    el PDF no reporta hora) llegando junto a uno de WOMPI tiene que entrar.
+    """
+    enviados = escribir_consolidado([_fila_wompi(), _fila_wompi(hora=None)])
+
+    assert len(enviados) == 2
+    assert all('payment_time' in fila for fila in enviados)
+    assert [f['payment_time'] for f in enviados] == ['21:45:48', None]
+
+
+def test_sin_la_columna_la_ingesta_entra_igual(escribir_consolidado):
+    """Desplegar antes de correr el SQL no puede costar los pagos del día.
+
+    Un POST con una columna inexistente se rechaza ENTERO, así que la hora se
+    omite del payload mientras la columna no exista. Es la lección del 24 de
+    julio, cuando código nuevo que exigía esquema nuevo dejó el motor caído un
+    día entero.
+    """
+    enviados = escribir_consolidado([_fila_wompi()], con_columna=False)
+
+    assert len(enviados) == 1, 'el pago tiene que entrar igual'
+    assert 'payment_time' not in enviados[0]
+    assert enviados[0]['matching_key'] == '190093-1'
 
 
 def test_dos_corridas_del_mismo_archivo_dan_las_mismas_llaves(bandeja):

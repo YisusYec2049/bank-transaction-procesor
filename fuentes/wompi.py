@@ -20,6 +20,21 @@ Columnas esperadas (headers en minúsculas):
   [8] phone               ← nombre del pagador (Fase 9.5; antes: ref. 2)
   [9] payment_amount      ← float
   [10] matching_key       ← id de la transaccion
+  [11] payment_time       ← la HORA de `fecha` ('HH:MM:SS'), vacía si el
+                              archivo no la trae (ver más abajo)
+
+11 de agosto — la hora del pago deja de tirarse. `fecha` viene
+`2026-07-21 21:45:48` y hasta hoy se cortaba en 10 caracteres para armar
+`payment_date`: el día se guardaba y la hora se perdía en el acto, así que no
+existía en ninguna tabla ni había de dónde recuperarla. Pedido del área para
+la descarga del "Reporte WOMPI del día", donde la celda de Fecha Pago pasa a
+mostrar fecha y hora juntas.
+
+Va como campo aparte y no dentro de `payment_date` porque esa columna es una
+fecha de verdad en la base (`date`) y la lee medio pipeline. Los demás
+parsers siguen devolviendo 11 columnas: el consolidado guarda la hora cuando
+la fila la trae y deja la celda vacía cuando no (`utils/supabase.py`), que es
+lo que pasa con los extractos de Bancolombia — el PDF no la reporta.
 
 Fase 9.5 del rediseño (16 de julio): `program` y `phone` estaban
 intercambiados desde el 26 de junio (línea 1 de "Cambios para Consolidado"):
@@ -56,7 +71,27 @@ HEADERS = [
     'VAL',
     'identification', 'payment_date', 'transaction_code_1', 'transaction_code_2',
     'email', 'payment_method', 'program', 'phone', 'payment_amount', 'matching_key',
+    'payment_time',
 ]
+
+
+def _hora(fecha_col: str) -> str:
+    """La hora de `fecha` ('2026-07-21 21:45:48' -> '21:45:48').
+
+    Devuelve '' ante cualquier cosa que no sea exactamente HH:MM:SS —
+    una fecha sin hora, un separador raro, la celda vacía. Preferible a
+    guardar media hora suelta: la celda vacía se lee como "no vino", un
+    '21:45' a medias se lee como un dato.
+    """
+    hora = fecha_col[11:19]
+    if len(hora) != 8 or hora[2] != ':' or hora[5] != ':':
+        return ''
+    hh, mm, ss = hora[:2], hora[3:5], hora[6:]
+    if not (hh + mm + ss).isdigit():
+        return ''
+    if int(hh) > 23 or int(mm) > 59 or int(ss) > 59:
+        return ''
+    return hora
 
 
 def parse_file(buf: io.BytesIO, filename: str = '') -> list[dict]:
@@ -71,7 +106,8 @@ def parse_file(buf: io.BytesIO, filename: str = '') -> list[dict]:
         if not id_tx:
             continue
 
-        fecha_raw = r.get('fecha', '')[:10]
+        fecha_col = r.get('fecha', '')
+        fecha_raw = fecha_col[:10]
         if not fecha_raw:
             continue
         # WOMPI fecha: YYYY-MM-DD HH:MM:SS
@@ -100,6 +136,7 @@ def parse_file(buf: io.BytesIO, filename: str = '') -> list[dict]:
             'nombre':          r.get('nombre del pagador', ''),
             'documento':       r.get('documento del pagador', ''),
             'ref_2':           r.get('ref. 2', ''),
+            'hora':            _hora(fecha_col),
             'monto':           monto,
         })
 
@@ -121,6 +158,7 @@ def normalize(raw_rows: list[dict]) -> list[list]:
             r['nombre'],                       # [8]  phone (Fase 9.5: nombre del pagador)
             r['monto'],                        # [9]  payment_amount
             r['id_tx'],                        # [10] matching_key
+            r['hora'],                         # [11] payment_time (11 de agosto)
         ]
         for r in raw_rows
     ]
