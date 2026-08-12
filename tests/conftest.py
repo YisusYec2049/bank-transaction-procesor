@@ -70,6 +70,24 @@ def extracto_bancolombia(monkeypatch):
     return cargar
 
 
+@pytest.fixture
+def extracto_a_mano(monkeypatch):
+    """Igual que `extracto_bancolombia`, pero con las líneas escritas en el test.
+
+    Para casos que el extracto anonimizado no contiene y que no vale la pena
+    meterle: alcanza con el encabezado de la tabla y las dos o tres líneas que
+    el caso necesita. Sin `words`, así que la sucursal no se resuelve por
+    posición — lo que se prueba acá no depende de eso.
+    """
+    def cargar(modulo, lineas: list[str]):
+        texto = 'FECHA DESCRIPCIÓN SUCURSAL REFERENCIA VALOR\n' + '\n'.join(lineas)
+        paginas = [{'text': texto, 'words': []}]
+        monkeypatch.setattr(modulo.pdfplumber, 'open', lambda *_a, **_k: _PdfFalso(paginas))
+        return io.BytesIO(b'%PDF-falso')
+
+    return cargar
+
+
 # ── Archivos tal cual los recibe cada parser ──────────────────────────────────
 
 @pytest.fixture

@@ -92,6 +92,33 @@ def test_bancolombia_extrae_documento_de_consignaciones(extracto_bancolombia):
     )
 
 
+@pytest.mark.parametrize('modulo', [bc2576, bc2833])
+def test_bancolombia_omite_los_pagos_que_ya_reporta_la_pasarela(modulo, extracto_a_mano):
+    """Una transferencia cuya primera referencia es el código de comercio de una
+    pasarela ya viene por el archivo de esa pasarela: si entra también por el
+    banco, es la misma plata dos veces.
+
+    Caso real del 12/08/2026 (Heidy Garzón, $538.871): la referencia del extracto
+    (`190093 1786539474 11615`) es la llave de ese pago en WOMPI. Medido: 14
+    líneas así en los extractos de junio a agosto, 5 de ellas ya en el
+    consolidado, y ninguna cruzó nunca contra nadie porque el número que quedaba
+    de documento era el de la transacción en WOMPI.
+    """
+    buf = extracto_a_mano(modulo, [
+        '2026/08/12 TRANSF DE HEIDY GARZON YEPES TOBERIN 190093 1786539474 11615 538,871.00',
+        '2026/08/12 TRANSF DE LAURA PEREZ GOMEZ TOBERIN 52345678 400,000.00',
+    ])
+    filas = modulo.parse_pdf(buf)
+
+    montos = sorted(f['valor'] for f in filas)
+    assert montos == [400000.0], (
+        'el pago que la pasarela ya reporta no debe entrar al consolidado; '
+        f'salieron {montos}'
+    )
+    # La transferencia normal del mismo día sigue entrando con su documento.
+    assert filas[0]['ref1'] == '52345678'
+
+
 # ── Pasarelas ─────────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize('modulo, fixture, nombre', [

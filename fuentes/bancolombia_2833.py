@@ -28,6 +28,14 @@ DESCRIPCIONES_ELIMINAR = frozenset([
     'PAGO VIRTUAL PSE', 'BOTON', 'TRANSF BOTON',
 ])
 
+# Mismo criterio que en 2576 (ver el comentario largo allá): la primera referencia
+# es el código de comercio de una pasarela → ese pago ya viene por el archivo de la
+# pasarela y aquí sería la misma plata contada dos veces. En 2833 no se ha visto
+# ninguno todavía; va igual para que las dos cuentas se comporten igual.
+REFS_PASARELA = frozenset([
+    '190093',   # WOMPI
+])
+
 _FIJAS = [
     'ABONO BRUTO AMEX', 'ABONO BRUTO MASTER', 'ABONO BRUTO VISA',
     'ABONO INTERESES AHORROS',
@@ -221,9 +229,15 @@ def parse_pdf(pdf_bytes: io.BytesIO) -> list[dict]:
 
         i += 1
 
+    for f in filas:
+        if f['ref1'] in REFS_PASARELA:
+            log.info('parse_pdf 2833: %s "%s" $%s la reporta la pasarela (ref %s %s), se omite',
+                     f['fecha'], f['descripcion'], valor_str(f['valor']), f['ref1'], f['ref2'])
+
     validas = [
         f for f in filas
         if not any(d in f['descripcion'].upper() for d in DESCRIPCIONES_ELIMINAR)
+        and f['ref1'] not in REFS_PASARELA
         and f['valor'] >= 0
     ]
 

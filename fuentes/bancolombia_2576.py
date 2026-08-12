@@ -34,6 +34,22 @@ DESCRIPCIONES_ELIMINAR = frozenset([
     'PAGO VIRTUAL PSE', 'BOTON', 'TRANSF BOTON',
 ])
 
+# Códigos de comercio de pasarela. Una línea cuya PRIMERA referencia es uno de
+# estos no es un pago nuevo: es un pago que la pasarela ya reporta en su propio
+# archivo, y las tres referencias juntas (`190093 1786539474 11615`) son su llave
+# allá. Se va del consolidado por la misma razón que TRANSF BOTON — si no, la
+# misma plata entra dos veces.
+#
+# Además nunca cruzaba contra nadie: `_extraer_refs` deja la segunda referencia
+# (el número de la transacción en la pasarela) donde va el documento del pagador.
+#
+# Medido sobre los 71 extractos del Histórico (jun-ago 2026): 14 líneas, todas
+# `TRANSF DE <persona>` y todas de WOMPI. Ninguna otra pasarela aparece todavía;
+# el día que aparezca, es agregar su código acá.
+REFS_PASARELA = frozenset([
+    '190093',   # WOMPI
+])
+
 _FIJAS = [
     'ABONO BRUTO AMEX', 'ABONO BRUTO MASTER', 'ABONO BRUTO VISA',
     'ABONO INTERESES AHORROS', 'CARGUE TARJETA PREPAGO PROPIA',
@@ -229,9 +245,15 @@ def parse_pdf(pdf_bytes: io.BytesIO) -> list[dict]:
 
         i += 1
 
+    for f in filas:
+        if f['ref1'] in REFS_PASARELA:
+            log.info('parse_pdf 2576: %s "%s" $%s la reporta la pasarela (ref %s %s), se omite',
+                     f['fecha'], f['descripcion'], valor_str(f['valor']), f['ref1'], f['ref2'])
+
     validas = [
         f for f in filas
         if not any(d in f['descripcion'].upper() for d in DESCRIPCIONES_ELIMINAR)
+        and f['ref1'] not in REFS_PASARELA
         and f['valor'] >= 0
     ]
 
