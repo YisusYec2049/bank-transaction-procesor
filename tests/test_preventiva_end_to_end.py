@@ -8,6 +8,7 @@ en producción durante días, y nadie se enteró porque no fallaba: no hacía na
 """
 
 import cruzar_cartera_preventiva as ccp
+from cruzar_cartera_preventiva import _mismo_monto
 
 _IDS: dict[str, int] = {}
 
@@ -1124,4 +1125,117 @@ def test_la_linea_de_falta_de_pago_toma_la_fecha_de_su_cuota_madre(mundo):
     )
     assert float(linea.get('valor_a_cobrar')) == 300_000, (
         'al arrastrar la fecha se movió el faltante, que no cambió'
+    )
+
+
+# ── Abono del Excel corregido a mano (14 de agosto) ───────────────────────────
+# `cartera_preventiva_overrides.pago_manual`. El Excel trae la columna `PAGO`
+# —plata que el proceso manual dice haber cobrado— y con ella `valor_a_cobrar`
+# cae a 0, así que la cuota sale del reparto y ningún pago posterior le entra.
+# A veces ese abono es correcto y a veces no; poner 0 la reabre.
+# Caso que lo originó: doc 1038415208, cuota 3681PN46253 — la cartera la trajo
+# cobrada y el pago que llegó después quedó colgado.
+
+def _mundo_cuota_que_el_excel_trae_cobrada(pago_manual=None, **extra_cuota):
+    """Una cuota de $1.081.200 que el Excel trae ya cobrada (`pago` lleno,
+    `valor_a_cobrar` en 0) y un pago del mismo monto que entra hoy."""
+    campos = {'pago': '1081200', 'valor_a_cobrar': 0, **extra_cuota}
+    cuota = _cuota('INS60-A', 'INS60', '1038415208', 1_081_200, '2026-08-19', **campos)
+    tablas = {
+        'cartera_cargas': [_carga(f'{_hoy_bogota()}T15:23:32+00:00')],
+        'cartera_preventiva': [cuota],
+        'cruce_cartera': [_pago_cruzado('PAGO-ABONO', '1038415208', 'INS60', 1_081_200)],
+    }
+    if pago_manual is not None:
+        tablas['cartera_preventiva_overrides'] = [
+            {'llave': 'INS60-A', 'cerrado_manual': False, 'fecha_pago_manual': None,
+             'valor_cuota_manual': None, 'fecha_vencimiento_manual': None,
+             'pago_manual': pago_manual},
+        ]
+    return tablas
+
+
+def test_sin_corregir_el_abono_la_cuota_cobrada_no_recibe_el_pago(mundo):
+    """Línea base: es el problema tal cual, y sin esto el test de abajo no
+    demuestra nada."""
+    capturado = mundo(ccp, tablas=_mundo_cuota_que_el_excel_trae_cobrada())
+
+    assert not capturado.get('pago_asociaciones'), (
+        'la cuota que el Excel trae cobrada recibió plata sin que nadie '
+        'corrigiera el abono'
+    )
+
+
+def test_poner_el_abono_en_cero_reabre_la_cuota_y_el_pago_entra_solo(mundo):
+    """Lo que pidió el usuario: el abono que trae la cartera no existe, se pone
+    en 0, la cuota vuelve a deber lo suyo entero y el pago que llegó después
+    entra sin que nadie lo asocie a mano."""
+    capturado = mundo(ccp, tablas=_mundo_cuota_que_el_excel_trae_cobrada(pago_manual=0))
+
+    asociaciones = capturado.get('pago_asociaciones', [])
+    assert [a['llave'] for a in asociaciones] == ['INS60-A'], (
+        f'el pago no entró a la cuota reabierta: {asociaciones}'
+    )
+    assert float(asociaciones[0]['monto']) == 1_081_200
+
+    fila = _fila_final(capturado, 'INS60-A')
+    assert _mismo_monto(fila.get('valor_pago'), 1_081_200), (
+        'la cuota no quedó mostrando el pago que la cubrió'
+    )
+    assert _mismo_monto(fila.get('diferencia'), 0), (
+        'la cuota quedó con saldo: el abono corregido no llegó al cálculo'
+    )
+
+
+def test_un_abono_parcial_corregido_deja_la_cuota_debiendo_la_diferencia(mundo):
+    """El Excel dice que se cobraron $1.081.200 y de verdad fueron $81.200: la
+    cuota queda debiendo $1.000.000, y el pago de $1.081.200 la cubre dejando
+    $81.200 de excedente."""
+    capturado = mundo(ccp, tablas=_mundo_cuota_que_el_excel_trae_cobrada(pago_manual=81_200))
+
+    asociaciones = capturado.get('pago_asociaciones', [])
+    assert [a['llave'] for a in asociaciones] == ['INS60-A']
+    assert float(asociaciones[0]['monto']) == 1_000_000, (
+        'el pago no se midió contra el saldo real de la cuota: debía '
+        f'$1.000.000 y se aplicaron {asociaciones[0]["monto"]}'
+    )
+
+
+def test_corregir_el_abono_de_una_cuota_cerrada_no_le_borra_el_cierre(mundo):
+    """`pago` mezcla dos manos desde el 23 de julio: el abono del Excel y lo que
+    escribió el cierre (`pago_confirmado`). La corrección reemplaza SOLO la
+    parte del Excel — si pisara la columna entera, corregir el abono de una
+    cuota cerrada le borraría el cierre de contrabando."""
+    # Cuota de $1.081.200 con $581.200 de abono del Excel: quedaba debiendo
+    # $500.000, el pipeline le aplicó un pago de $500.000 y la cerró — por eso
+    # `pago` suma las dos manos y `valor_a_cobrar` quedó en 0.
+    tablas = _mundo_cuota_que_el_excel_trae_cobrada(
+        pago_manual=0, pago='1081200', pago_confirmado=500_000,
+        valor_pago=500_000, fecha_pago='2026-08-01', fecha_cruce=_hoy_bogota())
+    tablas['cruce_cartera'] = [
+        _pago_cruzado('PAGO-ABONO', '1038415208', 'INS60', 500_000)]
+    tablas['pago_asociaciones'] = [
+        {'id': 9601, 'matching_key': 'PAGO-ABONO', 'llave': 'INS60-A',
+         'monto': 500_000, 'origen': 'automatico'},
+    ]
+
+    capturado = mundo(ccp, tablas=tablas)
+
+    fila = _fila_final(capturado, 'INS60-A')
+    # `_fila_final` acumula lo que la corrida ESCRIBIÓ: que `pago_confirmado`
+    # no aparezca significa que nadie lo tocó, o sea que el cierre sigue en pie.
+    assert _mismo_monto(fila.get('pago_confirmado', 500_000), 500_000), (
+        'la corrección del abono se llevó por delante el cierre de la cuota'
+    )
+    assert _mismo_monto(fila.get('pago'), 500_000), (
+        'al quitar el abono del Excel la cuota tiene que quedar solo con lo '
+        f'que puso el cierre, y quedó con {fila.get("pago")}'
+    )
+    assert _mismo_monto(fila.get('valor_a_cobrar'), 581_200), (
+        'la cuota tiene que volver a deber el abono que no existía '
+        f'($581.200), y quedó pidiendo {fila.get("valor_a_cobrar")}'
+    )
+    assert not capturado.get('pago_asociaciones'), (
+        'la corrección del abono repartió plata de nuevo: el pago ya estaba '
+        'aplicado a esa cuota y un pago se reparte una sola vez'
     )

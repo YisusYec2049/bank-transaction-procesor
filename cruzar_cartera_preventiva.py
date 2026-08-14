@@ -902,9 +902,20 @@ def main():
     ayer = (datetime.now(tz_bogota) - timedelta(days=1)).strftime('%Y-%m-%d')
 
     log.info('Cargando overrides y asociaciones existentes...')
-    overrides_rows = select_all(supabase_url, srk, 'cartera_preventiva_overrides',
-                                 select='llave,cerrado_manual,fecha_pago_manual,valor_cuota_manual,'
-                                        'fecha_vencimiento_manual')
+    _cols_override = ('llave,cerrado_manual,fecha_pago_manual,valor_cuota_manual,'
+                      'fecha_vencimiento_manual')
+    # `pago_manual` es el abono del Excel corregido a mano (14 de agosto). Se
+    # pide con red por la misma razón que `aplicacion_cerrada_at`: pedir una
+    # columna que todavía no existe tumba la corrida entera, y el SQL y el
+    # despliegue son independientes a propósito (lección del 24 de julio).
+    try:
+        overrides_rows = select_all(supabase_url, srk, 'cartera_preventiva_overrides',
+                                     select=_cols_override + ',pago_manual')
+    except requests.HTTPError:
+        log.warning('cartera_preventiva_overrides.pago_manual no existe todavía: el abono '
+                     'que trae el Excel no se puede corregir. Correr el ALTER TABLE.')
+        overrides_rows = select_all(supabase_url, srk, 'cartera_preventiva_overrides',
+                                     select=_cols_override)
     llaves_cerradas_manual = {r['llave'] for r in overrides_rows if r.get('cerrado_manual')}
     cerrados_manual_por_llave = {r['llave']: r for r in overrides_rows if r.get('cerrado_manual')}
     overrides_por_llave = {r['llave']: r for r in overrides_rows if r.get('llave')}
@@ -970,6 +981,50 @@ def main():
     id_por_llave      = {c['llave']: c['id'] for c in cuotas_rows if c.get('llave')}
     llave_por_id      = {c['id']: c['llave'] for c in cuotas_rows}
     cliente_por_llave = {c['llave']: c.get('cliente') for c in cuotas_rows if c.get('llave')}
+
+    # Abono del Excel corregido a mano desde fin-platform
+    # (`cartera_preventiva_overrides.pago_manual`, 14 de agosto).
+    #
+    # El Excel trae la columna `PAGO` — plata que el proceso manual dice haber
+    # cobrado ya — y con ella `valor_a_cobrar` cae a 0, así que la cuota sale
+    # del reparto y NINGÚN pago posterior puede entrarle. A veces ese abono es
+    # correcto y a veces no, y hasta hoy no había forma de corregirlo: los
+    # otros dos overrides no sirven (el de valor recalcula
+    # `valor_a_cobrar = valor - abono`, así que reabrir una cuota exigía
+    # inflar su valor al doble, dejando el dato mintiendo).
+    #
+    # Poner 0 = "ese abono no existe": la cuota vuelve a deber lo suyo entero
+    # y el pago que llegue después entra solo. Un abono parcial se escribe con
+    # su valor real. Caso que lo originó: doc 1038415208, cuota 3681PN46253.
+    #
+    # Va ANTES del bloque de `valor_cuota_manual` a propósito: ese lee el
+    # abono con `_pago_sin_confirmar` para recalcular, así que tiene que ver
+    # el corregido. Y `pago` mezcla dos manos desde el 23 de julio (el abono
+    # del Excel y lo que escribió el cierre, que guarda `pago_confirmado`),
+    # así que la corrección reemplaza SOLO la parte del Excel y le devuelve
+    # encima lo que puso el cierre — si no, corregir el abono de una cuota
+    # cerrada le borraría el cierre de contrabando.
+    ajustes_pago: list[dict] = []
+    for cuota in cuotas_rows:
+        override = overrides_por_llave.get(cuota.get('llave') or '')
+        nuevo = override.get('pago_manual') if override else None
+        if nuevo is None:
+            continue
+        nuevo = round(float(nuevo), 2)
+        if _mismo_monto(_pago_sin_confirmar(cuota), nuevo):
+            continue
+        confirmado = round(float(cuota.get('pago_confirmado') or 0), 2)
+        cuota['pago']           = round(nuevo + confirmado, 2)
+        # `valor_a_cobrar` sale de la fórmula del Sistema Financiero sobre el
+        # `pago` COMPLETO (abono corregido + lo que puso el cierre), igual que
+        # en `_fila_cierre`. Restar solo el abono dejaría el cierre contado dos
+        # veces al recuperar el saldo en `_saldo_a_cobrar`.
+        cuota['valor_a_cobrar'] = round(float(cuota.get('valor_cuota') or 0) - cuota['pago'], 2)
+        ajustes_pago.append({'id': cuota['id'], 'pago': cuota['pago'],
+                             'valor_a_cobrar': cuota['valor_a_cobrar']})
+    if ajustes_pago:
+        upsert_cartera_preventiva(supabase_url, srk, ajustes_pago)
+        log.info('%d cuota(s) con abono del Excel corregido a mano aplicado.', len(ajustes_pago))
 
     # Valor de cuota corregido a mano desde fin-platform
     # (`cartera_preventiva_overrides.valor_cuota_manual`). La app lo guarda
