@@ -1314,3 +1314,75 @@ def test_el_saldo_propio_se_sigue_viendo_en_la_cuota_del_pagador(mundo):
         '`valor_pago` dejó de mostrar lo que entró por el pago: '
         f'{fila.get("valor_pago")}'
     )
+
+
+# ── El cruce a la inversa nombra a las DOS personas de un pago compartido ────
+#
+# Un pago puede pagarle a dos personas (un diplomado de 2 cupos girado de una
+# vez, una empresa por su empleado, o un saldo trasladado a otro documento).
+# La columna tomaba `llaves[0]` —la primera de la lista, sin criterio— así que
+# nombraba a una sola, elegida por el orden de lectura, y en pantalla la fila
+# del PAGADOR podía mostrar el nombre de la otra persona.
+#
+# Caso real (19 de agosto): el pago de Guillermo Orrego decía "Yanci Stefania
+# Cardona" en las dos filas.
+
+def _mundo_pago_compartido():
+    """Un pago de $1.336.400 aplicado a una cuota de cada persona: la del
+    pagador y la de otra, a la que le trasladaron el saldo."""
+    return {
+        'cartera_cargas': [_carga(f'{_hoy_bogota()}T15:23:32+00:00')],
+        'cartera_preventiva': [
+            _cuota('INS80-A', 'INS80', '80911728', 668_200, '2026-09-10',
+                   cliente='Guillermo Orrego',
+                   fecha_pago='2026-08-14', valor_pago=668_200,
+                   fecha_cruce=_hoy_bogota(), diferencia=0),
+            _cuota('INS81-A', 'INS81', '1214726672', 668_200, '2026-09-10',
+                   cliente='Yanci Cardona',
+                   fecha_pago='2026-08-14', valor_pago=668_200,
+                   fecha_cruce=_hoy_bogota(), diferencia=0),
+        ],
+        'pago_asociaciones': [
+            {'id': 9901, 'matching_key': 'PAGO-2-CUPOS', 'llave': 'INS81-A',
+             'monto': 668_200, 'origen': 'manual'},
+            {'id': 9902, 'matching_key': 'PAGO-2-CUPOS', 'llave': 'INS80-A',
+             'monto': 668_200, 'origen': 'automatico'},
+        ],
+        'cruce_cartera': [_pago_cruzado('PAGO-2-CUPOS', '80911728', 'INS80',
+                                        1_336_400, fecha='2026-08-14')],
+    }
+
+
+def _cruce_inverso_de(capturado, matching_key):
+    valor = None
+    for u in capturado.get('cruce_cartera_update', []):
+        if u.get('matching_key') == matching_key and 'cruce' in u:
+            valor = u['cruce']
+    return valor
+
+
+def test_el_cruce_inverso_nombra_a_las_dos_personas(mundo):
+    capturado = mundo(ccp, tablas=_mundo_pago_compartido())
+
+    assert _cruce_inverso_de(capturado, 'PAGO-2-CUPOS') == (
+        'Guillermo Orrego | Yanci Cardona'), (
+        'el cruce a la inversa nombra a una sola persona del pago compartido, '
+        f'y quedó: {_cruce_inverso_de(capturado, "PAGO-2-CUPOS")!r}'
+    )
+
+
+def test_el_cruce_inverso_no_oscila_entre_corridas(mundo):
+    """Esta columna se reescribe entera en cada corrida. Si el orden lo pusiera
+    la lectura, dos corridas seguidas escribirían los mismos nombres al revés y
+    la fila parecería cambiar sola."""
+    tablas = _mundo_pago_compartido()
+    primera = _cruce_inverso_de(mundo(ccp, tablas=tablas), 'PAGO-2-CUPOS')
+
+    tablas_al_reves = _mundo_pago_compartido()
+    tablas_al_reves['pago_asociaciones'].reverse()
+    tablas_al_reves['cartera_preventiva'].reverse()
+    segunda = _cruce_inverso_de(mundo(ccp, tablas=tablas_al_reves), 'PAGO-2-CUPOS')
+
+    assert primera == segunda, (
+        f'el valor depende del orden de lectura: {primera!r} vs {segunda!r}'
+    )

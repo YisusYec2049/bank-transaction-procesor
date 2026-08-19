@@ -2077,7 +2077,23 @@ def main():
     for p in pagos_cruzados:
         mk = p['matching_key']
         llaves = llaves_por_pago.get(mk)
-        cruce = cliente_por_llave.get(llaves[0]) if llaves else None
+        # Un pago puede pagarle a DOS personas: un diplomado de 2 cupos girado
+        # de una vez, una empresa por su empleado, o un saldo trasladado a otro
+        # documento. Antes se tomaba `llaves[0]` —la primera de la lista, sin
+        # ningún criterio— así que en un pago compartido la columna nombraba a
+        # una sola de las dos, elegida por el orden de lectura. Y en la pantalla
+        # eso se ve peor de lo que suena: la fila del pagador mostraba el nombre
+        # de la OTRA persona (caso 19 de agosto: el pago de Guillermo Orrego
+        # decía "Yanci Stefania Cardona").
+        #
+        # Se ordenan para que el valor no oscile entre corridas: esta columna se
+        # reescribe entera en cada una, y con el orden de lectura mandando, dos
+        # corridas seguidas escribirían los mismos nombres al revés.
+        nombres = sorted({
+            nombre for llave in (llaves or [])
+            if (nombre := cliente_por_llave.get(llave))
+        })
+        cruce = ' | '.join(nombres) or None
         cruce_updates.append({'matching_key': mk, 'cruce': cruce})
 
     if cruce_updates:
