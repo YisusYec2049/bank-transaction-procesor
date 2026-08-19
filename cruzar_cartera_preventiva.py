@@ -1236,12 +1236,39 @@ def main():
     # doble de lo que entró).
     venc_por_llave = {c['llave']: (c.get('fecha_vencimiento') or _FECHA_MAX)
                        for c in cuotas_rows if c.get('llave')}
-    disponible_por_pago: dict[str, float] = {}
+    doc_por_llave = {c['llave']: _normalizar_documento(c.get('cruce_access'))
+                      for c in cuotas_rows if c.get('llave')}
+
+    # El ledger se agrupa por PAGO **y DOCUMENTO**, no solo por pago.
+    #
+    # Un pago puede cubrir a dos personas (una empresa por su empleado, un
+    # familiar por otro), y desde el traslado de saldo la plata sobrante de un
+    # pago puede quedar a nombre de OTRO documento. Agrupando solo por pago,
+    # ese `disponible` ajeno se sumaba sobre la cuota del pagador: su fila
+    # mostraba como saldo a favor —y dentro de `valor_pago`— plata que ya es de
+    # otra persona, y quien la viera podría asociarla dos veces.
+    #
+    # Mientras nadie traslade nada esto no cambia ningún número: todas las
+    # filas del ledger nacen con el documento de su propia cuota (medido el
+    # 19 de agosto: 113 de 113 filas vivas con `documento`, 0 sin él).
+    disponible_por_pago: dict[tuple[str, str], float] = {}
     for cr in saldos_favor_rows:
         mk = cr.get('matching_key')
         if mk:
-            disponible_por_pago[mk] = round(
-                disponible_por_pago.get(mk, 0.0) + float(cr.get('disponible') or 0), 2)
+            clave = (mk, _normalizar_documento(cr.get('documento')))
+            disponible_por_pago[clave] = round(
+                disponible_por_pago.get(clave, 0.0) + float(cr.get('disponible') or 0), 2)
+
+    def _disponible_del_pago(mk: str, llave: str) -> float:
+        """Plata de ese pago que sigue suelta **y que le pertenece al dueño de
+        esa cuota**.
+
+        Una fila del ledger sin `documento` cuenta igual: son filas viejas
+        (7 en la tabla de archivo, ninguna viva), y hacer desaparecer plata en
+        silencio es peor que mostrarla donde se mostraba hasta ahora."""
+        doc = doc_por_llave.get(llave, '')
+        return round(disponible_por_pago.get((mk, doc), 0.0)
+                      + disponible_por_pago.get((mk, ''), 0.0), 2)
 
     def _llaves_por_pago(asociaciones) -> dict[str, list[str]]:
         """Cuotas que cubre cada pago hoy, de la más vieja a la más nueva."""
@@ -1274,7 +1301,7 @@ def main():
         extra = 0.0
         for mk in {a['matching_key'] for a in asociaciones_cuota}:
             if _destino_saldo(por_pago.get(mk) or []) == llave:
-                extra += disponible_por_pago.get(mk, 0.0)
+                extra += _disponible_del_pago(mk, llave)
         return round(extra, 2)
 
     def _valor_pago_visible(llave: str, asociaciones_cuota: list[dict],
@@ -1719,8 +1746,9 @@ def main():
         for s in saldos_favor_nuevos:
             mk = s.get('matching_key')
             if mk:
-                disponible_por_pago[mk] = round(
-                    disponible_por_pago.get(mk, 0.0) + float(s.get('disponible') or 0), 2)
+                clave = (mk, _normalizar_documento(s.get('documento')))
+                disponible_por_pago[clave] = round(
+                    disponible_por_pago.get(clave, 0.0) + float(s.get('disponible') or 0), 2)
     # La línea de FALTA DE PAGO sigue a la `diferencia` de su cuota original
     # mientras esa original siga abierta (30 de julio). Va ANTES de escribir
     # las líneas nuevas porque puede descartar alguna que ya no corresponde.
@@ -1776,16 +1804,20 @@ def main():
 
     # El ledger se agrupa POR PAGO, no fila por fila: un mismo pago puede
     # tener varias filas (su sobrante original más lo que le devuelva un
-    # descarte) y todas describen la misma plata suelta de la misma persona.
+    # descarte) y todas describen la misma plata suelta.
+    #
+    # Este mapa solo sirve para saber DÓNDE mirar (`llave_origen`) y qué cuotas
+    # son candidatas a limpieza. **Cuánta plata mostrar sale de
+    # `_disponible_del_pago`**, que filtra por documento: desde el traslado de
+    # saldo, no toda la plata suelta de un pago es de la misma persona.
     saldo_por_pago: dict[str, dict] = {}
     for cr in saldos_favor_rows:
         mk = cr.get('matching_key')
         if not mk:
             continue
-        acum = saldo_por_pago.setdefault(
-            mk, {'monto': 0.0, 'disponible': 0.0, 'llave_origen': cr.get('llave_origen')})
-        acum['monto']      = round(acum['monto'] + float(cr.get('monto') or 0), 2)
-        acum['disponible'] = round(acum['disponible'] + float(cr.get('disponible') or 0), 2)
+        acum = saldo_por_pago.setdefault(mk, {'llave_origen': cr.get('llave_origen')})
+        if not acum.get('llave_origen'):
+            acum['llave_origen'] = cr.get('llave_origen')
 
     destino_por_pago: dict[str, str] = {}
     for mk, acum in saldo_por_pago.items():
@@ -1820,7 +1852,7 @@ def main():
         if not llaves_vigentes_por_pago.get(mk):
             continue
         diferencia_deseada[destino] = round(
-            diferencia_deseada.get(destino, 0.0) + saldo_por_pago[mk]['disponible'], 2)
+            diferencia_deseada.get(destino, 0.0) + _disponible_del_pago(mk, destino), 2)
 
     # Candidatas a limpieza: toda cuota donde este saldo pudo haberse
     # mostrado antes de moverse. Se acota a cuotas que tocó el pipeline
@@ -1962,13 +1994,16 @@ def main():
     # la misma donde se muestra el saldo a favor (los dos usan
     # `destino_por_pago`).
     etiqueta_por_llave: dict[str, str] = {}
-    for mk, acum in saldo_por_pago.items():
-        if acum['disponible'] <= 0:
-            continue  # no queda nada sin repartir: no hay nada que avisar
+    for mk in saldo_por_pago:
         destino = destino_por_pago.get(mk)
         cuota_id = id_por_llave.get(destino) if destino else None
         if cuota_id is None:
             continue
+        # Lo que le queda suelto a ese pago **para el dueño de esta cuota**: la
+        # plata trasladada a otro documento ya no se avisa acá.
+        disponible = _disponible_del_pago(mk, destino)
+        if disponible <= 0:
+            continue  # no queda nada sin repartir: no hay nada que avisar
         cuota_destino = next((c for c in cuotas_rows if c['id'] == cuota_id), None)
         if not cuota_destino:
             continue
@@ -1988,7 +2023,7 @@ def main():
         if not cubiertas:
             continue
         etiqueta = _etiqueta_notificacion(_saldo_a_cobrar(cuota_destino),
-                                           acum['disponible'], cubiertas)
+                                           disponible, cubiertas)
         if etiqueta:
             etiqueta_por_llave[destino] = etiqueta
 

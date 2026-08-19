@@ -1239,3 +1239,78 @@ def test_corregir_el_abono_de_una_cuota_cerrada_no_le_borra_el_cierre(mundo):
         'la corrección del abono repartió plata de nuevo: el pago ya estaba '
         'aplicado a esa cuota y un pago se reparte una sola vez'
     )
+
+
+# ── La plata enviada a otro documento no se pinta sobre la cuota del pagador ─
+#
+# Un pago puede cubrir a dos personas (una empresa por su empleado, un familiar
+# por otro), y desde el traslado de saldo el sobrante de un pago puede quedar a
+# nombre de OTRO documento. El pipeline agrupaba el ledger solo por pago, así
+# que ese `disponible` ajeno se sumaba sobre la cuota del pagador: su fila
+# mostraba como saldo a favor —y dentro de `valor_pago`— plata que ya es de otra
+# persona. Quien la viera podía asociarla dos veces, una de cada lado.
+#
+# Caso que lo trajo: doc 80911728 (19 de agosto), pago de $1.336.400 por un
+# diplomado de 2 cupos — media plata es del segundo cupo, que va a otra cédula.
+
+def _mundo_saldo_trasladado(documento_del_saldo: str):
+    """Una cuota de $668.200 pagada por un pago de $1.336.400. El sobrante
+    ($668.200) queda en el ledger a nombre de `documento_del_saldo`."""
+    return {
+        'cartera_cargas': [_carga(f'{_hoy_bogota()}T15:23:32+00:00')],
+        'cartera_preventiva': [
+            _cuota('INS70-A', 'INS70', '80911728', 668_200, '2026-09-10',
+                   fecha_pago='2026-08-14', valor_pago=1_336_400,
+                   fecha_cruce=_hoy_bogota(), diferencia=668_200),
+        ],
+        'pago_asociaciones': [
+            {'id': 9701, 'matching_key': 'PAGO-2-CUPOS', 'llave': 'INS70-A',
+             'monto': 668_200, 'origen': 'automatico'},
+        ],
+        'cartera_saldos_favor': [
+            {'id': 9801, 'matching_key': 'PAGO-2-CUPOS', 'llave_origen': 'INS70-A',
+             'monto': 668_200, 'disponible': 668_200, 'aplicado': False,
+             'origen': 'sobrante', 'documento': documento_del_saldo,
+             'correo': 'kdt1720@example.com', 'inscrip': 'INS70',
+             'cliente': 'PERSONA DE PRUEBA', 'fecha': '2026-08-14'},
+        ],
+        'cruce_cartera': [_pago_cruzado('PAGO-2-CUPOS', '80911728', 'INS70',
+                                        1_336_400, fecha='2026-08-14')],
+    }
+
+
+def test_el_saldo_enviado_a_otro_documento_sale_de_la_cuota_del_pagador(mundo):
+    """La plata que ya es de otra persona no puede seguir viéndose como saldo a
+    favor del pagador: se asociaría dos veces, una de cada lado."""
+    capturado = mundo(ccp, tablas=_mundo_saldo_trasladado('1144132970'))
+
+    fila = _fila_final(capturado, 'INS70-A')
+    assert _mismo_monto(fila.get('diferencia', 0), 0), (
+        'la cuota del pagador sigue mostrando como saldo a favor '
+        f'{fila.get("diferencia")}, que ya es de otro documento'
+    )
+    assert fila.get('notificacion') in (None, '__sin_escribir__', ''), (
+        'la cuota del pagador avisa de plata sin repartir que ya no es suya: '
+        f'{fila.get("notificacion")!r}'
+    )
+    assert _mismo_monto(fila.get('valor_pago', 668_200), 668_200), (
+        '`valor_pago` sigue contando el sobrante trasladado, así que la fila '
+        f'dice que entraron {fila.get("valor_pago")} para esta persona'
+    )
+
+
+def test_el_saldo_propio_se_sigue_viendo_en_la_cuota_del_pagador(mundo):
+    """El guardo del cambio anterior: mientras la plata sea del mismo
+    documento, todo se ve exactamente igual que antes. Sin esta prueba, filtrar
+    de más apagaría el saldo a favor de todo el mundo."""
+    capturado = mundo(ccp, tablas=_mundo_saldo_trasladado('80911728'))
+
+    fila = _fila_final(capturado, 'INS70-A')
+    assert _mismo_monto(fila.get('diferencia', 668_200), 668_200), (
+        'el saldo a favor propio dejó de verse: la cuota quedó con '
+        f'{fila.get("diferencia")}'
+    )
+    assert _mismo_monto(fila.get('valor_pago', 1_336_400), 1_336_400), (
+        '`valor_pago` dejó de mostrar lo que entró por el pago: '
+        f'{fila.get("valor_pago")}'
+    )
