@@ -269,9 +269,22 @@ def parse_pdf(pdf_bytes: io.BytesIO) -> list[dict]:
 def normalize(raw_rows: list[dict]) -> list[list]:
     result = []
     for row in raw_rows:
-        ref1         = str(row['ref1'] or '').strip().lstrip('0')
-        ref2         = str(row['ref2'] or '').strip().lstrip('0')
-        ident        = ref2 if ref2 else ref1
+        # El documento sale SIEMPRE de REFERENCIA 1, que es lo que digita quien
+        # paga. La columna DOCUMENTO del extracto es la de quien fue a la
+        # ventanilla (un familiar, un mensajero) y no identifica al estudiante.
+        #
+        # Antes se tomaba "el segundo número de la línea", pensando en las
+        # líneas de tarjeta, donde la primera referencia es el código fijo de
+        # comercio. Pero el PDF llega con todas las columnas pegadas y aquí se
+        # cuentan números, no columnas: ese segundo número era REFERENCIA 2 o
+        # DOCUMENTO según qué columnas vinieran llenas, así que la misma
+        # persona pagando lo mismo cambiaba de documento entre un extracto y
+        # otro (caso real: CNB REDES $550.000, 9520551 → 3805PN).
+        #
+        # Este mismo valor es el que viaja a `email` (índice 5), y con él se
+        # resuelven INCP y CORREO(2) en el cruce y la búsqueda en cartera
+        # preventiva.
+        ident        = str(row['ref1'] or '').strip().lstrip('0')
         fecha        = row['fecha']
         v            = row['valor']
         matching_key = f'{fecha}_{ident}_{valor_str(v)}'

@@ -119,6 +119,44 @@ def test_bancolombia_omite_los_pagos_que_ya_reporta_la_pasarela(modulo, extracto
     assert filas[0]['ref1'] == '52345678'
 
 
+@pytest.mark.parametrize('modulo', [bc2576, bc2833])
+def test_bancolombia_el_documento_sale_de_referencia_1(modulo, extracto_a_mano):
+    """El documento del pago es REFERENCIA 1, nunca la columna DOCUMENTO.
+
+    REFERENCIA 1 es lo que digita quien paga; la columna DOCUMENTO es de quien
+    fue a la ventanilla (un familiar, un mensajero) y no identifica al
+    estudiante. Y como el PDF llega con todas las columnas pegadas, acá se
+    cuentan números y no columnas: tomar "el segundo" era quedarse con
+    REFERENCIA 2 o con DOCUMENTO según qué columnas vinieran llenas.
+
+    Caso real del 20/08/2026 (CNB REDES, $550.000): REFERENCIA 1 = 9520551 es la
+    inscripción `3805PN`; el documento 000070332 no existe en cartera. La misma
+    persona había pagado el 16/07 y esa vez el extracto trajo un solo número, así
+    que sí cruzó — el pago cambiaba de dueño según cómo viniera el archivo.
+
+    El mismo valor viaja a `email` (índice 5), que es con el que se resuelve
+    CORREO(2), y a la `matching_key`.
+    """
+    buf = extracto_a_mano(modulo, [
+        # REFERENCIA 1 + DOCUMENTO, sin REFERENCIA 2 (el caso del 20/08).
+        '2026/08/20 CONSIG NAL REFERENCIA EFECTIVO CNB REDES 9520551 000070332 550,000.00',
+        # Las tres llenas: manda REFERENCIA 1 igual.
+        '2026/08/20 CONSIG NAL REFERENCIA EFECTIVO CNB REDES 1065009581 777888 000070332 310,000.00',
+    ])
+    filas = modulo.normalize(modulo.parse_pdf(buf))
+    por_valor = {f[9]: f for f in filas}
+
+    documento, email, llave = por_valor[550000.0][1], por_valor[550000.0][5], por_valor[550000.0][10]
+    assert documento == '9520551', f'el documento debe ser REFERENCIA 1, salió {documento}'
+    assert email == '9520551', f'el correo lleva el mismo dato, salió {email}'
+    assert llave == '20/08/2026_9520551_550000'
+
+    assert por_valor[310000.0][1] == '1065009581', (
+        'con REFERENCIA 2 y DOCUMENTO llenos también manda REFERENCIA 1, '
+        f'salió {por_valor[310000.0][1]}'
+    )
+
+
 # ── Pasarelas ─────────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize('modulo, fixture, nombre', [

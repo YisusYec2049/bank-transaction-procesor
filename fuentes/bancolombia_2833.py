@@ -252,9 +252,12 @@ def parse_pdf(pdf_bytes: io.BytesIO) -> list[dict]:
 def normalize(raw_rows: list[dict]) -> list[list]:
     result = []
     for row in raw_rows:
-        ref1         = str(row['ref1'] or '').strip().lstrip('0')
-        ref2         = str(row['ref2'] or '').strip().lstrip('0')
-        ident        = ref2 if ref2 else ref1
+        # Mismo criterio que 2576: el documento sale SIEMPRE de REFERENCIA 1.
+        # La columna DOCUMENTO del extracto es de quien fue a la ventanilla, no
+        # del estudiante, y como el PDF llega con las columnas pegadas, "el
+        # segundo número de la línea" era REFERENCIA 2 o DOCUMENTO según qué
+        # columnas vinieran llenas. Este valor viaja también a `email`.
+        ident        = str(row['ref1'] or '').strip().lstrip('0')
         fecha        = row['fecha']
         v            = row['valor']
         matching_key = f'{fecha}_{ident}_{valor_str(v)}'
