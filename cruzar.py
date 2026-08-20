@@ -581,6 +581,61 @@ PAGOS_MANUALES_LABEL  = 'PAGOS MANUALES'
 WOMPI_GENERA_LINK_LABEL = 'WOMPI (Genera Link)'
 
 
+def _documento_del_reporte(valor) -> str | None:
+    """El número de documento que trae la columna "Documento" del
+    ReportePagosWompi, sin el prefijo del tipo.
+
+    Ese campo llega como `<TIPO>-<número>`, y el tipo NO es siempre "CC".
+    Medido sobre los 835 pagos de los 15 reportes del Histórico (19 de
+    agosto): 807 `CC-1065891689`, 5 `CC- 1012367687` (**con espacio**),
+    7 `CEDULA_DE_EXTRANJERIA-227446`, 8 `Nit-830054203-1`, 4 `5114-1017268987`
+    (un tipo numérico, con la cédula correcta detrás), 2 `DNI-`, 1 `CI-` y
+    1 `OTR-Z2036570V` (pasaporte, con letra).
+
+    Por eso no hay lista de prefijos: se corta en el PRIMER guion y se valida
+    lo que queda. Un prefijo nuevo entra solo, y algo que no parezca un
+    documento devuelve None para que el llamador deje el número como está en
+    vez de escribir basura.
+
+    El NIT conserva su dígito de verificación (`830054203-1`): el segundo
+    guion es parte del número, y así queda **igual a como lo guarda la
+    cartera** — los 8 NIT del reporte están en `cartera_preventiva` con su
+    dígito."""
+    crudo = str(valor or '').strip()
+    if not crudo:
+        return None
+    numero = crudo.split('-', 1)[1].strip() if '-' in crudo else crudo
+    # Un documento: al menos 5 caracteres, con dígitos, y sin espacios ni
+    # letras sueltas de más. Cubre cédulas, NIT con dígito (`830054203-1`) y
+    # pasaportes (`Z2036570V`).
+    if len(numero) < 5 or not re.fullmatch(r'[A-Za-z0-9-]+', numero):
+        return None
+    if not any(c.isdigit() for c in numero):
+        return None
+    return numero
+
+
+def _mismo_documento(a: str, b: str) -> bool:
+    """¿Los dos son el mismo documento, aunque se escriban distinto?
+
+    Hoy la única diferencia de escritura es el dígito de verificación del NIT:
+    el reporte trae `Nit-901104591-7` y el consolidado `901104591` — la misma
+    empresa. Son 2 de los 15 pagos con documento distinto.
+
+    Y NO se corrigen al del reporte aunque sea el más completo, aunque la
+    cartera guarde el NIT con su dígito: `lookup_inscrip` se indexa con el
+    documento normalizado (sin dígito) y se busca con el CRUDO, así que
+    escribir `901104591-7` haría que esa empresa dejara de cruzar contra su
+    inscripción. Lo cazó una prueba, no el razonamiento.
+
+    (Que buscar con el crudo contra un índice normalizado sea frágil es un
+    hallazgo aparte, del mismo tipo que el bug del dígito de verificación del
+    4 de agosto — pero en `cruzar.py`. Arreglarlo cambia el cruce de todos los
+    pagos y necesita su propia medición; no entra de contrabando acá.)"""
+    na, nb = _normalizar_nit(a), _normalizar_nit(b)
+    return bool(na) and na == nb
+
+
 def _cargar_lookup_wompi_reporte(sa_json: str, folder_id: str) -> tuple[dict[str, dict], bool, list[dict]]:
     """Lee TODOS los ReportePagosWompi_*.xlsx que haya en la carpeta de Drive
     y arma {id_transaccion: {pagador, comprobante, inscripcion, id_transaccion,
@@ -1163,12 +1218,47 @@ def main():
                 t['program'] = proyecto
                 cambios['program'] = proyecto
 
+            # El DOCUMENTO del reporte manda sobre el que tecleó quien pagó
+            # (19 de agosto, pedido del área para ahorrar correcciones a mano).
+            # El reporte lo trae del Sistema Financiero; el CSV de WOMPI trae
+            # el "documento del pagador", que se escribe en un formulario y a
+            # veces sale mal — medido sobre los 835 pagos de los 15 reportes
+            # del Histórico: 771 idénticos y 7 realmente equivocados, dos de
+            # ellos con un CELULAR en lugar de la cédula. Los 7 quedaron sin
+            # aplicar y los 7 tienen hoy su cuota abierta esperando, por el
+            # monto exacto ($3.920.346) — entre ellos el pago de $650.614 de
+            # Mary Luz Giraldo, que costó media sesión el 5 de agosto.
+            #
+            # Se escribe acá, ANTES del cruce, para que el INCP y el CORREO(2)
+            # de esta misma corrida salgan con el número bueno. Y como
+            # `cruce_cartera.identification` es passthrough del consolidado, la
+            # fila terminal que se haya cruzado con el documento viejo se
+            # reabre sola más abajo, por el mismo camino que una corrección
+            # hecha a mano.
+            if match and t.get('matching_key') not in correcciones_documento:
+                doc_reporte = _documento_del_reporte(match.get('documento'))
+                doc_actual  = str(t.get('identification') or '').strip()
+                if doc_reporte is None and str(match.get('documento') or '').strip():
+                    # Prefijo que no se sabe leer: se deja el documento como
+                    # está y queda escrito, en vez de escribir cualquier cosa.
+                    log.warning('ReportePagosWompi: no se pudo leer el documento '
+                                '%r del pago %s, se deja el que ya tenía (%s).',
+                                match.get('documento'), tx_id, doc_actual)
+                elif (doc_reporte and doc_reporte != doc_actual
+                        and not _mismo_documento(doc_reporte, doc_actual)):
+                    t['identification'] = doc_reporte
+                    cambios['identification'] = doc_reporte
+                    log.info('Documento corregido con el ReportePagosWompi: '
+                              '%s -> %s (pago %s, %s).',
+                              doc_actual or '(vacío)', doc_reporte, tx_id,
+                              match.get('pagador') or '')
+
             if cambios:
                 actualizaciones.append({'matching_key': t['matching_key'], **cambios})
         if actualizaciones:
             update_consolidated_campos(supabase_url, srk, actualizaciones)
-            log.info('Consolidado: %d pago(s) WOMPI actualizados (método/programa).',
-                      len(actualizaciones))
+            log.info('Consolidado: %d pago(s) WOMPI actualizados '
+                      '(método/programa/documento).', len(actualizaciones))
 
     # Una fila terminal se salta, SALVO que el documento con el que se cruzó ya
     # no sea el documento que tiene hoy: eso significa que alguien lo corrigió

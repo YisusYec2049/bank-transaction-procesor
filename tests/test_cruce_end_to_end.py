@@ -323,3 +323,151 @@ def test_el_documento_corregido_no_se_guarda_en_la_columna_de_correo(mundo):
     )
     # Y el cruce no se degrada por guardar el original: sigue cerrando.
     assert fila['correo_2'] == '4321PN'
+
+
+# --------------------------------------------------------------------------
+# El documento del ReportePagosWompi manda sobre el que tecleó quien pagó
+# (19 de agosto). El reporte lo trae del Sistema Financiero; el CSV de WOMPI
+# trae lo que la persona escribió en el formulario. Medido sobre los 835 pagos
+# de los 15 reportes del Histórico: 771 idénticos, 7 realmente equivocados.
+# --------------------------------------------------------------------------
+
+def _reporte(monkeypatch, filas):
+    """Pone un ReportePagosWompi en la carpeta de Drive, sin salir a la red."""
+    lookup = {f['id_transaccion']: f for f in filas}
+    monkeypatch.setattr(cruzar, '_cargar_lookup_wompi_reporte',
+                        lambda *_a, **_k: (lookup, True, []))
+
+
+def _fila_reporte(id_transaccion, documento, pagador='PERSONA DE PRUEBA'):
+    return {'id_transaccion': id_transaccion, 'documento': documento,
+            'pagador': pagador, 'comprobante': 'CI-1', 'inscripcion': '',
+            'proyecto': '', 'fecha_pago': '2026-08-01'}
+
+
+def _documento_escrito(capturado, matching_key):
+    for f in capturado.get('consolidated_update', []):
+        if f.get('matching_key') == matching_key and 'identification' in f:
+            return f['identification']
+    return None
+
+
+def test_el_documento_del_reporte_corrige_el_que_tecleo_quien_pago(mundo, monkeypatch):
+    """Caso de Karen Liseth Gómez: al pagar puso su CELULAR (3164363047) donde
+    va la cédula. El reporte dice 1143858596, que es donde está su cuota."""
+    _reporte(monkeypatch, [_fila_reporte('PAGO-W', 'CC-1143858596', 'Karen Liseth Gomez')])
+    capturado = mundo(cruzar, tablas={
+        'consolidated_transactions': [_pago('PAGO-W', identification='3164363047',
+                                             metodo='WOMPI CARD')],
+        'cartera_inscrip': [{'numero_id': '1143858596', 'id_inscripcion': '4399PN'}],
+    })
+
+    assert _documento_escrito(capturado, 'PAGO-W') == '1143858596', (
+        'el documento equivocado quedó en el consolidado'
+    )
+    fila = _filas(capturado)['PAGO-W']
+    assert fila['identification'] == '1143858596'
+    assert fila['incp'] == '4399PN', (
+        'el documento se corrigió pero el cruce de esta misma corrida usó el '
+        f'viejo: {fila}'
+    )
+
+
+def test_si_el_documento_ya_coincide_no_se_escribe_nada(mundo, monkeypatch):
+    """771 de los 835 pagos del Histórico traen el mismo documento en los dos
+    lados. Sobre esos no se toca la base."""
+    _reporte(monkeypatch, [_fila_reporte('PAGO-W', 'CC-1002003004')])
+    capturado = mundo(cruzar, tablas={
+        'consolidated_transactions': [_pago('PAGO-W', identification='1002003004',
+                                             metodo='WOMPI CARD')],
+        'cartera_inscrip': [{'numero_id': '1002003004', 'id_inscripcion': '4321PN'}],
+    })
+
+    assert _documento_escrito(capturado, 'PAGO-W') is None, (
+        'se reescribió un documento que ya estaba bien'
+    )
+
+
+def test_una_correccion_hecha_a_mano_le_gana_al_reporte(mundo, monkeypatch):
+    """Regla del usuario: si alguien ya corrigió ese documento, manda la
+    persona. El reporte no le pisa el trabajo."""
+    _reporte(monkeypatch, [_fila_reporte('PAGO-W', 'CC-1143858596')])
+    capturado = mundo(cruzar, tablas={
+        'consolidated_transactions': [_pago('PAGO-W', identification='3164363047',
+                                             metodo='WOMPI CARD')],
+        'documento_correcciones': [{'id': 1, 'documento_original': '3164363047',
+                                     'documento_corregido': '9999999',
+                                     'matching_key_original': 'PAGO-W'}],
+        'cartera_inscrip': [{'numero_id': '9999999', 'id_inscripcion': '5000PN'}],
+    })
+
+    fila = _filas(capturado)['PAGO-W']
+    assert fila['identification'] == '9999999', (
+        'el reporte pisó una corrección hecha a mano: quedó '
+        f'{fila["identification"]}'
+    )
+
+
+def test_un_tipo_de_documento_raro_se_lee_igual(mundo, monkeypatch):
+    """El reporte no siempre dice "CC": hay 4 pagos con el tipo `5114-`, 7 con
+    `CEDULA_DE_EXTRANJERIA-`, 1 con `OTR-` y 5 con un espacio de más
+    (`CC- 1012367687`). Todos traen el documento bueno detrás."""
+    _reporte(monkeypatch, [
+        _fila_reporte('PAGO-A', '5114-1017268987'),
+        _fila_reporte('PAGO-B', 'CEDULA_DE_EXTRANJERIA-6235591'),
+        _fila_reporte('PAGO-C', 'OTR-Z2036570V'),
+        _fila_reporte('PAGO-D', 'CC- 1012367687'),
+    ])
+    capturado = mundo(cruzar, tablas={
+        'consolidated_transactions': [
+            _pago('PAGO-A', identification='malo1', metodo='WOMPI CARD'),
+            _pago('PAGO-B', identification='malo2', metodo='WOMPI CARD'),
+            _pago('PAGO-C', identification='malo3', metodo='WOMPI CARD'),
+            _pago('PAGO-D', identification='malo4', metodo='WOMPI CARD'),
+        ],
+    })
+
+    assert _documento_escrito(capturado, 'PAGO-A') == '1017268987'
+    assert _documento_escrito(capturado, 'PAGO-B') == '6235591'
+    assert _documento_escrito(capturado, 'PAGO-C') == 'Z2036570V'
+    assert _documento_escrito(capturado, 'PAGO-D') == '1012367687', (
+        'el espacio después del guion se coló en el documento'
+    )
+
+
+def test_un_documento_ilegible_no_pisa_el_que_ya_hay(mundo, monkeypatch):
+    """Ante algo que no parece un documento se deja el que hay y queda avisado
+    en el log — antes que escribir basura en el consolidado."""
+    _reporte(monkeypatch, [_fila_reporte('PAGO-W', 'CC-')])
+    capturado = mundo(cruzar, tablas={
+        'consolidated_transactions': [_pago('PAGO-W', identification='1002003004',
+                                             metodo='WOMPI CARD')],
+    })
+
+    assert _documento_escrito(capturado, 'PAGO-W') is None, (
+        'se escribió un documento ilegible sobre el que ya estaba'
+    )
+    assert _filas(capturado)['PAGO-W']['identification'] == '1002003004'
+
+
+def test_el_nit_no_se_reescribe_solo_por_el_digito_de_verificacion(mundo, monkeypatch):
+    """El reporte trae `Nit-901104591-7` y el consolidado `901104591`: es la
+    misma empresa, así que no hay nada que corregir.
+
+    Y escribirlo rompería el cruce: `lookup_inscrip` se indexa con el documento
+    sin dígito y se busca con el crudo, así que con `901104591-7` esa empresa
+    dejaría de encontrar su inscripción. Esta prueba nació fallando."""
+    _reporte(monkeypatch, [_fila_reporte('PAGO-W', 'Nit-901104591-7',
+                                          'CONTROL FINANCIERO Y TRIBUTARIO S.A.S')])
+    capturado = mundo(cruzar, tablas={
+        'consolidated_transactions': [_pago('PAGO-W', identification='901104591',
+                                             metodo='WOMPI CARD')],
+        'cartera_inscrip': [{'numero_id': '901104591-7', 'id_inscripcion': '301PJ'}],
+    })
+
+    assert _documento_escrito(capturado, 'PAGO-W') is None, (
+        'se reescribió el NIT con su dígito, y con eso deja de cruzar'
+    )
+    assert _filas(capturado)['PAGO-W']['incp'] == '301PJ', (
+        'el NIT dejó de cruzar contra su inscripción'
+    )
