@@ -339,9 +339,10 @@ def _reporte(monkeypatch, filas):
                         lambda *_a, **_k: (lookup, True, []))
 
 
-def _fila_reporte(id_transaccion, documento, pagador='PERSONA DE PRUEBA'):
+def _fila_reporte(id_transaccion, documento, pagador='PERSONA DE PRUEBA',
+                  inscripcion=''):
     return {'id_transaccion': id_transaccion, 'documento': documento,
-            'pagador': pagador, 'comprobante': 'CI-1', 'inscripcion': '',
+            'pagador': pagador, 'comprobante': 'CI-1', 'inscripcion': inscripcion,
             'proyecto': '', 'fecha_pago': '2026-08-01'}
 
 
@@ -450,13 +451,16 @@ def test_un_documento_ilegible_no_pisa_el_que_ya_hay(mundo, monkeypatch):
     assert _filas(capturado)['PAGO-W']['identification'] == '1002003004'
 
 
-def test_el_nit_no_se_reescribe_solo_por_el_digito_de_verificacion(mundo, monkeypatch):
-    """El reporte trae `Nit-901104591-7` y el consolidado `901104591`: es la
-    misma empresa, así que no hay nada que corregir.
+def test_el_nit_se_guarda_con_su_digito_y_sigue_cruzando(mundo, monkeypatch):
+    """El reporte trae `Nit-901104591-7` y el consolidado `901104591`: se guarda
+    el completo, que es como lo tiene la cartera.
 
-    Y escribirlo rompería el cruce: `lookup_inscrip` se indexa con el documento
-    sin dígito y se busca con el crudo, así que con `901104591-7` esa empresa
-    dejaría de encontrar su inscripción. Esta prueba nació fallando."""
+    Regla del usuario (20 de agosto de 2026): *"necesito que se guarde con el
+    dígito y busque con el dígito"*. Hasta ese día se dejaba el corto a
+    propósito, porque el índice se armaba sin dígito y buscar `901104591-7` no
+    encontraba nada. Ahora la inscripción entra al índice bajo las dos formas
+    (`_con_y_sin_digito`), así que las dos cosas se cumplen a la vez — y esta
+    prueba vale por el segundo assert: **guardarlo no puede costar el cruce**."""
     _reporte(monkeypatch, [_fila_reporte('PAGO-W', 'Nit-901104591-7',
                                           'CONTROL FINANCIERO Y TRIBUTARIO S.A.S')])
     capturado = mundo(cruzar, tablas={
@@ -465,9 +469,49 @@ def test_el_nit_no_se_reescribe_solo_por_el_digito_de_verificacion(mundo, monkey
         'cartera_inscrip': [{'numero_id': '901104591-7', 'id_inscripcion': '301PJ'}],
     })
 
-    assert _documento_escrito(capturado, 'PAGO-W') is None, (
-        'se reescribió el NIT con su dígito, y con eso deja de cruzar'
+    assert _documento_escrito(capturado, 'PAGO-W') == '901104591-7', (
+        'el documento debe quedar con su dígito de verificación, como la cartera'
     )
     assert _filas(capturado)['PAGO-W']['incp'] == '301PJ', (
-        'el NIT dejó de cruzar contra su inscripción'
+        'el NIT con dígito dejó de cruzar contra su inscripción'
     )
+
+
+def test_el_pago_sin_digito_sigue_encontrando_al_nit_de_la_cartera(mundo, monkeypatch):
+    """La otra mitad: los bancos reportan el NIT sin su dígito y la cartera lo
+    guarda con él. Ese cruce es el que arregló la normalización del 8 de julio
+    y **no se puede perder** al indexar también la forma completa."""
+    _reporte(monkeypatch, [])
+    capturado = mundo(cruzar, tablas={
+        'consolidated_transactions': [_pago('PAGO-B', identification='901104591',
+                                             metodo='BANCOLOMBIA')],
+        'cartera_inscrip': [{'numero_id': '901104591-7', 'id_inscripcion': '301PJ'}],
+    })
+
+    assert _filas(capturado)['PAGO-B']['incp'] == '301PJ'
+
+
+def test_el_nit_desempata_el_sufijo_de_la_inscripcion_del_reporte(mundo, monkeypatch):
+    """El reporte da la inscripción sin sufijo (`347`) y en la cartera hay dos:
+    `347PN` (una persona) y `347PJ` (la empresa). Con un NIT pagando, es la PJ.
+
+    Caso real del 20/08/2026 (CONSTRUIR & MAS SAS, $524.688): sin este
+    desempate el pago se iba a Excepciones como "no hay INCP asignada", aunque
+    su propio documento ya resolviera `347PJ` sin ninguna duda."""
+    _reporte(monkeypatch, [_fila_reporte('PAGO-W', 'Nit-901408499-2',
+                                          'CONSTRUIR & MAS SAS', inscripcion='347')])
+    capturado = mundo(cruzar, tablas={
+        'consolidated_transactions': [_pago('PAGO-W', identification='901408499',
+                                             metodo='WOMPI PSE')],
+        'cartera_inscrip': [
+            {'numero_id': '12618856',    'id_inscripcion': '347PN'},
+            {'numero_id': '901408499-2', 'id_inscripcion': '347PJ'},
+        ],
+    })
+
+    fila = _filas(capturado)['PAGO-W']
+    assert fila['incp'] == '347PJ'
+    assert fila['estado_cruce'] == 'cruzado', (
+        f'quedó en Excepciones por {fila["excepcion_motivo"]!r} teniendo el INCP resuelto'
+    )
+    assert fila['excepcion_motivo'] is None

@@ -4,10 +4,11 @@ cruzar.py — calcula el cruce de cartera sobre consolidated_transactions.
 
 Implementado hasta ahora (columnas 10-11 del diseño de 20 columnas):
   - INCP:      identification vs cartera_inscrip.numero_id → id_inscripcion.
-               numero_id se normaliza quitando el dígito de verificación de
-               NIT (ej. "860004922-4" -> "860004922") antes de indexar, ya
-               que identification nunca lo trae — sin esto ningún pago hecho
-               por una empresa (Persona Jurídica) cruzaba (ver _normalizar_nit).
+               El índice lleva el numero_id TAL CUAL y, si es un NIT con
+               dígito de verificación ("860004922-4"), también sin él — los
+               pagos llegan de las dos formas (el ReportePagosWompi trae el
+               NIT completo, los bancos no), y así el documento se guarda como
+               viene y encuentra su inscripción igual (ver _con_y_sin_digito).
   - CORREO(2): email vs la hoja "Ingresos PSE y PAYU" correspondiente al banco
                (BANCOLOMBIA 2576 / BANCOL 2833 / WOMPI / STRIPE_USA), primera
                coincidencia (replica BUSCARV de Excel: la primera fila que
@@ -615,25 +616,44 @@ def _documento_del_reporte(valor) -> str | None:
     return numero
 
 
-def _mismo_documento(a: str, b: str) -> bool:
-    """¿Los dos son el mismo documento, aunque se escriban distinto?
+def _es_nit(documento: str) -> bool:
+    """¿Este documento es un NIT? Se sabe por el dígito de verificación: un
+    número, un guion y un dígito al final (`901408499-2`).
 
-    Hoy la única diferencia de escritura es el dígito de verificación del NIT:
-    el reporte trae `Nit-901104591-7` y el consolidado `901104591` — la misma
-    empresa. Son 2 de los 15 pagos con documento distinto.
+    Sirve para desempatar el sufijo de la inscripción: un NIT es una empresa,
+    así que entre `347PN` (una persona) y `347PJ` (la empresa) es el PJ.
+    Regla del usuario: *"si el número tiene dígito de verificación y viene de
+    un NIT se sabe que es PJ"*."""
+    return bool(re.fullmatch(r'\d+-\d', str(documento or '').strip()))
 
-    Y NO se corrigen al del reporte aunque sea el más completo, aunque la
-    cartera guarde el NIT con su dígito: `lookup_inscrip` se indexa con el
-    documento normalizado (sin dígito) y se busca con el CRUDO, así que
-    escribir `901104591-7` haría que esa empresa dejara de cruzar contra su
-    inscripción. Lo cazó una prueba, no el razonamiento.
 
-    (Que buscar con el crudo contra un índice normalizado sea frágil es un
-    hallazgo aparte, del mismo tipo que el bug del dígito de verificación del
-    4 de agosto — pero en `cruzar.py`. Arreglarlo cambia el cruce de todos los
-    pagos y necesita su propia medición; no entra de contrabando acá.)"""
-    na, nb = _normalizar_nit(a), _normalizar_nit(b)
-    return bool(na) and na == nb
+def _con_y_sin_digito(rows: list[dict]) -> list[dict]:
+    """Cada inscripción entra al índice con su documento TAL CUAL y, si es un
+    NIT con dígito de verificación, también sin él.
+
+    La cartera guarda el NIT completo (`901408499-2`) y los pagos llegan de las
+    dos formas: el ReportePagosWompi lo trae con dígito y los bancos sin él.
+    Indexar bajo las dos es lo que permite **guardar el documento como viene y
+    encontrar la inscripción igual**.
+
+    Hasta el 20 de agosto de 2026 se indexaba solo la forma normalizada (sin
+    dígito) y se buscaba con el documento CRUDO, así que un NIT con dígito no
+    encontraba nada: **23 de los 24 pagos** con NIT completo quedaban sin INCP
+    salvo que una persona se lo escribiera a mano. Y como corregir el documento
+    a mano es justamente lo que el área hace con estos, el arreglo de un caso
+    creaba el siguiente (`901916551-7`, $721.770, corregido y sin cruzar).
+
+    El orden importa: la fila cruda va primera, así el criterio "primera
+    coincidencia gana" de `_build_lookup` no cambia para las llaves que ya
+    existían."""
+    out: list[dict] = []
+    for r in rows:
+        doc = str(r.get('numero_id') or '').strip()
+        out.append(r)
+        sin_digito = _normalizar_nit(doc)
+        if sin_digito and sin_digito != doc:
+            out.append({**r, 'numero_id': sin_digito})
+    return out
 
 
 def _cargar_lookup_wompi_reporte(sa_json: str, folder_id: str) -> tuple[dict[str, dict], bool, list[dict]]:
@@ -861,7 +881,8 @@ def _build_id_inscripcion_por_base(inscrip_rows: list[dict]) -> dict[str, set[st
 
 
 def _resolver_incp_wompi_link(inscripcion_reporte: str,
-                               id_inscripcion_por_base: dict[str, set[str]]) -> str | None:
+                               id_inscripcion_por_base: dict[str, set[str]],
+                               documento: str = '') -> str | None:
     """Fase 9.2: dado el número de "Inscripción" que trae ReportePagosWompi
     (ej. "3077", normalmente sin sufijo), busca su forma con sufijo en
     cartera_inscrip (ej. "3077PN"). Si esa base no aparece en absoluto, o
@@ -873,8 +894,23 @@ def _resolver_incp_wompi_link(inscripcion_reporte: str,
     if not base:
         return None
     candidatos = id_inscripcion_por_base.get(base)
-    if candidatos and len(candidatos) == 1:
+    if not candidatos:
+        return None
+    if len(candidatos) == 1:
         return next(iter(candidatos))
+
+    # Empate entre sufijos: si el documento del pago es un NIT, quien paga es
+    # una empresa, así que la inscripción es la PJ. Caso real del 20/08/2026
+    # (CONSTRUIR & MAS SAS, NIT 901408499-2, $524.688): el reporte trae
+    # "Inscripción 347" y en la cartera hay `347PN` —una persona— y `347PJ`
+    # —la empresa—, así que el pago se iba a Excepciones diciendo "no hay INCP
+    # asignada" aunque su documento ya resolviera `347PJ` sin ninguna duda.
+    # Regla del usuario: *"si el número tiene dígito de verificación y viene
+    # de un NIT se sabe que es PJ"*.
+    if _es_nit(documento):
+        pj = {c for c in candidatos if str(c).upper().endswith('PJ')}
+        if len(pj) == 1:
+            return next(iter(pj))
     return None
 
 
@@ -1029,18 +1065,28 @@ def main():
                                select='numero_id,id_inscripcion',
                                filtros=filtros.get('cartera_inscrip'))
     for row in inscrip_rows:
-        row['numero_id'] = _normalizar_nit(str(row.get('numero_id') or ''))
+        row['numero_id'] = str(row.get('numero_id') or '').strip()
 
     exclusiones_rows = select_all(supabase_url, srk, 'cruce_incp_exclusiones',
                                    select='identification,id_inscripcion_excluido')
     exclusiones = {(r['identification'], r['id_inscripcion_excluido']) for r in exclusiones_rows}
     if exclusiones:
         antes = len(inscrip_rows)
+        # Se compara con las dos formas del documento: la exclusión pudo
+        # guardarse con el NIT completo o sin su dígito, según con cuál venía
+        # el pago desde el que la persona la creó.
         inscrip_rows = [
             r for r in inscrip_rows
             if (r['numero_id'], str(r.get('id_inscripcion') or '').strip()) not in exclusiones
+            and (_normalizar_nit(r['numero_id']),
+                 str(r.get('id_inscripcion') or '').strip()) not in exclusiones
         ]
         log.info('%d filas de cartera_inscrip descartadas por exclusión manual.', antes - len(inscrip_rows))
+
+    # Cada inscripción entra al índice con su documento tal cual y, si es un
+    # NIT, también sin su dígito. Va DESPUÉS de las exclusiones para no tener
+    # que excluir dos veces la misma fila.
+    inscrip_rows = _con_y_sin_digito(inscrip_rows)
 
     bc2576_rows  = select_all(supabase_url, srk, 'cartera_ingresos_bancolombia_2576',
                                select='referencia_1,incp,fecha',
@@ -1244,8 +1290,7 @@ def main():
                     log.warning('ReportePagosWompi: no se pudo leer el documento '
                                 '%r del pago %s, se deja el que ya tenía (%s).',
                                 match.get('documento'), tx_id, doc_actual)
-                elif (doc_reporte and doc_reporte != doc_actual
-                        and not _mismo_documento(doc_reporte, doc_actual)):
+                elif doc_reporte and doc_reporte != doc_actual:
                     t['identification'] = doc_reporte
                     cambios['identification'] = doc_reporte
                     log.info('Documento corregido con el ReportePagosWompi: '
@@ -1503,7 +1548,8 @@ def main():
                 metodo_de_pago = WOMPI_GENERA_LINK_LABEL
                 ci             = match.get('comprobante') or None
                 program        = match.get('proyecto') or None
-                incp_link = _resolver_incp_wompi_link(match.get('inscripcion'), id_inscripcion_por_base)
+                incp_link = _resolver_incp_wompi_link(
+                    match.get('inscripcion'), id_inscripcion_por_base, identification)
                 if incp_link:
                     incp, incp_ambiguo, correo_2_ambiguo = incp_link, False, False
                     wompi_link_resuelto = True
@@ -1704,7 +1750,9 @@ def main():
                 'ci':             match.get('comprobante') or None,
                 'program':        match.get('proyecto') or None,
             }
-            incp_link = _resolver_incp_wompi_link(match.get('inscripcion'), id_inscripcion_por_base)
+            incp_link = _resolver_incp_wompi_link(
+                match.get('inscripcion'), id_inscripcion_por_base,
+                str(r.get('identification') or '').strip())
             if incp_link:
                 update['incp'] = incp_link
             actualizaciones_9_4.append(update)
