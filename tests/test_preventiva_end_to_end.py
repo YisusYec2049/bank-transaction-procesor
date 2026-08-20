@@ -1386,3 +1386,144 @@ def test_el_cruce_inverso_no_oscila_entre_corridas(mundo):
     assert primera == segunda, (
         f'el valor depende del orden de lectura: {primera!r} vs {segunda!r}'
     )
+
+
+# --------------------------------------------------------------------------
+# Las cuotas en dólares se cobran en dólares (19 de agosto)
+#
+# El Excel trae el precio en dos monedas: `valor_cuota` en PESOS y el campo
+# `moneda` con el valor en dólares ("159USD"). El pago de Stripe entra en
+# dólares, así que restarlo contra el valor en pesos daba una deuda que no
+# existe: 41 cuotas, $22.159.856, las 41 con su cuota nueva de deuda creada.
+# Los casos de abajo son reales, con sus montos.
+# --------------------------------------------------------------------------
+
+def _cuota_usd(llave, valor_usd, valor_cop, **extra):
+    return _cuota(llave, llave.split('-')[0], '1710328442', valor_cop,
+                  '2026-08-20', moneda=f'{valor_usd}USD', **extra)
+
+
+def _pago_stripe(matching_key, monto_usd, metodo='STRIPE_USA'):
+    pago = _pago_cruzado(matching_key, '1710328442', 'INSUSD', monto_usd)
+    pago['payment_method'] = metodo
+    return pago
+
+
+def _mundo_usd(valor_usd, valor_cop, pagado_usd, metodo='STRIPE_USA'):
+    return {
+        'cartera_cargas': [_carga(f'{_hoy_bogota()}T15:23:32+00:00')],
+        'cartera_preventiva': [_cuota_usd('INSUSD-A', valor_usd, valor_cop)],
+        'cruce_cartera': [_pago_stripe('PAGO-USD', pagado_usd, metodo)],
+    }
+
+
+def test_una_cuota_en_dolares_pagada_exacta_queda_en_cero(mundo):
+    """Caso de Adrián Sánchez: cuota de 159USD ($508.800) pagada con 159 USD.
+    Antes la fila decía FALTA DE PAGO por $508.641 estando pagada exacta."""
+    capturado = mundo(ccp, tablas=_mundo_usd(159, 508_800, 159))
+
+    fila = _fila_final(capturado, 'INSUSD-A')
+    assert _mismo_monto(fila.get('diferencia'), 0), (
+        'se restaron dólares contra pesos: la cuota está pagada exacta y la '
+        f'fila dice {fila.get("diferencia")}'
+    )
+    assert fila.get('notificacion') != 'FALTA DE PAGO'
+    assert not capturado.get('cartera_preventiva_lineas'), (
+        'nació una cuota nueva de deuda sobre una cuota pagada exacta: '
+        f'{capturado.get("cartera_preventiva_lineas")}'
+    )
+
+
+def test_una_cuota_en_dolares_pagada_de_mas_muestra_lo_que_sobra(mundo):
+    """Caso de Sophia Miurel, la fila que reportó el área: cuota de 199USD
+    ($696.500) pagada con 200 USD. Sobra 1 dólar, no faltan $696.300."""
+    capturado = mundo(ccp, tablas=_mundo_usd(199, 696_500, 200))
+
+    fila = _fila_final(capturado, 'INSUSD-A')
+    assert _mismo_monto(fila.get('diferencia'), 1), (
+        f'la cuota pagó 1 USD de más y la fila dice {fila.get("diferencia")}'
+    )
+
+
+def test_faltando_menos_de_15_dolares_no_nace_cuota_nueva(mundo):
+    """Caso de Nathaly Rosales: cuota de 182USD pagada con 181. Falta 1 dólar,
+    que es el ruido de redondeo de las pasarelas — no abre una cuota nueva,
+    igual que un faltante de menos de $50.000 en pesos."""
+    capturado = mundo(ccp, tablas=_mundo_usd(182, 582_400, 181))
+
+    assert not capturado.get('cartera_preventiva_lineas'), (
+        'se abrió una cuota nueva de deuda por 1 dólar: '
+        f'{capturado.get("cartera_preventiva_lineas")}'
+    )
+    fila = _fila_final(capturado, 'INSUSD-A')
+    assert _mismo_monto(fila.get('diferencia'), -1)
+
+
+def test_faltando_15_dolares_o_mas_nace_la_cuota_nueva_en_dolares(mundo):
+    """Caso de Robertson Tomás Núñez, el único de los 41 que debe de verdad:
+    cuota de 178USD ($569.600) pagada con 160. Faltan 18 dólares, y la cuota
+    nueva nace por 18 USD — no por $57.600."""
+    capturado = mundo(ccp, tablas=_mundo_usd(178, 569_600, 160))
+
+    lineas = capturado.get('cartera_preventiva_lineas', [])
+    assert len(lineas) == 1, f'debía nacer una sola cuota nueva de deuda: {lineas}'
+    assert _mismo_monto(lineas[0]['valor_cuota'], 18), (
+        f'la cuota nueva no nació por los 18 dólares que faltan: {lineas[0]}'
+    )
+    assert lineas[0]['moneda'] == '18USD', (
+        'la cuota nueva heredó la moneda de su madre, así que en la próxima '
+        f'corrida se va a cobrar por el valor viejo: {lineas[0]["moneda"]!r}'
+    )
+    fila = _fila_final(capturado, 'INSUSD-A')
+    assert fila.get('notificacion') == 'FALTA DE PAGO'
+
+
+def test_la_moneda_de_la_cuota_manda_aunque_el_pago_no_sea_de_stripe(mundo):
+    """Caso de Mónica Raquel Rojas: cuota de 174USD pagada con WOMPI CARD por
+    174. WOMPI también cobra en dólares y su archivo no lo dice por ningún
+    lado, así que mirar el medio de pago dejaría esta cuota con una deuda
+    falsa de $556.626."""
+    capturado = mundo(ccp, tablas=_mundo_usd(174, 556_800, 174, metodo='WOMPI CARD'))
+
+    fila = _fila_final(capturado, 'INSUSD-A')
+    assert _mismo_monto(fila.get('diferencia'), 0), (
+        'la cuota se cobró en pesos porque el pago no era de Stripe: '
+        f'{fila.get("diferencia")}'
+    )
+
+
+def test_una_cuota_en_pesos_se_sigue_cobrando_en_pesos(mundo):
+    """Guarda de regresión: 2.837 de las 3.112 cuotas están en pesos y no se
+    pueden ver afectadas. Pasa con y sin el cambio, a propósito."""
+    tablas = {
+        'cartera_cargas': [_carga(f'{_hoy_bogota()}T15:23:32+00:00')],
+        'cartera_preventiva': [_cuota('INSCOP-A', 'INSCOP', '1710328442',
+                                       508_800, '2026-08-20')],
+        'cruce_cartera': [_pago_cruzado('PAGO-COP', '1710328442', 'INSCOP', 508_800)],
+    }
+    capturado = mundo(ccp, tablas=tablas)
+
+    fila = _fila_final(capturado, 'INSCOP-A')
+    assert _mismo_monto(fila.get('diferencia'), 0)
+    assert not capturado.get('cartera_preventiva_lineas')
+
+
+def test_una_linea_vieja_con_la_moneda_heredada_se_sigue_cobrando_en_pesos(mundo):
+    """Las líneas de deuda nacidas antes del cambio copiaban `moneda` de su
+    madre, así que hay líneas con su valor en PESOS ($540.631) y `moneda`
+    diciendo "169USD" — el precio de la madre, no el suyo. Leerlas en dólares
+    las haría cobrar 169. Caso real: `3730PN46237 (2026-08-06)`."""
+    linea = _cuota('INSUSD-A (2026-08-06)', 'INSUSD', '1710328442',
+                   540_631, '2026-08-20', moneda='169USD')
+    tablas = {
+        'cartera_cargas': [_carga(f'{_hoy_bogota()}T15:23:32+00:00')],
+        'cartera_preventiva': [linea],
+        'cruce_cartera': [_pago_stripe('PAGO-VIEJO', 540_631)],
+    }
+    capturado = mundo(ccp, tablas=tablas)
+
+    fila = _fila_final(capturado, 'INSUSD-A (2026-08-06)')
+    assert _mismo_monto(fila.get('diferencia'), 0), (
+        'la línea se cobró como si valiera 169 dólares, cuando su valor está '
+        f'en pesos: {fila.get("diferencia")}'
+    )

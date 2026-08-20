@@ -72,6 +72,13 @@ Reglas nuevas:
   de llave, `_generar_llave_saldo`) SIN notificación y con `diferencia` vacía
   (todavía no tiene pago). La marca y la deuda viven en la original, no en la
   nueva.
+- **En DÓLARES los dos umbrales son otros** (19 de agosto): una cuota cuyo
+  campo `moneda` trae el valor en dólares ("159USD") se cobra en dólares de
+  punta a punta —`valor_cuota`/`valor_a_cobrar` están en PESOS y restarlos
+  contra un pago en dólares daba una deuda que no existe—, con la cuota nueva
+  a partir de **15 USD** y el aviso desde **1 USD**. Ver `_saldo_a_cobrar` y
+  `_valor_en_dolares`. La señal es la moneda de la cuota, no el medio de pago:
+  Stripe cobra siempre en dólares pero WOMPI también lo hace a veces.
 - **Sobra `>= $1`** (sin importar el monto, sin distinción SOBRANTE/
   EXCEDENTE): la ÚLTIMA cuota cubierta cierra con `diferencia` POSITIVA
   informativa (el saldo a favor "vive" ahí) y se crea/actualiza un registro
@@ -132,6 +139,7 @@ Requerimientos del 23 de julio (`requeriments.md`, puntos #1, #2 y #3):
 import argparse
 import logging
 import os
+import re
 import sys
 from datetime import datetime, timedelta
 
@@ -177,6 +185,23 @@ UMBRAL_LINEA_NUEVA = 50000
 # Con $50.000 se habrían perdido 9 de los 11 casos reales con plata de verdad.
 # Ver `_etiqueta_notificacion` para los dos usos que tiene este número.
 UMBRAL_NOTIFICACION = 1000
+
+# Los mismos dos umbrales para las cuotas que se cobran en DÓLARES (19 de
+# agosto). No son una conversión de los de arriba: los fijó el usuario
+# ("la cuota nueva se crea a partir de una diferencia de -15 USD", y avisar
+# desde 1 USD). A la tasa que trae el propio Excel —entre 3.200 y 3.632 COP
+# por dólar, y no es una sola— $50.000 caerían entre 13,8 y 15,6 USD, así que
+# convertir daría un número que se mueve con cada cuota.
+UMBRAL_LINEA_NUEVA_USD = 15
+UMBRAL_NOTIFICACION_USD = 1
+
+# `moneda` es texto libre del Excel. Las que se cobran en dólares traen el
+# valor adentro ("178USD", "176 USD", "158,75USD", y una con comentario:
+# "176 USD- problema documentos peru"). El resto dice "COP", viene vacío o
+# trae cualquier otra cosa ("OPCION GRADO", "FACTURA", "REFI MARZO"), y ahí
+# no hay nada que leer. Medido sobre las 3.112 cuotas del 19 de agosto: 195
+# en dólares, las 195 con número legible.
+_RE_USD = re.compile(r'(\d[\d.,]*)\s*USD', re.IGNORECASE)
 
 _NUMERO_EN_LETRA = {2: 'DOS', 3: 'TRES', 4: 'CUATRO', 5: 'CINCO', 6: 'SEIS',
                      7: 'SIETE', 8: 'OCHO', 9: 'NUEVE', 10: 'DIEZ'}
@@ -255,11 +280,90 @@ def _saldo_a_cobrar(cuota: dict) -> float:
     Como el cierre baja `valor_a_cobrar` exactamente en `pago_confirmado`,
     el saldo original se recupera sumándolo de vuelta. Sin esto, recalcular
     una cuota cerrada (ej. tras un descarte) mediría el pago contra un saldo
-    en cero y daría una `diferencia` igual al pago entero."""
+    en cero y daría una `diferencia` igual al pago entero.
+
+    EN DÓLARES (19 de agosto): si la cuota se cobra en dólares, el saldo sale
+    del campo `moneda` y no de `valor_cuota`/`valor_a_cobrar`, que están en
+    PESOS. Sin esto se restaban dólares contra pesos: un pago de 159 USD sobre
+    una cuota de 159USD ($508.800) daba `diferencia = -508.641` y la fila
+    decía FALTA DE PAGO estando pagada exacta. Medido el 19 de agosto: **41
+    cuotas, $22.159.856 de deuda que no existe**, y las 41 con su cuota nueva
+    de deuda creada — 41 de las 86 de toda la cartera. El área ya venía
+    tapándolo a mano: 31 de esas 41 las habían cerrado una por una.
+
+    La señal es la MONEDA DE LA CUOTA, no el medio de pago. Stripe cobra
+    siempre en dólares, pero no es el único: `4729PN46247` (Mónica Raquel
+    Rojas, cuota de 174USD) la pagó **WOMPI CARD** con 174, y su archivo no
+    dice la moneda por ningún lado. Mirar el medio dejaría esa cuota con su
+    deuda falsa de $556.626.
+
+    Se resta `_pago_sin_confirmar` por el mismo motivo que en pesos (el abono
+    del Excel), y en las cuotas en dólares ese abono también viene en dólares
+    (las 31 cerradas traen `pago='178'` con `valor_cuota=569.600`)."""
+    valor_usd = _valor_en_dolares(cuota)
+    if valor_usd is not None:
+        return round(valor_usd - _pago_sin_confirmar(cuota), 2)
     valor = cuota.get('valor_a_cobrar')
     if valor is None:
         valor = cuota.get('valor_cuota')
     return float(valor or 0) + float(cuota.get('pago_confirmado') or 0)
+
+
+def _valor_en_dolares(cuota: dict) -> float | None:
+    """Cuánto vale la cuota en dólares, o None si se cobra en pesos.
+
+    Devuelve None ante cualquier duda —campo vacío, "COP", texto sin número—
+    para que la cuota siga cobrándose en pesos, que es el camino de siempre.
+    El Excel escribe el decimal con coma ("158,75USD").
+
+    Las LÍNEAS DE DEUDA nacidas antes de este cambio son la excepción: copiaban
+    `moneda` de su madre tal cual, así que hay líneas con su valor en PESOS
+    ("$540.631") y `moneda` diciendo "169USD" — el precio de la madre, no el
+    suyo. Leerlas en dólares las haría cobrar 169 y reescribiría un cierre de
+    $540.631 como uno de 169. Por eso a una línea se le exige que las dos
+    cifras hablen de lo mismo; una línea nueva ya nace coherente
+    (`_moneda_para`) y las viejas se cobran en pesos como hasta ahora. Al
+    19 de agosto es 1 fila en toda la cartera, y de las que hay que borrar."""
+    m = _RE_USD.search(str(cuota.get('moneda') or ''))
+    if not m:
+        return None
+    try:
+        valor = float(m.group(1).replace('.', '').replace(',', '.')
+                      if ',' in m.group(1) else m.group(1).replace(',', ''))
+    except ValueError:
+        return None
+    if valor <= 0:
+        return None
+    es_linea = (cuota.get('llave') or '').rfind(' (') > 0
+    if es_linea and float(cuota.get('valor_cuota') or 0) > valor * 10:
+        return None
+    return valor
+
+
+def _en_dolares(cuota: dict) -> bool:
+    return _valor_en_dolares(cuota) is not None
+
+
+def _umbral_linea_nueva(cuota: dict) -> float:
+    """A partir de cuánto falta se abre una cuota nueva de deuda."""
+    return UMBRAL_LINEA_NUEVA_USD if _en_dolares(cuota) else UMBRAL_LINEA_NUEVA
+
+
+def _umbral_notificacion(cuota: dict) -> float:
+    """A partir de cuánto sobrante vale la pena avisar."""
+    return UMBRAL_NOTIFICACION_USD if _en_dolares(cuota) else UMBRAL_NOTIFICACION
+
+
+def _moneda_para(cuota: dict, valor: float) -> str | None:
+    """El `moneda` que le toca a una línea de deuda nacida de `cuota`.
+
+    En pesos se hereda tal cual (es "COP" o lo que traiga el Excel). En
+    dólares se REESCRIBE con el valor de la línea, porque ese campo no es una
+    etiqueta: es de donde `_saldo_a_cobrar` saca cuánto se cobra."""
+    if not _en_dolares(cuota):
+        return cuota.get('moneda')
+    entero = round(valor, 2)
+    return f'{int(entero)}USD' if entero == int(entero) else f'{entero}USD'
 
 
 def _es_wompi_automatico(pago: dict) -> bool:
@@ -521,7 +625,10 @@ def _fila_linea_saldo(parcial: dict, nueva_llave: str, notificacion: str | None 
         'sistema_financiero':  cuota.get('sistema_financiero'),
         'inscrip':             cuota.get('inscrip'),
         'cliente':             cuota.get('cliente'),
-        'moneda':              cuota.get('moneda'),
+        # En una cuota en dólares la línea nace en dólares, con SU propio
+        # valor: si heredara el de la madre ("178USD") diría que debe 178
+        # cuando debe 18, y `_saldo_a_cobrar` la leería mal en cada corrida.
+        'moneda':              _moneda_para(cuota, saldo),
         'fecha_vencimiento':   cuota.get('fecha_vencimiento'),
         'programa':            cuota.get('programa'),
         'cruce_access':        cuota.get('cruce_access'),
@@ -614,7 +721,7 @@ def _sincronizar_lineas_falta_de_pago(
         falta = round(-float(diferencia), 2) if diferencia is not None and float(diferencia) < 0 else 0.0
         existentes = sorted(lineas_por_original.get(base, []), key=lambda c: c['id'])
 
-        if falta >= UMBRAL_LINEA_NUEVA and existentes:
+        if falta >= _umbral_linea_nueva(original) and existentes:
             # Ya hay línea: se ajusta esa y no se crea ninguna otra.
             viva = existentes[0]
             # La línea también sigue la FECHA de su madre (11 de agosto): si
@@ -625,6 +732,11 @@ def _sincronizar_lineas_falta_de_pago(
             # fechas distintas en pantalla y en las descargas.
             venc = _campo(original, 'fecha_vencimiento') or viva.get('fecha_vencimiento')
             cambia_valor = round(float(viva.get('valor_a_cobrar') or 0), 2) != falta
+            # En dólares el valor de la línea vive en `moneda` (ver
+            # `_moneda_para`), así que ese campo se mueve junto con el valor —
+            # si no, la línea bajaría en pantalla y `_saldo_a_cobrar` seguiría
+            # cobrando el número viejo.
+            moneda = _moneda_para(original, falta) if cambia_valor else viva.get('moneda')
             if cambia_valor or viva.get('fecha_vencimiento') != venc:
                 # Las claves van SIEMPRE las mismas: un array con dicts de
                 # distinto set de claves lo rechaza PostgREST (PGRST102, ver
@@ -635,9 +747,11 @@ def _sincronizar_lineas_falta_de_pago(
                     'valor_cuota':      falta if cambia_valor else round(float(viva.get('valor_cuota') or 0), 2),
                     'valor_a_cobrar':   falta if cambia_valor else round(float(viva.get('valor_a_cobrar') or 0), 2),
                     'fecha_vencimiento': venc,
+                    'moneda':           moneda,
                 })
                 if cambia_valor:
                     viva['valor_cuota'] = viva['valor_a_cobrar'] = falta
+                    viva['moneda'] = moneda
                 viva['fecha_vencimiento'] = venc
             sobrantes = existentes[1:]
         else:
@@ -675,7 +789,7 @@ def _cerrar_o_faltante(info: dict, hoy: str,
     s = round(_saldo_a_cobrar(cuota) - monto, 2)
     if s <= 0:
         return _fila_cierre(info, hoy), None
-    if s >= UMBRAL_LINEA_NUEVA:
+    if s >= _umbral_linea_nueva(cuota):
         # El faltante (>= $50.000) genera una cuota NUEVA por la deuda, pero la
         # marca 'FALTA DE PAGO' y el monto que quedó a deber viven en la cuota
         # ORIGINAL —la que no se pagó completa—, que es a la que le faltó el
@@ -742,7 +856,8 @@ def _procesar_inscripcion(cuotas_inscripcion: list[dict], pagos_para: list[dict]
 
 
 def _etiqueta_notificacion(valor_cuota: float, sobrante: float,
-                            cuotas_cubiertas: int = 1) -> str | None:
+                            cuotas_cubiertas: int = 1,
+                            umbral: float = UMBRAL_NOTIFICACION) -> str | None:
     """Texto de la columna `notificacion` para un pago que dejó plata sin
     repartir (23 de julio, punto #2). Describe CUÁNTO pagó la persona medido
     en cuotas, no cuántas cuotas alcanzó a cerrar el sistema: la cartera
@@ -769,12 +884,12 @@ def _etiqueta_notificacion(valor_cuota: float, sobrante: float,
     seis. Sale la misma cuenta por los dos caminos — si después se le descarta
     el pago a una de las dos, esa cuota deja de contarse pero su plata vuelve
     al saldo disponible y reaparece como cuota entera."""
-    if valor_cuota <= 0 or sobrante < UMBRAL_NOTIFICACION:
+    if valor_cuota <= 0 or sobrante < umbral:
         return None
-    enteras = int((sobrante + UMBRAL_NOTIFICACION) // valor_cuota)
+    enteras = int((sobrante + umbral) // valor_cuota)
     resto   = sobrante - enteras * valor_cuota
     total   = max(int(cuotas_cubiertas), 1) + enteras
-    if resto >= UMBRAL_NOTIFICACION:
+    if resto >= umbral:
         return f'{total} CUOTA{"S" if total > 1 else ""} + ABONO'
     return f'PAGA {_NUMERO_EN_LETRA.get(total, str(total))} CUOTAS'
 
@@ -1761,8 +1876,9 @@ def main():
                   len(sync_lineas))
     if lineas_a_borrar:
         delete_by_keys(supabase_url, srk, 'cartera_preventiva', 'llave', lineas_a_borrar)
-        log.info('Líneas de deuda eliminadas (el faltante bajó de %s): %d.',
-                  UMBRAL_LINEA_NUEVA, len(lineas_a_borrar))
+        log.info('Líneas de deuda eliminadas (el faltante bajó del umbral, '
+                  '%s en pesos / %s USD): %d.',
+                  UMBRAL_LINEA_NUEVA, UMBRAL_LINEA_NUEVA_USD, len(lineas_a_borrar))
     if lineas_nuevas:
         insert_cartera_preventiva_lineas(
             supabase_url, srk,
@@ -2023,7 +2139,8 @@ def main():
         if not cubiertas:
             continue
         etiqueta = _etiqueta_notificacion(_saldo_a_cobrar(cuota_destino),
-                                           disponible, cubiertas)
+                                           disponible, cubiertas,
+                                           _umbral_notificacion(cuota_destino))
         if etiqueta:
             etiqueta_por_llave[destino] = etiqueta
 
