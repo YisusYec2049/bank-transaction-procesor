@@ -400,6 +400,41 @@ def _email_a_guardar(t: dict):
     return t.get('email_consolidado', t.get('email'))
 
 
+def _buscar_correo_2(t: dict, email: str, lookup: dict, ambiguos: set,
+                      historial: dict) -> tuple[str, bool, dict]:
+    """CORREO(2) en Bancolombia, probando las DOS referencias del pago.
+
+    En Bancolombia el campo del correo es copia de la REFERENCIA 1 del extracto,
+    y con él se busca el INCP en la hoja de ingresos. Cuando alguien corrige el
+    documento, `_aplicar_correcciones_documento` pisa ese campo con el número
+    nuevo — a propósito, porque si no, corregir el documento no arreglaría nada.
+
+    Pero la hoja conoce la REFERENCIA que reportó el banco, no el documento
+    real: corregir un pago a su NIT lo saca de esa hoja y **apaga un cruce que
+    funcionaba**. Caso real del 20/08/2026: `74500012486` está tres veces en la
+    hoja, las tres apuntando a `330PJ`; corregido a `901916551-7` —que no está—
+    el CORREO(2) quedó vacío. Medido: **33 pagos, $32.526.819**, con 25 que
+    perdieron su CORREO(2). Ninguno perdió el cruce entero porque el INCP los
+    rescató, y ese es justo el accidente que esto deja de necesitar.
+
+    Se prueba primero el número corregido (manda la persona) y solo si la hoja
+    no sabe nada de él se cae al que traía el extracto, así que esto **solo
+    puede agregar** cruces: lo que hoy resuelve, sigue resolviendo igual.
+
+    Una ambigüedad del número corregido NO se esquiva cayendo al otro: es una
+    señal de que hace falta una persona, no un fallo de búsqueda."""
+    valor = lookup.get(email, '')
+    if valor or email in ambiguos:
+        return valor, email in ambiguos, historial.get(email, {})
+
+    original = str(t.get('email_consolidado') or '').strip()
+    if original and original != email:
+        valor_original = lookup.get(original, '')
+        if valor_original or original in ambiguos:
+            return valor_original, original in ambiguos, historial.get(original, {})
+    return '', False, {}
+
+
 def _es_valor_relleno(valor: str) -> bool:
     """True si el valor es basura de captura del Excel de referencia, no un
     cruce real: un punto solo (".") o un sufijo (PN/PJ) sin ningún dígito
@@ -1476,17 +1511,15 @@ def main():
         stripe_pendiente_incp    = False
         stripe_confirmado_nombre = False
         if payment_method == 'BANCOLOMBIA':
-            correo_2           = lookup_bc2576.get(email, '')
-            correo_2_ambiguo   = email in ambiguos_bc2576
-            correo_2_historial = historial_bc2576.get(email, {})
+            correo_2, correo_2_ambiguo, correo_2_historial = _buscar_correo_2(
+                t, email, lookup_bc2576, ambiguos_bc2576, historial_bc2576)
         elif payment_method == 'PREBANCOLOMBIA':
             # Bancolombia 2833. Misma llave que 2576 (email, que en Bancolombia
             # es copia del documento, contra la REFERENCIA 1 de la hoja) y sin
             # bajar el nivel: si CORREO(2) resuelve solo, la fila queda
             # 'cruce_unico' para que una persona confirme, igual que en 2576.
-            correo_2           = lookup_bc2833.get(email, '')
-            correo_2_ambiguo   = email in ambiguos_bc2833
-            correo_2_historial = historial_bc2833.get(email, {})
+            correo_2, correo_2_ambiguo, correo_2_historial = _buscar_correo_2(
+                t, email, lookup_bc2833, ambiguos_bc2833, historial_bc2833)
         elif payment_method.startswith('WOMPI'):
             correo_2           = lookup_wompi.get(email_lower, '')
             correo_2_ambiguo   = email_lower in ambiguos_wompi

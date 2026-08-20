@@ -515,3 +515,57 @@ def test_el_nit_desempata_el_sufijo_de_la_inscripcion_del_reporte(mundo, monkeyp
         f'quedó en Excepciones por {fila["excepcion_motivo"]!r} teniendo el INCP resuelto'
     )
     assert fila['excepcion_motivo'] is None
+
+
+def test_correo_2_cae_a_la_referencia_del_extracto_cuando_la_hoja_no_sabe_del_documento(mundo):
+    """Corregir el documento no puede apagar el CORREO(2) que ya funcionaba.
+
+    En Bancolombia el correo es copia de la REFERENCIA 1 del extracto, y al
+    corregir el documento el pipeline pisa ese campo con el número nuevo para
+    poder buscar con él. Pero la hoja de ingresos conoce la REFERENCIA que
+    reportó el banco, no el documento real.
+
+    Caso real del 20/08/2026 (ORTEGON PROYECTOS, $721.770): `74500012486` está
+    en la hoja apuntando a `330PJ`, y corregido a su NIT `901916551-7` —que la
+    hoja no tiene— el CORREO(2) quedó vacío. Acá la cartera NO tiene el NIT, así
+    que el INCP no puede rescatarlo: lo que se prueba es el correo solo."""
+    capturado = mundo(cruzar, tablas={
+        'consolidated_transactions': [_pago('PAGO-1', identification='74500012486',
+                                             email='74500012486')],
+        'cartera_inscrip': [],
+        'cartera_ingresos_bancolombia_2576': [
+            {'referencia_1': '74500012486', 'incp': '330PJ', 'fecha': '2026-05-30'},
+        ],
+        'documento_correcciones': [
+            {'documento_original': '74500012486', 'documento_corregido': '901916551-7',
+             'matching_key_original': 'PAGO-1',
+             'created_at': '2026-08-20T14:53:50', 'updated_at': '2026-08-20T14:53:50'},
+        ],
+    })
+
+    fila = _filas(capturado)['PAGO-1']
+    assert fila['identification'] == '901916551-7', 'el documento corregido manda'
+    assert fila['correo_2'] == '330PJ', (
+        'corregir el documento apagó el CORREO(2) que la hoja sí sabía resolver'
+    )
+
+
+def test_el_documento_corregido_manda_sobre_la_referencia_vieja(mundo):
+    """La caída a la referencia del extracto es un último recurso, no un empate:
+    si la hoja sabe del número corregido, ese es el que vale."""
+    capturado = mundo(cruzar, tablas={
+        'consolidated_transactions': [_pago('PAGO-1', identification='11111111',
+                                             email='11111111')],
+        'cartera_inscrip': [],
+        'cartera_ingresos_bancolombia_2576': [
+            {'referencia_1': '11111111', 'incp': '111PN', 'fecha': '2026-05-30'},
+            {'referencia_1': '22222222', 'incp': '222PN', 'fecha': '2026-05-30'},
+        ],
+        'documento_correcciones': [
+            {'documento_original': '11111111', 'documento_corregido': '22222222',
+             'matching_key_original': 'PAGO-1',
+             'created_at': '2026-08-20T14:53:50', 'updated_at': '2026-08-20T14:53:50'},
+        ],
+    })
+
+    assert _filas(capturado)['PAGO-1']['correo_2'] == '222PN'
