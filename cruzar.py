@@ -213,6 +213,8 @@ import unicodedata
 from datetime import date
 from datetime import datetime as dt
 
+import pytz
+import requests
 from dotenv import load_dotenv
 
 from utils import dry_run
@@ -223,6 +225,7 @@ from utils.parser import normalizar_nit as _normalizar_nit
 from utils.parser import normalizar_sufijo as _normalizar_sufijo
 from utils.supabase import (
     delete_by_keys,
+    insert_rows,
     select_all,
     update_consolidated_campos,
     update_cruce_valores,
@@ -295,10 +298,29 @@ def _es_pago_compartido(valor: str) -> bool:
     return len(_inscripciones_en_valor(valor)) >= 2
 
 
-def _cargar_correcciones_documento(supabase_url: str, srk: str) -> dict[str, str]:
-    """Mapa matching_key -> documento_corregido, con la ÚLTIMA corrección de
-    cada pago (tabla que llena financial-platform cuando alguien edita un
-    documento a mano).
+# Con qué se firma en `documento_correcciones` lo que corrigió el pipeline al
+# leer el ReportePagosWompi. Una fila sin firma es de una persona — así quedan
+# las que ya existían y las que escribe financial-platform.
+ORIGEN_REPORTE_WOMPI = 'reporte_wompi'
+
+
+def _cargar_correcciones_documento(supabase_url: str, srk: str):
+    """Devuelve dos cosas de `documento_correcciones`:
+
+    1. **La memoria**: mapa matching_key -> (documento_corregido, el anterior)
+       con la ÚLTIMA corrección **hecha por una persona** en cada pago.
+    2. **El rastro ya anotado por el pipeline**: pares (pago, documento) que él
+       mismo escribió al aplicar el ReportePagosWompi, para no repetir la misma
+       anotación en cada corrida. Vale `None` cuando la columna `origen` no
+       existe todavía en la base: ahí no se puede distinguir quién escribió
+       cada fila, así que no se anota nada.
+
+    ⚠️ **Lo que anota el pipeline NO es memoria** (21 de agosto). Si sus
+    propias filas entraran al mapa, el bloque del reporte las leería como "acá
+    ya decidió una persona" y se quedaría callado para siempre — y con él se
+    perdería el reintento que hoy arregla solo un consolidado que quedó viejo.
+    Justamente así se descubrió el bug de la función de base: el reporte
+    reintentaba la corrección en cada corrida porque nadie la había anotado.
 
     **Una corrección vale solo para el pago en el que se hizo** (5 de agosto).
     Antes la memoria era por número de documento y se aplicaba a todos los
@@ -320,20 +342,39 @@ def _cargar_correcciones_documento(supabase_url: str, srk: str) -> dict[str, str
     el suyo) y **manda la más reciente** (corregir dos veces deja el último
     número que escribió la persona, no el primero).
     """
-    rows = select_all(supabase_url, srk, 'documento_correcciones',
-                       select='documento_original,documento_corregido,'
-                              'matching_key_original,created_at,updated_at')
+    columnas = ('documento_original,documento_corregido,matching_key_original,'
+                'created_at,updated_at')
+    # `origen` se pide con red, por la misma razón que `pago_manual` o
+    # `aplicacion_cerrada_at`: pedir una columna que todavía no existe tumba la
+    # corrida entera, y el SQL y el despliegue son independientes a propósito
+    # (lección del 24 de julio). Sin la columna se sigue trabajando igual que
+    # antes; lo único que no pasa es dejar el rastro.
+    try:
+        rows = select_all(supabase_url, srk, 'documento_correcciones',
+                           select=columnas + ',origen')
+        hay_origen = True
+    except requests.HTTPError:
+        log.warning('documento_correcciones.origen no existe todavía: la corrección que '
+                     'hace el ReportePagosWompi no va a dejar rastro. Correr el ALTER TABLE.')
+        rows = select_all(supabase_url, srk, 'documento_correcciones', select=columnas)
+        hay_origen = False
+
     ultima: dict[str, tuple[str, str, str]] = {}
+    registradas: set[tuple[str, str]] = set()
     for r in rows:
         pago = str(r.get('matching_key_original') or '').strip()
         nuevo = str(r.get('documento_corregido') or '').strip()
         if not pago or not nuevo:
             continue
+        if hay_origen and str(r.get('origen') or '').strip() == ORIGEN_REPORTE_WOMPI:
+            registradas.add((pago, nuevo))
+            continue
         cuando = str(r.get('updated_at') or r.get('created_at') or '')
         anterior = ultima.get(pago)
         if anterior is None or cuando >= anterior[0]:
             ultima[pago] = (cuando, nuevo, str(r.get('documento_original') or '').strip())
-    return {pago: (nuevo, viejo) for pago, (_, nuevo, viejo) in ultima.items()}
+    memoria = {pago: (nuevo, viejo) for pago, (_, nuevo, viejo) in ultima.items()}
+    return memoria, (registradas if hay_origen else None)
 
 
 def _aplicar_correcciones_documento(transacciones: list[dict],
@@ -1221,7 +1262,7 @@ def main():
         log.info('Modo puntual sobre un pago que no es WOMPI: se omite el reporte.')
         lookup_wompi_reporte, wompi_reporte_disponible, reportes_wompi = {}, False, []
 
-    correcciones_documento = _cargar_correcciones_documento(supabase_url, srk)
+    correcciones_documento, rastro_reporte = _cargar_correcciones_documento(supabase_url, srk)
     log.info('%d corrección(es) de documento cargadas.', len(correcciones_documento))
 
     log.info('Cargando estado_cruce existente...')
@@ -1271,6 +1312,8 @@ def main():
     # cuál es hasta que el pago cruce contra su inscripción.
     if wompi_reporte_disponible:
         actualizaciones = []
+        correcciones_nuevas: list[dict] = []
+        hoy_bogota = dt.now(pytz.timezone('America/Bogota')).strftime('%Y-%m-%d')
         for t in transacciones:
             if not str(t.get('payment_method') or '').upper().startswith('WOMPI'):
                 continue
@@ -1332,6 +1375,23 @@ def main():
                               '%s -> %s (pago %s, %s).',
                               doc_actual or '(vacío)', doc_reporte, tx_id,
                               match.get('pagador') or '')
+                    # Y queda el rastro, igual que cuando corrige una persona
+                    # (21 de agosto). Sin esto el número viejo desaparece del
+                    # sistema: quien busque el documento de QUIEN PAGÓ —que es
+                    # el que quedó en el comprobante— no encuentra nada, en
+                    # ninguna de las tres pantallas, y no hay forma de saber
+                    # que hubo una corrección. De paso, `document-history` le
+                    # muestra a la persona "este número ya se corrigió antes".
+                    if rastro_reporte is not None and (tx_id, doc_reporte) not in rastro_reporte:
+                        rastro_reporte.add((tx_id, doc_reporte))
+                        correcciones_nuevas.append({
+                            'documento_original':    doc_actual,
+                            'documento_corregido':   doc_reporte,
+                            'matching_key_original': tx_id,
+                            'matching_key_nuevo':    tx_id,
+                            'fecha_correccion':      hoy_bogota,
+                            'origen':                ORIGEN_REPORTE_WOMPI,
+                        })
 
             if cambios:
                 actualizaciones.append({'matching_key': t['matching_key'], **cambios})
@@ -1339,6 +1399,11 @@ def main():
             update_consolidated_campos(supabase_url, srk, actualizaciones)
             log.info('Consolidado: %d pago(s) WOMPI actualizados '
                       '(método/programa/documento).', len(actualizaciones))
+        if correcciones_nuevas:
+            # Va DESPUÉS de escribir el consolidado a propósito: el rastro dice
+            # "esto ya se corrigió", así que anotarlo antes y que la escritura
+            # fallara dejaría el pago con el documento viejo y sin reintento.
+            insert_rows(supabase_url, srk, 'documento_correcciones', correcciones_nuevas)
 
     # Una fila terminal se salta, SALVO que el documento con el que se cruzó ya
     # no sea el documento que tiene hoy: eso significa que alguien lo corrigió

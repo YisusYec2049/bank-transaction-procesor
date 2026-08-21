@@ -171,6 +171,13 @@ def mundo(monkeypatch):
                 return len(llaves)
             monkeypatch.setattr(modulo, 'marcar_aplicacion_cerrada', _sellar)
 
+        # insert_rows lleva la tabla en el medio, así que se captura por tabla:
+        # lo usan el rastro de correcciones de documento y el archivado del swap.
+        if hasattr(modulo, 'insert_rows'):
+            def _insertar(_url, _srk, tabla, filas, **_kw):
+                capturado.setdefault(tabla, []).extend(filas)
+            monkeypatch.setattr(modulo, 'insert_rows', _insertar)
+
         # delete_by_keys tiene la llave en otra posición (tabla, columna, valores).
         if hasattr(modulo, 'delete_by_keys'):
             def _borrar(_url, _srk, tabla, _col, valores, **_kw):
@@ -233,6 +240,10 @@ def mundo_filtrable(monkeypatch):
                                 ('update_consolidated_campos', 'consolidated_update')]:
             monkeypatch.setattr(modulo, nombre, _capturar(destino))
         monkeypatch.setattr(modulo, 'delete_by_keys', lambda *a, **k: None)
+
+        def _insertar(_url, _srk, tabla, filas, **_kw):
+            capturado.setdefault(tabla, []).extend(filas)
+        monkeypatch.setattr(modulo, 'insert_rows', _insertar)
 
         modulo.main()
         capturado['_lecturas'] = lecturas

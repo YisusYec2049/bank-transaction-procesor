@@ -374,6 +374,62 @@ def test_el_documento_del_reporte_corrige_el_que_tecleo_quien_pago(mundo, monkey
     )
 
 
+def test_la_correccion_del_reporte_deja_rastro(mundo, monkeypatch):
+    """Caso del 21 de agosto (doc 1016008792, John Fredy pagando por Jenyffer):
+    el reporte cambia el documento y el número de QUIEN PAGÓ —el que quedó en su
+    comprobante— desaparece del sistema. Buscándolo no sale nada en ninguna de
+    las tres pantallas, y nada dice que hubo una corrección.
+
+    Con el rastro, ese número sigue siendo rastreable y la pantalla muestra
+    "este número ya se corrigió antes", igual que con las correcciones a mano.
+    """
+    _reporte(monkeypatch, [_fila_reporte('PAGO-W', 'CC-1030581686', 'Jenyffer Rodriguez')])
+    capturado = mundo(cruzar, tablas={
+        'consolidated_transactions': [_pago('PAGO-W', identification='1016008792',
+                                             metodo='WOMPI NEQUI')],
+        'cartera_inscrip': [{'numero_id': '1030581686', 'id_inscripcion': '3852PN'}],
+    })
+
+    rastro = capturado.get('documento_correcciones', [])
+    assert len(rastro) == 1, f'no quedó rastro de la corrección: {rastro}'
+    assert rastro[0]['documento_original'] == '1016008792'
+    assert rastro[0]['documento_corregido'] == '1030581686'
+    assert rastro[0]['matching_key_original'] == 'PAGO-W'
+    assert rastro[0]['origen'] == cruzar.ORIGEN_REPORTE_WOMPI, (
+        'sin la firma, la corrida siguiente la lee como si la hubiera hecho una '
+        'persona y el reporte se queda callado para siempre'
+    )
+
+
+def test_el_rastro_del_pipeline_no_es_memoria_ni_se_repite(mundo, monkeypatch):
+    """El rastro dice "esto ya lo corregí yo", no "acá decidió una persona".
+
+    Si entrara a la memoria, el bloque del reporte se saltaría ese pago y se
+    perdería el reintento que arregla solo un consolidado que quedó viejo — que
+    es justo lo que destapó el bug de la función de base el 21 de agosto: el
+    reporte reintentaba en cada corrida porque nadie lo había anotado.
+    """
+    _reporte(monkeypatch, [_fila_reporte('PAGO-W', 'CC-1030581686')])
+    capturado = mundo(cruzar, tablas={
+        # El consolidado quedó con el documento viejo (la escritura falló).
+        'consolidated_transactions': [_pago('PAGO-W', identification='1016008792',
+                                             metodo='WOMPI NEQUI')],
+        'documento_correcciones': [
+            {'id': 1, 'documento_original': '1016008792',
+             'documento_corregido': '1030581686', 'matching_key_original': 'PAGO-W',
+             'origen': cruzar.ORIGEN_REPORTE_WOMPI}],
+        'cartera_inscrip': [{'numero_id': '1030581686', 'id_inscripcion': '3852PN'}],
+    })
+
+    assert _documento_escrito(capturado, 'PAGO-W') == '1030581686', (
+        'el rastro se leyó como una corrección a mano y el pago se quedó con el '
+        'documento viejo, sin nadie que lo reintente'
+    )
+    assert capturado.get('documento_correcciones', []) == [], (
+        'se anotó dos veces la misma corrección'
+    )
+
+
 def test_si_el_documento_ya_coincide_no_se_escribe_nada(mundo, monkeypatch):
     """771 de los 835 pagos del Histórico traen el mismo documento en los dos
     lados. Sobre esos no se toca la base."""
