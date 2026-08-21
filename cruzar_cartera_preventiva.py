@@ -673,7 +673,18 @@ def _aplicar_pagos_inscripcion(cuotas_abiertas: list[dict], pagos_nuevos: list[d
     nacen acá todavía no tienen id — la llave la tienen desde que nacen y es
     única en la cartera."""
     cuotas_ordenadas = sorted(cuotas_abiertas, key=lambda c: c.get('fecha_vencimiento') or _FECHA_MAX)
-    pagos_ordenados = sorted(pagos_nuevos, key=lambda p: p.get('payment_date') or _FECHA_MAX)
+    # El desempate por `matching_key` no es cosmético desde que el reparto va
+    # por pago (21 de agosto): con dos pagos del MISMO día, el que el sistema
+    # lea primero se queda en la cuota madre y el otro se va a la línea de
+    # deuda. Sin un orden fijo eso lo decide el orden en que la base devolvió
+    # las filas, así que dos corridas del mismo caso podrían intercambiar los
+    # montos entre los dos renglones —la línea se llama igual, porque lleva la
+    # fecha— y la fila parecería cambiar sola. Cuál de los dos queda arriba es
+    # indiferente (decisión del usuario: "el que el sistema lea primero"); lo
+    # que no puede es variar.
+    pagos_ordenados = sorted(
+        pagos_nuevos,
+        key=lambda p: (p.get('payment_date') or _FECHA_MAX, p.get('matching_key') or ''))
 
     acumulado: dict = {}
     ultimo_pago_por_cuota: dict = {}

@@ -1725,3 +1725,26 @@ def test_un_faltante_de_redondeo_no_detiene_el_reparto(mundo):
     assert not capturado.get('cartera_preventiva_lineas'), (
         'nació una cuota de deuda por un faltante de redondeo'
     )
+
+
+def test_el_reparto_de_dos_pagos_del_mismo_dia_no_depende_del_orden_de_lectura(mundo):
+    """Con dos pagos del mismo día, el que el sistema lea primero se queda en la
+    cuota madre y el otro se va a la línea de deuda. Da igual cuál sea —lo
+    decidió el usuario— pero no puede cambiar entre corridas: la línea se llama
+    igual (lleva la fecha), así que los montos se intercambiarían entre los dos
+    renglones y la fila parecería moverse sola."""
+    def _correr(al_reves):
+        pagos = [
+            _pago_cruzado('PAGO-A', '1002003087', 'INS87', 360_000, fecha='2026-08-20'),
+            _pago_cruzado('PAGO-B', '1002003087', 'INS87', 173_600, fecha='2026-08-20'),
+        ]
+        capturado = mundo(ccp, tablas={
+            'cartera_cargas': [_carga(f'{_hoy_bogota()}T15:23:32+00:00')],
+            'cartera_preventiva': [_cuota('INS87-A', 'INS87', '1002003087', 533_600, '2026-07-10')],
+            'cruce_cartera': pagos[::-1] if al_reves else pagos,
+        })
+        return {a['llave']: a['matching_key'] for a in capturado.get('pago_asociaciones', [])}
+
+    assert _correr(False) == _correr(True), (
+        'el reparto cambió según cómo vinieran leídos los pagos'
+    )
