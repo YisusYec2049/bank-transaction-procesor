@@ -1527,3 +1527,201 @@ def test_una_linea_vieja_con_la_moneda_heredada_se_sigue_cobrando_en_pesos(mundo
         'la línea se cobró como si valiera 169 dólares, cuando su valor está '
         f'en pesos: {fila.get("diferencia")}'
     )
+
+
+# ── El reparto es POR PAGO, no por cuota (21 de agosto) ────────────────────
+#
+# Regla del usuario, a partir del doc 27602604 (Mary Luz Monsalve): dos pagos
+# de la misma corrida sobre la misma cuota se sumaban en UN renglón que
+# mostraba el total y un solo código de transacción, así que el otro pago no
+# aparecía por ningún lado. Ahora el primero cubre lo que alcanza, la cuota de
+# deuda nace ahí mismo, y el segundo entra en ELLA.
+
+def _linea_creada(capturado, llave):
+    """Las cuotas de deuda se escriben por LLAVE (todavía no tienen id)."""
+    for f in capturado.get('cartera_preventiva_lineas', []):
+        if f.get('llave') == llave:
+            return f
+    return {}
+
+
+def test_dos_pagos_del_mismo_dia_no_se_suman_en_un_solo_renglon(mundo):
+    """Caso real 2858PN46213: $360.000 + $173.600 sobre una cuota de $533.600.
+
+    Cada pago tiene que quedar amarrado a su propio renglón, con su código de
+    transacción a la vista."""
+    capturado = mundo(ccp, tablas={
+        'cartera_cargas': [_carga(f'{_hoy_bogota()}T15:23:32+00:00')],
+        'cartera_preventiva': [_cuota('INS80-A', 'INS80', '27602604', 533_600, '2026-07-10')],
+        'cruce_cartera': [
+            _pago_cruzado('PAGO-CARD', '27602604', 'INS80', 360_000, fecha='2026-08-20'),
+            _pago_cruzado('PAGO-PSE', '27602604', 'INS80', 173_600, fecha='2026-08-20'),
+        ],
+    })
+
+    madre = _fila_final(capturado, 'INS80-A')
+    assert _mismo_monto(madre.get('valor_pago'), 360_000), (
+        'la cuota madre volvió a mostrar la suma de los dos pagos '
+        f'({madre.get("valor_pago")}): el segundo pago queda invisible'
+    )
+    assert madre.get('notificacion') == 'FALTA DE PAGO'
+
+    linea = _linea_creada(capturado, 'INS80-A (2026-08-20)')
+    assert linea, 'no nació la cuota de deuda por lo que faltó'
+    assert _mismo_monto(linea.get('valor_cuota'), 173_600)
+    assert _mismo_monto(linea.get('valor_pago'), 173_600), (
+        'la cuota de deuda nació vacía: el segundo pago no entró en ella'
+    )
+    assert _mismo_monto(linea.get('diferencia'), 0)
+    assert linea.get('fecha_cruce'), 'la línea no quedó marcada como tocada por el pipeline'
+
+    # La plata sigue cuadrando: lo que entró es lo que se aplicó.
+    asociado = sum(float(a['monto']) for a in capturado.get('pago_asociaciones', []))
+    assert asociado == 533_600
+    por_llave = {a['llave']: a['matching_key'] for a in capturado.get('pago_asociaciones', [])}
+    assert por_llave.get('INS80-A') == 'PAGO-CARD'
+    assert por_llave.get('INS80-A (2026-08-20)') == 'PAGO-PSE'
+
+
+def test_si_el_segundo_pago_tampoco_alcanza_nace_una_tercera_linea(mundo):
+    """Decisión del usuario: la cascada de deuda es recursiva."""
+    capturado = mundo(ccp, tablas={
+        'cartera_cargas': [_carga(f'{_hoy_bogota()}T15:23:32+00:00')],
+        'cartera_preventiva': [_cuota('INS81-A', 'INS81', '1002003081', 900_000, '2026-07-10')],
+        'cruce_cartera': [
+            _pago_cruzado('PAGO-1', '1002003081', 'INS81', 400_000, fecha='2026-08-18'),
+            _pago_cruzado('PAGO-2', '1002003081', 'INS81', 300_000, fecha='2026-08-19'),
+        ],
+    })
+
+    primera = _linea_creada(capturado, 'INS81-A (2026-08-18)')
+    assert _mismo_monto(primera.get('valor_cuota'), 500_000), 'la primera línea no nació por el faltante'
+    assert _mismo_monto(primera.get('valor_pago'), 300_000), 'el segundo pago no entró en la línea'
+
+    segunda = _linea_creada(capturado, 'INS81-A (2026-08-18) (2026-08-19)')
+    assert segunda, 'no nació la tercera línea por lo que siguió faltando'
+    assert _mismo_monto(segunda.get('valor_cuota'), 200_000)
+    assert segunda.get('valor_pago') in (None, 0), 'la tercera línea no debería tener plata'
+
+
+def test_un_pago_que_deja_la_cuota_corta_por_poco_no_admite_el_siguiente(mundo):
+    """Punto 1 de la regla: si el faltante no llega al umbral no nace cuota
+    nueva, y entonces el pago siguiente NO se le suma a la madre — queda para
+    que una persona lo asocie."""
+    capturado = mundo(ccp, tablas={
+        'cartera_cargas': [_carga(f'{_hoy_bogota()}T15:23:32+00:00')],
+        'cartera_preventiva': [_cuota('INS82-A', 'INS82', '1002003082', 533_600, '2026-07-10')],
+        'cruce_cartera': [
+            _pago_cruzado('PAGO-1', '1002003082', 'INS82', 500_000, fecha='2026-08-18'),
+            _pago_cruzado('PAGO-2', '1002003082', 'INS82', 33_600, fecha='2026-08-19'),
+        ],
+    })
+
+    aplicados = {a['matching_key'] for a in capturado.get('pago_asociaciones', [])}
+    assert aplicados == {'PAGO-1'}, (
+        'el segundo pago se aplicó solo sobre la cuota madre'
+    )
+    assert not capturado.get('cartera_preventiva_lineas'), (
+        'nació una cuota de deuda por un faltante que no llega al umbral'
+    )
+    assert not capturado.get('cartera_saldos_favor'), (
+        'el pago que quedó esperando se registró como saldo a favor: parecería '
+        'que ya se repartió'
+    )
+    fila = _fila_final(capturado, 'INS82-A')
+    assert _mismo_monto(fila.get('diferencia'), -33_600), 'la cuota no muestra su deuda'
+
+
+def test_la_cuota_corta_avisa_que_tiene_un_pago_esperando(mundo):
+    """Punto 6: si la plata no entra sola, la cuota tiene que decirlo o nadie
+    la gestiona."""
+    capturado = mundo(ccp, tablas={
+        'cartera_cargas': [_carga(f'{_hoy_bogota()}T15:23:32+00:00')],
+        'cartera_preventiva': [_cuota('INS83-A', 'INS83', '1002003083', 533_600, '2026-07-10')],
+        'cruce_cartera': [
+            _pago_cruzado('PAGO-1', '1002003083', 'INS83', 500_000, fecha='2026-08-18'),
+            _pago_cruzado('PAGO-2', '1002003083', 'INS83', 33_600, fecha='2026-08-19'),
+        ],
+    })
+
+    fila = _fila_final(capturado, 'INS83-A')
+    assert fila.get('notificacion') == 'PAGO SIN APLICAR $33.600', (
+        f'la cuota no avisa que tiene plata esperando: {fila.get("notificacion")!r}'
+    )
+
+
+def test_el_pago_que_quedo_esperando_no_se_sella(mundo):
+    """Punto (a) de la regla: ese pago sigue vivo para asociarse a mano, así
+    que la corrida diaria no puede cerrarle la puerta."""
+    pago_viejo = _pago_cruzado('PAGO-1', '1002003084', 'INS84', 500_000, fecha='2026-08-17')
+    pago_viejo['registration_date'] = '2026-08-18'
+    esperando = _pago_cruzado('PAGO-2', '1002003084', 'INS84', 33_600, fecha='2026-08-18')
+    esperando['registration_date'] = '2026-08-19'
+    capturado = mundo(ccp, tablas={
+        'cartera_cargas': [_carga(f'{_hoy_bogota()}T15:23:32+00:00')],
+        'cartera_preventiva': [
+            _cuota('INS84-A', 'INS84', '1002003084', 533_600, '2026-07-10',
+                   fecha_pago='2026-08-17', valor_pago=500_000,
+                   fecha_cruce='2026-08-18', diferencia=-33_600),
+        ],
+        'pago_asociaciones': [
+            {'id': 9401, 'matching_key': 'PAGO-1', 'llave': 'INS84-A',
+             'monto': 500_000, 'origen': 'automatico'},
+        ],
+        'cruce_cartera': [pago_viejo, esperando],
+    }, argv=['--cierre-diario'])
+
+    assert 'PAGO-2' not in capturado.get('sellados', []), (
+        'se selló el pago que la cuota está esperando: la plata queda muerta'
+    )
+
+
+def test_el_pago_que_paga_una_linea_nueva_no_queda_sin_cruce(mundo):
+    """Lo encontró la simulación contra producción, no el razonamiento.
+
+    El cruce a la inversa saca el nombre del dueño de la cuota de las filas
+    leídas al empezar la corrida, y una línea que acaba de nacer no está ahí.
+    El pago que la pagó aparecía como "sin cruce con Cartera Preventiva"
+    habiendo pagado."""
+    capturado = mundo(ccp, tablas={
+        'cartera_cargas': [_carga(f'{_hoy_bogota()}T15:23:32+00:00')],
+        'cartera_preventiva': [_cuota('INS85-A', 'INS85', '1002003085', 533_600, '2026-07-10')],
+        'cruce_cartera': [
+            _pago_cruzado('PAGO-CARD', '1002003085', 'INS85', 360_000, fecha='2026-08-20'),
+            _pago_cruzado('PAGO-PSE', '1002003085', 'INS85', 173_600, fecha='2026-08-20'),
+        ],
+    })
+
+    cruces = {u['matching_key']: u.get('cruce')
+              for u in capturado.get('cruce_cartera_update', [])}
+    assert cruces.get('PAGO-PSE'), (
+        'el pago que cubrió la cuota de deuda quedó marcado como si no hubiera '
+        'pagado ninguna cuota'
+    )
+
+
+def test_un_faltante_de_redondeo_no_detiene_el_reparto(mundo):
+    """El otro borde, y el que más cuotas toca: casi toda cuota corta lo está
+    por el redondeo de las pasarelas (12 de las 14 de la cartera al 21 de
+    agosto deben menos de $1.000). Frenar ahí dejaría sin aplicar el pago de la
+    cuota SIGUIENTE, que no tiene nada que ver con esos pesos."""
+    capturado = mundo(ccp, tablas={
+        'cartera_cargas': [_carga(f'{_hoy_bogota()}T15:23:32+00:00')],
+        'cartera_preventiva': [
+            _cuota('INS86-A', 'INS86', '1002003086', 500_000, '2026-07-10'),
+            _cuota('INS86-B', 'INS86', '1002003086', 500_000, '2026-08-10'),
+        ],
+        'cruce_cartera': [
+            _pago_cruzado('PAGO-1', '1002003086', 'INS86', 499_998, fecha='2026-08-18'),
+            _pago_cruzado('PAGO-2', '1002003086', 'INS86', 500_002, fecha='2026-08-19'),
+        ],
+    })
+
+    tocadas = _por_llave(capturado)
+    assert 'INS86-B' in tocadas, (
+        'la cuota siguiente se quedó sin pago porque la anterior debía $2 de '
+        'redondeo'
+    )
+    assert not capturado.get('cartera_preventiva_lineas'), (
+        'nació una cuota de deuda por un faltante de redondeo'
+    )

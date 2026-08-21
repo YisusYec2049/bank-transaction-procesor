@@ -134,6 +134,41 @@ Requerimientos del 23 de julio (`requeriments.md`, puntos #1, #2 y #3):
 (bug crítico PGRST102 del 16/07 — leer su docstring). El orden de escritura
 (`pago_asociaciones` primero) también se conserva por la misma razón.
 ────────────────────────────────────────────────────────────────────────────
+EL REPARTO ES POR PAGO, NO POR CUOTA (21 de agosto). Regla del usuario, a
+partir del doc 27602604 (Mary Luz Monsalve): dos pagos de la misma corrida
+sobre la misma cuota se SUMABAN en un renglón que mostraba el total y **un
+solo** código de transacción, así que el segundo pago no aparecía por ningún
+lado. Medido ese día: 5 cuotas, $6.456.018.
+
+  1. Un pago que no alcanza a cubrir la cuota la SACA del reparto. Si lo que
+     queda debiendo llega al umbral, la cuota de FALTA DE PAGO **nace dentro
+     de la cascada** (`_cuota_de_deuda`) y el pago siguiente entra en ELLA.
+     Cada renglón queda amarrado a un solo pago, con su propio código a la
+     vista.
+  2. Si ese pago tampoco la cubre, nace una tercera línea desde la línea, y
+     así — la cascada de deuda es recursiva, por decisión del usuario.
+  3. Si el faltante NO llega al umbral no nace cuota nueva, y entonces el
+     reparto de esa inscripción se DETIENE: el pago que venga no se le suma a
+     la madre (que es justo lo que se dejó de hacer) ni se salta hacia la
+     cuota siguiente, porque acá hay una deuda viva. Queda para que una
+     persona lo asocie.
+       · El piso para detener es el umbral de AVISO ($1.000 / 1 USD), no
+         cero: casi toda cuota corta lo está por el redondeo de las pasarelas
+         (12 de las 14 de la cartera al 21 de agosto deben menos de $1.000),
+         y frenar ahí dejaría sin aplicar el pago de la cuota siguiente.
+  4. Ese pago **no se sella** (`matching_keys_en_espera`): no se aplicó porque
+     el sistema no debía aplicarlo solo, no porque nadie lo trabajara.
+     Sellarlo dejaría la plata muerta, ni automática ni a mano.
+  5. Y la cuota corta lo AVISA (`ETIQUETA_ESPERA`), porque esa plata no está
+     en ningún otro lado visible: no es saldo a favor ni tiene renglón propio.
+     Textual del usuario: *"se debe informar al usuario para que vea qué
+     ocurre en esa cuota y la pueda gestionar"*.
+
+Lo que NO cambia: un pago que cubre dos cuotas se sigue repartiendo entre
+las dos (los dos renglones muestran los mismos datos del pago y solo cambia
+el monto), y dos pagos que entran en días distintos ya funcionaban así — el
+primero deja la cuota corta, nace la línea, y el de mañana entra en ella.
+────────────────────────────────────────────────────────────────────────────
 """
 
 import argparse
@@ -213,6 +248,21 @@ _NUMERO_EN_LETRA = {2: 'DOS', 3: 'TRES', 4: 'CUATRO', 5: 'CINCO', 6: 'SEIS',
 def _es_etiqueta_de_sobrante(valor) -> bool:
     v = str(valor or '').strip().upper()
     return bool(v) and (v.startswith('PAGA ') or v.endswith('+ ABONO'))
+
+
+# Aviso de que a la cuota le está esperando un pago que el sistema NO va a
+# aplicar solo (21 de agosto). Familia propia: la pasada que lo escribe solo
+# limpia filas con este texto, nunca las de sobrante, 'FALTA DE PAGO' ni
+# 'CARTERA'.
+ETIQUETA_ESPERA = 'PAGO SIN APLICAR'
+
+# Centinela para distinguir "no me pasaron el dato" de "me pasaron None", que
+# en `diferencia` significa "la cuota no tiene ningún pago encima".
+_SIN_DATO = object()
+
+
+def _es_etiqueta_de_espera(valor) -> bool:
+    return str(valor or '').strip().upper().startswith(ETIQUETA_ESPERA)
 
 
 def _dia_bogota(marca, tz) -> str:
@@ -354,6 +404,50 @@ def _umbral_notificacion(cuota: dict) -> float:
     return UMBRAL_NOTIFICACION_USD if _en_dolares(cuota) else UMBRAL_NOTIFICACION
 
 
+def _cuota_detenida(cuota: dict, diferencia=_SIN_DATO) -> bool:
+    """¿Esta cuota recibió un pago, quedó corta, y el faltante NO alcanzó para
+    abrirle una cuota de deuda?
+
+    Es el caso del punto 1 de la regla del 21 de agosto: no hay dónde poner el
+    pago siguiente. Ni se le suma a esta cuota —eso es justo lo que se dejó de
+    hacer— ni se salta hacia la cuota que sigue, porque acá hay una deuda viva.
+    Así que el reparto de esa inscripción se detiene y lo que venga queda para
+    que una persona lo asocie.
+
+    Se reconoce por su `diferencia`: negativa (debe plata) pero por debajo del
+    umbral de la cuota de deuda. Una cuota que SÍ tiene su línea muestra el
+    faltante completo, que por definición llega al umbral, así que las dos no
+    se confunden.
+
+    EL PISO ES EL UMBRAL DE AVISO ($1.000 / 1 USD), no cero. Casi toda cuota
+    corta lo está por el redondeo de las pasarelas: medido el 21 de agosto,
+    de las 14 cuotas cortas de la cartera **12 deben menos de $1.000** (nueve
+    de ellas 1 o 2 pesos). Detener el reparto de esa persona por un peso
+    dejaría sin aplicar el pago de su cuota siguiente, que no tiene nada que
+    ver. Es el mismo número con el que el sistema decide que un sobrante no
+    vale la pena avisarlo.
+
+    `diferencia` se puede pasar aparte para preguntar por el valor que la cuota
+    va a tener al terminar la corrida, que no es el que trae en memoria."""
+    dif = cuota.get('diferencia') if diferencia is _SIN_DATO else diferencia
+    if dif is None:
+        return False
+    try:
+        falta = -float(dif)
+    except (TypeError, ValueError):
+        return False
+    return _umbral_notificacion(cuota) <= falta < _umbral_linea_nueva(cuota)
+
+
+def _monto_legible(monto: float, cuota: dict) -> str:
+    """El monto como lo lee el área. En pesos con punto de miles — el separador
+    no se delega al locale (la base corre en inglés y escribiría "$668,200")."""
+    if _en_dolares(cuota):
+        entero = round(float(monto), 2)
+        return f'{int(entero) if entero == int(entero) else entero} USD'
+    return '$' + f'{int(round(float(monto))):,}'.replace(',', '.')
+
+
 def _moneda_para(cuota: dict, valor: float) -> str | None:
     """El `moneda` que le toca a una línea de deuda nacida de `cuota`.
 
@@ -488,23 +582,83 @@ def _fila_cierre_cartera(cuota: dict, fecha_pago_manual: str, hoy: str) -> dict:
     }
 
 
-def _aplicar_pagos_inscripcion(cuotas_abiertas: list[dict], pagos_nuevos: list[dict]):
+def _cuota_de_deuda(madre: dict, faltante: float, pago: dict,
+                     llaves_cobradas: frozenset) -> dict:
+    """La cuota nueva de FALTA DE PAGO, como CUOTA — no como fila de escritura.
+
+    Nace dentro de la cascada (21 de agosto) para que el pago siguiente de la
+    misma corrida pueda entrarle, así que tiene que comportarse como cualquier
+    otra cuota abierta: `_saldo_a_cobrar` sobre ella devuelve el faltante.
+
+    Todavía no existe en la base, así que no tiene `id`. Se reconoce por
+    `_nueva` y se escribe por LLAVE (`insert_cartera_preventiva_lineas` hace
+    upsert sobre esa columna), nunca por id."""
+    virtual = dict(madre)
+    virtual.update({
+        'id':                   None,
+        '_nueva':               True,
+        '_base':                madre.get('llave'),
+        'llave':                _generar_llave_saldo(madre['llave'], pago, llaves_cobradas),
+        'valor_cuota':          faltante,
+        'valor_a_cobrar':       faltante,
+        # En dólares el valor vive en `moneda`, no en `valor_cuota` (ver
+        # `_moneda_para`): si la línea heredara el de su madre, cobraría el
+        # precio entero de la cuota en vez de lo que quedó debiendo.
+        'moneda':               _moneda_para(madre, faltante),
+        'pago':                 None,
+        'pago_confirmado':      None,
+        'fecha_pago':           None,
+        'medio_pago':           None,
+        'valor_pago':           None,
+        'codigo_transaccion_1': None,
+        'codigo_transaccion_2': None,
+        'correo_elec':          None,
+        'fecha_cruce':          None,
+        'diferencia':           None,
+        'notificacion':         None,
+        'es_wompi_automatico':  None,
+    })
+    return virtual
+
+
+def _aplicar_pagos_inscripcion(cuotas_abiertas: list[dict], pagos_nuevos: list[dict],
+                                llaves_cobradas: frozenset = frozenset()):
     """FIFO de pagos_nuevos (ordenados por payment_date) contra
     cuotas_abiertas (ordenadas por fecha_vencimiento) de UNA sola
     inscripción. Montos EXACTOS: una cuota solo se considera cerrada cuando
     el acumulado la cubre por completo, ni un peso menos.
 
-    Cada cuota tocada se resuelve por completo en esta misma pasada: si el
-    dinero disponible no la cubre del todo, se cierra por lo recibido y el
-    resto queda para que quien llame decida (diferencia negativa o línea
-    nueva "FALTA DE PAGO", según el umbral).
+    EL REPARTO ES POR PAGO, NO POR CUOTA (21 de agosto, regla del usuario).
+    Un pago que no alcanza a cubrir la cuota la SACA del reparto: si lo que
+    quedó debiendo llega al umbral, la cuota de FALTA DE PAGO **nace acá
+    mismo** y el pago siguiente entra en ELLA, no en la madre. Así cada
+    renglón queda amarrado a un solo pago, con su propio código de
+    transacción a la vista.
 
-    Devuelve (cierres, parcial, asociaciones, excedente):
+    Hasta hoy la cuota acumulaba pagos: dos pagos de la misma corrida se
+    sumaban en un renglón que mostraba el total y **un solo** código de
+    transacción, así que el otro pago no aparecía por ningún lado (caso que
+    lo destapó: doc 27602604, $360.000 + $173.600 sobre una cuota de
+    $533.600). Medido el 21 de agosto: 5 cuotas, $6.456.018.
+
+    La cascada de deuda es recursiva por decisión del usuario: si el pago
+    siguiente tampoco cubre la línea, nace una tercera línea desde esa
+    línea, y así.
+
+    CUANDO NO NACE LÍNEA EL REPARTO SE DETIENE. Si el faltante no llega al
+    umbral no hay dónde meter el pago siguiente sin saltarse una deuda viva
+    —ni sumarlo a la madre, que es justo lo que se dejó de hacer—, así que
+    los pagos que queden se devuelven en `en_espera`: no se aplican solos,
+    quedan para que una persona los asocie.
+
+    Devuelve (cierres, parciales, asociaciones, excedentes, en_espera):
       - cierres: [{'cuota', 'monto_aplicado', 'ultimo_pago'}] cuotas
         cubiertas EXACTAMENTE.
-      - parcial: misma forma, o None — la ÚLTIMA cuota tocada que se quedó
-        sin dinero para completarla. A lo sumo una.
-      - asociaciones: [{'matching_key', 'cuota_id', 'monto'}].
+      - parciales: misma forma, para las cuotas que quedaron cortas, cada una
+        con la 'linea' que nació de ella (o None si no llegó al umbral). Ya
+        no es una sola: con el reparto por pago, cada pago puede dejar la
+        suya.
+      - asociaciones: [{'matching_key', 'llave', 'monto'}].
       - excedentes: [{'pago', 'monto'}] — plata que sobró tras cubrir TODAS
         las cuotas conocidas de la inscripción (saldo a favor, ver §2 de la
         spec), SEPARADA POR PAGO. Se devuelve así, y no como un total, porque
@@ -512,53 +666,101 @@ def _aplicar_pagos_inscripcion(cuotas_abiertas: list[dict], pagos_nuevos: list[d
         verdad: con dos pagos en la misma corrida y uno sobrando entero, el
         total se registraba bajo el pago que cerró la última cuota (caso real
         4166PN, 22 de julio — dos pagos de $524.688, uno cubrió la cuota y el
-        otro quedó libre, pero el ledger los atribuía los dos al primero)."""
+        otro quedó libre, pero el ledger los atribuía los dos al primero).
+      - en_espera: [pago] que no se aplicaron porque el reparto se detuvo.
+
+    El acumulado va por LLAVE y no por `id` porque las cuotas de deuda que
+    nacen acá todavía no tienen id — la llave la tienen desde que nacen y es
+    única en la cartera."""
     cuotas_ordenadas = sorted(cuotas_abiertas, key=lambda c: c.get('fecha_vencimiento') or _FECHA_MAX)
     pagos_ordenados = sorted(pagos_nuevos, key=lambda p: p.get('payment_date') or _FECHA_MAX)
 
     acumulado: dict = {}
     ultimo_pago_por_cuota: dict = {}
+    linea_de: dict = {}
     asociaciones = []
     idx = 0
     excedentes: list[dict] = []
+    en_espera: list[dict] = []
+    detenido = False
 
-    for pago in pagos_ordenados:
+    for n, pago in enumerate(pagos_ordenados):
+        if detenido:
+            en_espera.append(pago)
+            continue
         restante = float(pago.get('payment_amount') or 0)
         if restante <= 0:
             continue
+        entro = restante
         matching_key = pago['matching_key']
         while restante > 0 and idx < len(cuotas_ordenadas):
             cuota = cuotas_ordenadas[idx]
-            cuota_id = cuota['id']
+            llave = cuota['llave']
             saldo_cuota = _saldo_a_cobrar(cuota)
-            ya = acumulado.get(cuota_id, 0.0)
+            ya = acumulado.get(llave, 0.0)
             saldo = saldo_cuota - ya
             if saldo <= 0:
                 idx += 1
                 continue
+            if llave not in acumulado and _cuota_detenida(cuota):
+                # Ya quedó corta en una corrida anterior y nunca tuvo cuota de
+                # deuda: sumarle plata sola es exactamente lo que la regla del
+                # 21 de agosto dejó de hacer, y saltarla sería cobrar la cuota
+                # siguiente teniendo esta abierta.
+                detenido = True
+                break
             aplicar = min(restante, saldo)
-            acumulado[cuota_id] = ya + aplicar
-            ultimo_pago_por_cuota[cuota_id] = pago
-            asociaciones.append({'matching_key': matching_key, 'cuota_id': cuota_id, 'monto': round(aplicar, 2)})
+            acumulado[llave] = ya + aplicar
+            ultimo_pago_por_cuota[llave] = pago
+            asociaciones.append({'matching_key': matching_key, 'llave': llave,
+                                 'monto': round(aplicar, 2)})
             restante -= aplicar
-            if saldo_cuota - acumulado[cuota_id] <= 0:
+            faltante = round(saldo_cuota - acumulado[llave], 2)
+            if faltante <= 0:
                 idx += 1
+                continue
+            # El pago se agotó sin cubrirla: la cuota sale del reparto.
+            if faltante >= _umbral_linea_nueva(cuota):
+                linea = _cuota_de_deuda(cuota, faltante, pago, llaves_cobradas)
+                linea_de[llave] = linea
+                cuotas_ordenadas.insert(idx + 1, linea)
+            elif faltante >= _umbral_notificacion(cuota):
+                # Sin cuota nueva no hay dónde poner lo que venga después. Un
+                # faltante de redondeo (por debajo del umbral de aviso) no
+                # detiene nada: ahí el pago siguiente lo cubre y sigue de
+                # largo, como siempre.
+                detenido = True
+            idx += 1
         if restante > 0:
-            excedentes.append({'pago': pago, 'monto': round(restante, 2)})
+            if detenido and restante == entro:
+                # El reparto se detuvo y este pago no alcanzó a pagar ni un
+                # peso: no es plata que sobró, es plata que no tuvo dónde
+                # entrar. Llamarla sobrante le abriría un saldo a favor y la
+                # haría parecer repartida. Un pago que sobra porque ya no
+                # quedan cuotas SÍ sigue siendo excedente, como siempre (caso
+                # 4166PN, 22 de julio).
+                en_espera.append(pago)
+            else:
+                excedentes.append({'pago': pago, 'monto': round(restante, 2)})
+        if detenido:
+            en_espera.extend(pagos_ordenados[n + 1:])
+            break
 
-    cierres, parcial = [], None
+    cierres, parciales = [], []
     for cuota in cuotas_ordenadas:
-        cuota_id = cuota['id']
-        if cuota_id not in acumulado:
+        llave = cuota['llave']
+        if llave not in acumulado:
             continue
-        monto = acumulado[cuota_id]
-        info = {'cuota': cuota, 'monto_aplicado': monto, 'ultimo_pago': ultimo_pago_por_cuota[cuota_id]}
+        monto = acumulado[llave]
+        info = {'cuota': cuota, 'monto_aplicado': monto,
+                'ultimo_pago': ultimo_pago_por_cuota[llave]}
         if _saldo_a_cobrar(cuota) - monto <= 0:
             cierres.append(info)
         else:
-            parcial = info
+            info['linea'] = linea_de.get(llave)
+            parciales.append(info)
 
-    return cierres, parcial, asociaciones, excedentes
+    return cierres, parciales, asociaciones, excedentes, en_espera
 
 
 def _fila_cierre(info: dict, hoy: str, cerrar_al_monto_recibido: bool = False) -> dict:
@@ -613,40 +815,59 @@ def _fila_cierre(info: dict, hoy: str, cerrar_al_monto_recibido: bool = False) -
     return fila
 
 
-def _fila_linea_saldo(parcial: dict, nueva_llave: str, notificacion: str | None = None) -> dict:
-    cuota = parcial['cuota']
-    saldo = round(_saldo_a_cobrar(cuota) - parcial['monto_aplicado'], 2)
+def _fila_de_linea(linea: dict) -> dict:
+    """Fila de escritura de una cuota de deuda, a partir de la cuota que armó
+    `_cuota_de_deuda`.
+
+    Se escribe por LLAVE (`insert_cartera_preventiva_lineas` hace upsert sobre
+    esa columna), así que no lleva `id` — la línea puede no existir todavía.
+
+    Las claves van SIEMPRE las mismas, incluidas las del pago: desde el 21 de
+    agosto una línea puede nacer YA PAGADA por el pago siguiente de la misma
+    corrida, y todas las líneas de la corrida se escriben en un solo array —
+    PostgREST rechaza el POST entero si un objeto trae una clave que otro no
+    (PGRST102, ver `_fila_cierre`)."""
     return {
         # Llave de la cuota que originó esta línea. Solo circula en memoria
         # (`_sincronizar_lineas_falta_de_pago` la usa para saber si la
         # original ya tiene línea); se quita antes de escribir a Supabase.
-        '_base':               cuota.get('llave'),
-        'llave':               nueva_llave,
-        'sistema_financiero':  cuota.get('sistema_financiero'),
-        'inscrip':             cuota.get('inscrip'),
-        'cliente':             cuota.get('cliente'),
-        # En una cuota en dólares la línea nace en dólares, con SU propio
-        # valor: si heredara el de la madre ("178USD") diría que debe 178
-        # cuando debe 18, y `_saldo_a_cobrar` la leería mal en cada corrida.
-        'moneda':              _moneda_para(cuota, saldo),
-        'fecha_vencimiento':   cuota.get('fecha_vencimiento'),
-        'programa':            cuota.get('programa'),
-        'cruce_access':        cuota.get('cruce_access'),
-        'correo':              cuota.get('correo'),
-        'valor_cuota':         saldo,
-        'valor_a_cobrar':      saldo,
-        'pago':                None,
-        'fecha_pago':          None,
-        'medio_pago':          None,
-        'valor_pago':          None,
-        'codigo_transaccion_1': None,
-        'codigo_transaccion_2': None,
-        'correo_elec':         None,
-        'diferencia':          None,
-        'notificacion':        notificacion,
-        'es_wompi_automatico': None,
-        'pago_confirmado':     None,
+        '_base':               linea.get('_base'),
+        'llave':               linea['llave'],
+        'sistema_financiero':  linea.get('sistema_financiero'),
+        'inscrip':             linea.get('inscrip'),
+        'cliente':             linea.get('cliente'),
+        'moneda':              linea.get('moneda'),
+        'fecha_vencimiento':   linea.get('fecha_vencimiento'),
+        'programa':            linea.get('programa'),
+        'cruce_access':        linea.get('cruce_access'),
+        'correo':              linea.get('correo'),
+        'valor_cuota':         linea.get('valor_cuota'),
+        'valor_a_cobrar':      linea.get('valor_a_cobrar'),
+        'pago':                linea.get('pago'),
+        'fecha_pago':          linea.get('fecha_pago'),
+        'medio_pago':          linea.get('medio_pago'),
+        'valor_pago':          linea.get('valor_pago'),
+        'codigo_transaccion_1': linea.get('codigo_transaccion_1'),
+        'codigo_transaccion_2': linea.get('codigo_transaccion_2'),
+        'correo_elec':         linea.get('correo_elec'),
+        'fecha_cruce':         linea.get('fecha_cruce'),
+        'diferencia':          linea.get('diferencia'),
+        'notificacion':        linea.get('notificacion'),
+        'es_wompi_automatico': linea.get('es_wompi_automatico'),
+        'pago_confirmado':     linea.get('pago_confirmado'),
     }
+
+
+def _fila_linea_saldo(parcial: dict, nueva_llave: str, notificacion: str | None = None) -> dict:
+    """Línea de deuda VACÍA (sin pago encima), para el pase de reconciliación
+    manual (§3.5). El FIFO ya no pasa por acá: sus líneas nacen dentro de la
+    cascada y pueden traer pago, ver `_cuota_de_deuda`."""
+    cuota = parcial['cuota']
+    saldo = round(_saldo_a_cobrar(cuota) - parcial['monto_aplicado'], 2)
+    linea = _cuota_de_deuda(cuota, saldo, parcial['ultimo_pago'], frozenset())
+    linea['llave'] = nueva_llave
+    linea['notificacion'] = notificacion
+    return _fila_de_linea(linea)
 
 
 def _sincronizar_lineas_falta_de_pago(
@@ -778,17 +999,31 @@ def _sincronizar_lineas_falta_de_pago(
 
 
 def _cerrar_o_faltante(info: dict, hoy: str,
-                        llaves_cobradas: frozenset = frozenset()) -> tuple[dict, dict | None]:
+                        llaves_cobradas: frozenset = frozenset(),
+                        linea_ya_creada: dict | None = None) -> tuple[dict, dict | None]:
     """A partir de un cierre exacto o parcial (`info` con 'cuota',
     'monto_aplicado', 'ultimo_pago'), arma (fila_cierre, linea_nueva_o_None)
     aplicando el umbral único de FALTA DE PAGO (`>= UMBRAL_LINEA_NUEVA`).
     Usado tanto por el FIFO automático como por el pase de reconciliación
-    manual (§3.5) — ambos deben comportarse igual ante un faltante."""
+    manual (§3.5) — ambos deben comportarse igual ante un faltante.
+
+    `linea_ya_creada` la pasa el FIFO desde el 21 de agosto: sus líneas nacen
+    dentro de la cascada para que el pago siguiente pueda entrarles, así que
+    acá ya no hay que crearlas."""
     cuota = info['cuota']
     monto = info['monto_aplicado']
     s = round(_saldo_a_cobrar(cuota) - monto, 2)
     if s <= 0:
         return _fila_cierre(info, hoy), None
+    if linea_ya_creada is not None:
+        # El FIFO ya creó la cuota de deuda dentro de la cascada (21 de
+        # agosto) y puede haberle aplicado el pago siguiente, así que acá solo
+        # se arma la fila de la MADRE. Crear otra línea desde el mismo
+        # faltante duplicaría la deuda.
+        fila = _fila_cierre(info, hoy, cerrar_al_monto_recibido=True)
+        fila['notificacion'] = 'FALTA DE PAGO'
+        fila['diferencia'] = -s
+        return fila, None
     if s >= _umbral_linea_nueva(cuota):
         # El faltante (>= $50.000) genera una cuota NUEVA por la deuda, pero la
         # marca 'FALTA DE PAGO' y el monto que quedó a deber viven en la cuota
@@ -811,18 +1046,47 @@ def _procesar_inscripcion(cuotas_inscripcion: list[dict], pagos_para: list[dict]
     el modelo "Saldo a Favor Manual + FALTA DE PAGO" (21 de julio).
 
     No escribe nada en Supabase — solo calcula. Devuelve:
-      (cierres_filas, linea_nueva_o_None, asociaciones, saldos_favor_nuevos)
-    """
-    cierres, parcial, asociaciones, excedentes = _aplicar_pagos_inscripcion(cuotas_inscripcion, pagos_para)
+      (cierres_filas, lineas_nuevas, asociaciones, saldos_favor_nuevos, en_espera)
 
-    cierres_filas = [_fila_cierre(info, hoy) for info in cierres]
-    linea_nueva = None
-    if parcial:
-        fila, linea_nueva = _cerrar_o_faltante(parcial, hoy, llaves_cobradas)
-        cierres_filas.append(fila)
+    Desde el 21 de agosto las líneas de deuda nacen dentro de la cascada y
+    pueden venir YA PAGADAS por el pago siguiente, así que se devuelven en
+    lista (antes era a lo sumo una, siempre vacía). Las que traen pago se
+    escriben por llave con sus columnas de resultado llenas, en vez de
+    insertarse vacías y esperar a la corrida siguiente.
+    """
+    cierres, parciales, asociaciones, excedentes, en_espera = _aplicar_pagos_inscripcion(
+        cuotas_inscripcion, pagos_para, llaves_cobradas)
+
+    cierres_filas: list[dict] = []
+    lineas_nuevas: list[dict] = []
+    fila_por_llave: dict = {}
+    # Una cuota de deuda que nació en esta corrida se escribe por LLAVE (no
+    # existe todavía, no tiene id); una cuota de la cartera se actualiza por
+    # id. Es la única diferencia entre los dos caminos.
+    for info in cierres + parciales:
+        cuota = info['cuota']
+        fila, _ = _cerrar_o_faltante(info, hoy, llaves_cobradas,
+                                     linea_ya_creada=info.get('linea'))
+        if cuota.get('_nueva'):
+            pagada = dict(cuota)
+            pagada.update({k: v for k, v in fila.items() if k != 'id'})
+            fila = _fila_de_linea(pagada)
+            lineas_nuevas.append(fila)
+        else:
+            cierres_filas.append(fila)
+        fila_por_llave[cuota['llave']] = fila
+
+    # Las cuotas de deuda que nacieron y todavía NO recibieron plata (el pago
+    # que las originó se agotó al crearlas) se insertan vacías, como siempre.
+    for info in parciales:
+        linea = info.get('linea')
+        if linea is not None and linea['llave'] not in fila_por_llave:
+            fila = _fila_de_linea(linea)
+            lineas_nuevas.append(fila)
+            fila_por_llave[linea['llave']] = fila
 
     saldos_favor_nuevos: list[dict] = []
-    if excedentes and cierres_filas:
+    if excedentes and cierres:
         # El excedente lo absorbe la ÚLTIMA cuota que toca el pago (nunca la
         # parcial: excedente y parcial son mutuamente excluyentes dentro de
         # una misma llamada — si sobra plata es porque TODAS las cuotas ya
@@ -836,7 +1100,11 @@ def _procesar_inscripcion(cuotas_inscripcion: list[dict], pagos_para: list[dict]
         # (caso 4166PN del 22 de julio) y dejaba al segundo pago sin rastro de
         # haberse usado, así que cada corrida lo volvía a mirar como nuevo.
         ultima_cuota = cierres[-1]['cuota']
-        cierres_filas[-1]['diferencia'] = round(sum(e['monto'] for e in excedentes), 2)
+        # Se busca su fila por llave y no "la última escrita": desde que las
+        # cuotas de deuda nacen en la cascada, la última fila de la corrida
+        # puede ser una línea nueva y no la cuota que absorbió el excedente.
+        fila_por_llave[ultima_cuota['llave']]['diferencia'] = round(
+            sum(e['monto'] for e in excedentes), 2)
         for e in excedentes:
             saldos_favor_nuevos.append({
                 'inscrip':      ultima_cuota.get('inscrip'),
@@ -852,7 +1120,7 @@ def _procesar_inscripcion(cuotas_inscripcion: list[dict], pagos_para: list[dict]
                 'aplicado':     False,
             })
 
-    return cierres_filas, linea_nueva, asociaciones, saldos_favor_nuevos
+    return cierres_filas, lineas_nuevas, asociaciones, saldos_favor_nuevos, en_espera
 
 
 def _etiqueta_notificacion(valor_cuota: float, sobrante: float,
@@ -1094,7 +1362,6 @@ def main():
     )
 
     id_por_llave      = {c['llave']: c['id'] for c in cuotas_rows if c.get('llave')}
-    llave_por_id      = {c['id']: c['llave'] for c in cuotas_rows}
     cliente_por_llave = {c['llave']: c.get('cliente') for c in cuotas_rows if c.get('llave')}
 
     # Abono del Excel corregido a mano desde fin-platform
@@ -1323,6 +1590,7 @@ def main():
     lineas_nuevas: list[dict] = []
     nuevas_asociaciones: list[dict] = []
     saldos_favor_nuevos: list[dict] = []
+    pagos_en_espera: dict[str, dict] = {}
 
     # Pase de reconciliación: toda cuota se recalcula a partir de la SUMA de
     # TODAS sus asociaciones vigentes (mismo umbral que el FIFO automático).
@@ -1825,19 +2093,31 @@ def main():
         if not pagos_para_inscripcion:
             continue
 
-        cierres_filas, linea_nueva, asociaciones, saldos_favor = _procesar_inscripcion(
-            cuotas_inscripcion, pagos_para_inscripcion, hoy, llaves_cobradas)
+        cierres_filas, lineas_de_la_inscripcion, asociaciones, saldos_favor, en_espera = (
+            _procesar_inscripcion(cuotas_inscripcion, pagos_para_inscripcion, hoy,
+                                   llaves_cobradas))
 
         actualizaciones_cierre.extend(cierres_filas)
-        if linea_nueva:
-            lineas_nuevas.append(linea_nueva)
+        lineas_nuevas.extend(lineas_de_la_inscripcion)
+        # Las cuotas de deuda que acaban de nacer no están en `cuotas_rows`
+        # (se leyó al empezar), y el cruce a la inversa saca de ahí el nombre
+        # del dueño de cada cuota. Sin esto, el pago que pagó una línea nueva
+        # se marca "sin cruce con Cartera Preventiva" habiendo pagado.
+        for ln in lineas_de_la_inscripcion:
+            cliente_por_llave.setdefault(ln['llave'], ln.get('cliente'))
         for a in asociaciones:
             nuevas_asociaciones.append({
                 'matching_key': a['matching_key'],
-                'llave':        llave_por_id[a['cuota_id']],
+                'llave':        a['llave'],
                 'monto':        a['monto'],
                 'origen':       'automatico',
             })
+        for p in en_espera:
+            # No se aplicó porque la cuota que le tocaba quedó corta por menos
+            # del umbral, así que no hay cuota nueva donde entrar (regla del
+            # usuario, 21 de agosto). Queda vivo para asociarse a mano: la
+            # cuota corta lo avisa y el sello no lo toca.
+            pagos_en_espera[p['matching_key']] = p
         saldos_favor_nuevos.extend(saldos_favor)
         docs_procesados += 1
 
@@ -2170,6 +2450,75 @@ def main():
         upsert_cartera_preventiva(supabase_url, srk, sync_notificacion)
         log.info('Notificación de sobrante: %d cuota(s) actualizadas.', len(sync_notificacion))
 
+    # ── La cuota avisa que tiene un pago esperando (21 de agosto) ──────────
+    #
+    # Cuando el faltante de una cuota no llega al umbral no nace cuota de deuda,
+    # y entonces el pago que venga NO se aplica solo (punto 1 de la regla). Esa
+    # plata no está en ningún lado visible —no es saldo a favor, no tiene
+    # renglón propio—, así que sin este aviso nadie la gestiona. Regla del
+    # usuario: *"se debe informar al usuario para que vea qué ocurre en esa
+    # cuota y la pueda gestionar"*.
+    #
+    # Se calcula desde el ESTADO y no desde el reparto de esta corrida: un pago
+    # que quedó esperando ayer ya no entra a `pagos_nuevos` (se le cerró la
+    # ventana), y el aviso tiene que seguir vivo hasta que alguien lo asocie.
+    aplicados_ya = set(matching_keys_asociados) | {
+        a['matching_key'] for a in nuevas_asociaciones}
+    sin_aplicar_por_inscripcion: dict[str, list[dict]] = {}
+    for p in pagos_cruzados:
+        mk = p['matching_key']
+        if (mk in aplicados_ya or mk in matching_keys_en_ledger
+                or mk in matching_keys_en_excel or mk in matching_keys_archivados):
+            continue
+        ins = _base_inscripcion(p.get('incp'))
+        if ins:
+            sin_aplicar_por_inscripcion.setdefault(ins, []).append(p)
+
+    # La `diferencia` que la cuota va a tener al terminar la corrida, no la que
+    # trae en memoria: la que el FIFO acaba de dejar corta todavía no está
+    # reflejada acá.
+    diferencia_final = {f['id']: f['diferencia'] for f in actualizaciones_cierre
+                        if f.get('id') is not None and 'diferencia' in f}
+    espera_por_llave: dict[str, float] = {}
+    matching_keys_en_espera: set[str] = set()
+    for cuota in cuotas_rows:
+        llave = cuota.get('llave')
+        if (not llave or llave in llaves_cerradas_manual
+                or cuota.get('pago_confirmado') is not None):
+            continue
+        if not _cuota_detenida(cuota, diferencia_final.get(cuota['id'], cuota.get('diferencia'))):
+            continue
+        pendientes = sin_aplicar_por_inscripcion.get(_base_inscripcion(cuota.get('inscrip'))) or []
+        if not pendientes:
+            continue
+        espera_por_llave[llave] = round(
+            sum(float(p.get('payment_amount') or 0) for p in pendientes), 2)
+        matching_keys_en_espera.update(p['matching_key'] for p in pendientes)
+
+    sync_espera = []
+    for cuota in cuotas_rows:
+        llave = cuota.get('llave') or ''
+        if not llave:
+            continue
+        actual = cuota.get('notificacion')
+        monto = espera_por_llave.get(llave)
+        if monto:
+            deseada = f'{ETIQUETA_ESPERA} {_monto_legible(monto, cuota)}'
+            # 'FALTA DE PAGO' y 'CARTERA' son de otros dueños y mandan ellas,
+            # igual que en la pasada de sobrante.
+            if actual in ('FALTA DE PAGO', 'CARTERA') or actual == deseada:
+                continue
+            sync_espera.append({'id': cuota['id'], 'notificacion': deseada})
+            cuota['notificacion'] = deseada
+        elif _es_etiqueta_de_espera(actual):
+            # Ya se asoció, o la cuota dejó de estar corta: se limpia. Solo se
+            # tocan las etiquetas de esta familia, nunca las ajenas.
+            sync_espera.append({'id': cuota['id'], 'notificacion': None})
+            cuota['notificacion'] = None
+    if sync_espera:
+        upsert_cartera_preventiva(supabase_url, srk, sync_espera)
+        log.info('Aviso de pago sin aplicar: %d cuota(s) actualizadas.', len(sync_espera))
+
     # Cruce a la inversa (informativo, ver docstring del módulo).
     llaves_por_pago: dict[str, list[str]] = {}
     for r in asociaciones_vigentes:
@@ -2255,6 +2604,14 @@ def main():
             and p['matching_key'] not in en_ledger
             and p['matching_key'] not in matching_keys_en_excel
             and p['matching_key'] not in matching_keys_archivados
+            # Un pago que la cuota está ESPERANDO no se sella (21 de agosto):
+            # no se aplicó porque el sistema no debía aplicarlo solo, no porque
+            # nadie lo trabajara. Sellarlo dejaría esa plata muerta —ni
+            # automática ni a mano— y el aviso de su cuota apuntaría a un pago
+            # que ya no se puede usar. Regla del usuario: *"ese pago se
+            # exceptúa del sello, para que pueda cruzar o salir para asociar
+            # sin problema"*.
+            and p['matching_key'] not in matching_keys_en_espera
         ]
         if a_sellar:
             marcar_aplicacion_cerrada(supabase_url, srk, a_sellar, hoy)
