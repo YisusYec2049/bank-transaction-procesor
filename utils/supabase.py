@@ -526,6 +526,32 @@ def _patch_una_por_una(supabase_url: str, service_role_key: str, tabla: str,
     return escritas
 
 
+# Las columnas que cada función de base sabe escribir. Una columna que no esté
+# acá NO viaja en lote: esa tanda se escribe fila por fila, que es lento pero
+# llega.
+#
+# Existe por un caso real (21 de agosto de 2026). El 19 se le empezó a mandar
+# `identification` a `actualizar_consolidated_campos`, creada el 2 de agosto
+# para otras dos columnas. La función no la conocía, así que **la descartó en
+# silencio y respondió que todo salió bien**: el documento que el
+# ReportePagosWompi corrige quedaba escrito en `cruce_cartera` y no en el
+# consolidado, así que el mismo pago vivía con dos documentos distintos según la
+# pantalla y no se lo podía encontrar buscando (8 pagos, $4.172.563, y el log
+# repitiendo la corrección cada 15 minutos sin que quedara nunca).
+#
+# La lista puede quedar corta contra lo que la base realmente sabe hacer sin
+# causar daño: de menos se escribe lento, de más también. Lo único que no puede
+# volver a pasar es perder una columna creyendo que se escribió. Por eso un
+# `rpc` que no figure acá va entero por el camino lento — agregar la función a
+# la base y olvidarse de esta lista cuesta velocidad, al revés cuesta datos.
+_COLUMNAS_EN_LOTE: dict[str, frozenset[str]] = {
+    'actualizar_cruce_valores': frozenset({
+        'val', 'nombre', 'metodo_de_pago', 'ci', 'program', 'incp', 'cruce'}),
+    'actualizar_consolidated_campos': frozenset({
+        'metodo_de_pago', 'program', 'identification'}),
+}
+
+
 def _actualizar_por_matching_key(supabase_url: str, service_role_key: str, tabla: str,
                                   rpc: str, updates: list[dict], batch_size: int) -> int:
     """Aplica actualizaciones parciales por `matching_key` en una sola petición.
@@ -544,6 +570,14 @@ def _actualizar_por_matching_key(supabase_url: str, service_role_key: str, tabla
     Si la función no existe en esta base, cae sola al PATCH fila por fila.
     """
     if _LOTE_DISPONIBLE.get(rpc) is False:
+        return _patch_una_por_una(supabase_url, service_role_key, tabla, updates)
+
+    desconocidas = {c for u in updates for c in u if c != 'matching_key'} - \
+        _COLUMNAS_EN_LOTE.get(rpc, frozenset())
+    if desconocidas:
+        log.warning('%s() no sabe escribir %s: esas filas se actualizan una por una '
+                    '(lento). Agregar la columna a la función de base Y a '
+                    '_COLUMNAS_EN_LOTE.', rpc, ', '.join(sorted(desconocidas)))
         return _patch_una_por_una(supabase_url, service_role_key, tabla, updates)
 
     hdrs = _headers(service_role_key, prefer='return=minimal')

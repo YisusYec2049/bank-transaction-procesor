@@ -225,3 +225,48 @@ def test_cada_tabla_recuerda_su_funcion_por_separado(monkeypatch):
 
     assert supabase._LOTE_DISPONIBLE['actualizar_cruce_valores'] is False
     assert supabase._LOTE_DISPONIBLE['actualizar_consolidated_campos'] is True
+
+
+# --------------------------------------------------------------------------
+# Una columna que la función de base no conoce NO se pierde en silencio
+# (21 de agosto). El 19 se le empezó a mandar `identification` a
+# `actualizar_consolidated_campos`, creada el 2 de agosto para otras dos
+# columnas: la descartó y respondió que todo salió bien. El documento que el
+# ReportePagosWompi corrige quedaba en `cruce_cartera` y no en el consolidado,
+# así que el mismo pago vivía con dos documentos según la pantalla — 8 pagos,
+# $4.172.563, y el log repitiendo la corrección cada 15 minutos.
+# --------------------------------------------------------------------------
+
+def test_una_columna_que_la_funcion_no_conoce_va_fila_por_fila(espia, monkeypatch):
+    monkeypatch.setitem(supabase._COLUMNAS_EN_LOTE,
+                        'actualizar_consolidated_campos', frozenset({'program'}))
+
+    supabase.update_consolidated_campos('https://x', 'k', [
+        {'matching_key': 'A', 'identification': '1030581686'}])
+
+    assert not espia['post'], (
+        'se mandó en lote una columna que la función no sabe escribir: se pierde '
+        'y responde que todo salió bien'
+    )
+    assert espia['patch'], 'no se escribió por ningún camino'
+    assert espia['patch'][0][2] == {'identification': '1030581686'}
+
+
+def test_la_columna_conocida_sigue_yendo_en_lote(espia):
+    """El guardo no puede volver lento el camino normal."""
+    supabase.update_consolidated_campos('https://x', 'k', [
+        {'matching_key': 'A', 'identification': '1030581686', 'program': 'DIPLOMADO'}])
+
+    assert len(espia['post']) == 1, 'el caso bueno dejó de ir en lote'
+    assert not espia['patch']
+
+
+def test_una_funcion_sin_lista_no_se_arriesga(espia):
+    """Una función nueva sin entrada en la lista escribe fila por fila: lento y
+    correcto. Al revés —confiar por omisión— es perder datos."""
+    supabase._actualizar_por_matching_key(
+        'https://x', 'k', 'tabla_nueva', 'actualizar_tabla_nueva',
+        [{'matching_key': 'A', 'campo': 'x'}], 2000)
+
+    assert not espia['post']
+    assert len(espia['patch']) == 1
