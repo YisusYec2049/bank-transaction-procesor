@@ -153,14 +153,33 @@ def upsert(supabase_url: str, service_role_key: str, rows: list[list]) -> None:
     # sistema, y debe ser ESTABLE: no se re-escribe cuando el mismo archivo se
     # reprocesa. Sin esto, el export acumulado de Stripe (que trae varios días
     # de pagos) re-sellaba con la fecha de hoy pagos que ya habían entrado días
-    # atrás, cada vez que se procesaba. Solución: los pagos que YA existen se
-    # actualizan (merge) en todas sus columnas MENOS registration_date; solo
-    # los nuevos la estrenan. Van en dos POST porque un array de merge exige
-    # que todos los objetos tengan el mismo set de claves (PGRST102).
-    existentes = existing_matching_keys(
+    # atrás, cada vez que se procesaba.
+    #
+    # Los pagos que YA existen conservan DOS datos de la base en vez de los del
+    # archivo:
+    #
+    #   registration_date  Antes se OMITÍA, y eso rompía la tanda entera: la
+    #                      columna es NOT NULL y PostgreSQL la valida antes de
+    #                      resolver el ON CONFLICT (23502). Ese camino nunca
+    #                      llegó a correr en producción — desde el 3 de agosto
+    #                      dejó 7 archivos de Stripe atascados, con el vigilante
+    #                      disparando la cadena cada 15 minutos. Mandar la fecha
+    #                      guardada cumple la restricción sin moverla.
+    #
+    #   identification     Es la ÚNICA columna del consolidado que edita una
+    #                      persona (pantalla de corrección de documento). El
+    #                      archivo no puede pisarla: 59 pagos de Stripe la
+    #                      tienen corregida a mano y 55 de ellos justamente
+    #                      porque el archivo la trae VACÍA. Destrabar lo de
+    #                      arriba sin esta guarda les habría borrado el
+    #                      documento en silencio.
+    #
+    # Siguen yendo en dos POST porque un array de merge exige que todos los
+    # objetos tengan el mismo set de claves (PGRST102).
+    existentes = filas_existentes(
         supabase_url, service_role_key, [p['matching_key'] for p in payload])
     nuevos   = [p for p in payload if p['matching_key'] not in existentes]
-    ya_estan = [{k: v for k, v in p.items() if k != 'registration_date'}
+    ya_estan = [{**p, **existentes[p['matching_key']]}
                 for p in payload if p['matching_key'] in existentes]
 
     for lote in (nuevos, ya_estan):
@@ -177,6 +196,36 @@ def upsert(supabase_url: str, service_role_key: str, rows: list[list]) -> None:
              'sin re-sellar fecha de ingreso).', len(payload), len(nuevos), len(ya_estan))
 
 
+#: Lo que un pago que YA existe conserva de la base en vez de tomarlo del
+#: archivo. Ver el bloque de `upsert` para el porqué de cada una.
+_COLUMNAS_QUE_MANDA_LA_BASE = ('registration_date', 'identification')
+
+
+def filas_existentes(supabase_url: str, service_role_key: str,
+                     keys: list[str]) -> dict[str, dict]:
+    """De `keys`, las que ya están en consolidated_transactions y lo que la base
+    guarda hoy de cada una en las columnas que el archivo no puede pisar."""
+    if not keys:
+        return {}
+    encontrados: dict[str, dict] = {}
+    columnas = ','.join(('matching_key',) + _COLUMNAS_QUE_MANDA_LA_BASE)
+    batch_size = 200
+    for i in range(0, len(keys), batch_size):
+        batch = keys[i:i + batch_size]
+        valores = ','.join(f'"{v}"' for v in batch)
+        resp = http.get(
+            f'{supabase_url}/rest/v1/consolidated_transactions',
+            params={'select': columnas, 'matching_key': f'in.({valores})'},
+            headers=_headers(service_role_key),
+            timeout=30,
+        )
+        _raise_for_status(resp)
+        for r in resp.json():
+            encontrados[r['matching_key']] = {
+                c: r[c] for c in _COLUMNAS_QUE_MANDA_LA_BASE}
+    return encontrados
+
+
 def existing_matching_keys(supabase_url: str, service_role_key: str, keys: list[str]) -> set[str]:
     """Subconjunto de `keys` que ya existe en consolidated_transactions.
 
@@ -184,22 +233,7 @@ def existing_matching_keys(supabase_url: str, service_role_key: str, keys: list[
     distintos (dentro de un mismo archivo la numeración de duplicados es
     por posición, ver procesar_todos.py — esto solo detecta y loguea, no
     decide sufijos)."""
-    if not keys:
-        return set()
-    encontrados: set[str] = set()
-    batch_size = 200
-    for i in range(0, len(keys), batch_size):
-        batch = keys[i:i + batch_size]
-        valores = ','.join(f'"{v}"' for v in batch)
-        resp = http.get(
-            f'{supabase_url}/rest/v1/consolidated_transactions',
-            params={'select': 'matching_key', 'matching_key': f'in.({valores})'},
-            headers=_headers(service_role_key),
-            timeout=30,
-        )
-        _raise_for_status(resp)
-        encontrados.update(r['matching_key'] for r in resp.json())
-    return encontrados
+    return set(filas_existentes(supabase_url, service_role_key, keys))
 
 
 def keys_del_dia_anterior(supabase_url: str, service_role_key: str) -> set[str]:

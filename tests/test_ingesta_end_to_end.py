@@ -11,9 +11,11 @@ sustituyendo únicamente Drive, Sheets y Supabase.
 
 import io
 import json
+from datetime import datetime
 from pathlib import Path
 
 import pytest
+import pytz
 
 import procesar_todos
 from utils import dry_run, supabase
@@ -148,11 +150,15 @@ def test_los_cheques_no_llegan_al_consolidado(bandeja):
 
 
 class _Resp:
-    def __init__(self, ok=True, texto=''):
+    def __init__(self, ok=True, texto='', datos=None):
         self.status_code = 200 if ok else 400
         self.text = texto
         self.url = 'https://x'
         self.request = None
+        self._datos = datos if datos is not None else []
+
+    def json(self):
+        return self._datos
 
     @property
     def ok(self):
@@ -169,15 +175,30 @@ def escribir_consolidado(monkeypatch):
 
     `con_columna=False` simula una base donde el ALTER TABLE de
     `payment_time` todavía no se corrió.
+
+    `ya_en_base` simula pagos que YA están en el consolidado: un diccionario
+    `matching_key -> {'registration_date': ..., 'identification': ...}` con lo
+    que la base tiene guardado hoy. Es el grupo que el export acumulado de
+    Stripe vuelve a traer todos los días.
     """
-    def correr(filas, con_columna=True):
+    def correr(filas, con_columna=True, ya_en_base=None):
         # El test de simulación de este mismo archivo deja el modo dry-run
         # prendido (es global), y con él `upsert` no escribe nada.
         dry_run.desactivar()
         supabase._PAYMENT_TIME_DISPONIBLE = None
+        guardados = ya_en_base or {}
         enviados: list[dict] = []
 
-        def _get(*_a, **_kw):
+        def _get(_url, params=None, **_kw):
+            params = params or {}
+            # La consulta de "¿cuáles de estos pagos ya existen?" se responde con
+            # la base simulada, y SOLO con las columnas que pidió — así la prueba
+            # mide de verdad qué se consulta, no una respuesta armada a mano.
+            if 'matching_key' in params:
+                pedidas = str(params.get('select', '')).split(',')
+                filas = [{c: {'matching_key': k, **v}.get(c) for c in pedidas}
+                         for k, v in guardados.items()]
+                return _Resp(datos=filas)
             return _Resp(con_columna,
                          '' if con_columna else
                          'column consolidated_transactions.payment_time does not exist')
@@ -188,7 +209,6 @@ def escribir_consolidado(monkeypatch):
 
         monkeypatch.setattr(supabase.http, 'get', _get)
         monkeypatch.setattr(supabase.http, 'post', _post)
-        monkeypatch.setattr(supabase, 'existing_matching_keys', lambda *_a, **_k: set())
 
         supabase.upsert('https://x', 'k', filas)
         return enviados
@@ -238,6 +258,92 @@ def test_sin_la_columna_la_ingesta_entra_igual(escribir_consolidado):
     assert len(enviados) == 1, 'el pago tiene que entrar igual'
     assert 'payment_time' not in enviados[0]
     assert enviados[0]['matching_key'] == '190093-1'
+
+
+# ---------------------------------------------------------------------------
+# Los pagos que YA existen (el atasco de Stripe, 2026-09-02)
+#
+# El export de Stripe es acumulado: cada archivo trae varios días de pagos, así
+# que en cada corrida una parte del lote YA está en el consolidado. Ese grupo se
+# mandaba SIN `registration_date` —para no re-sellarle la fecha de ingreso— y
+# PostgreSQL valida el NOT NULL antes de resolver el ON CONFLICT, así que
+# rechazaba la tanda entera (23502). Efecto: el archivo nunca se archiva, el
+# vigilante lo ve como trabajo nuevo y dispara la cadena cada 15 minutos.
+# ---------------------------------------------------------------------------
+
+def _fila_stripe(matching_key, identification):
+    """Un pago del export de Stripe. El documento llega VACÍO muy seguido."""
+    return ['x', identification, '11-08-2026', 'ch_1', '',
+            'quien.paga@example.com', 'STRIPE_USA', 'Diplomado',
+            '', 169.0, matching_key]
+
+
+def test_un_pago_que_ya_existe_conserva_su_fecha_de_ingreso(escribir_consolidado):
+    """La fecha de ingreso no se re-sella, pero tampoco se omite.
+
+    Omitirla es lo que rompe: la columna es NOT NULL y PostgreSQL la valida
+    antes de mirar el ON CONFLICT. Se manda la que la base ya tiene guardada —
+    cumple la restricción y el valor no se mueve, que era todo el objetivo.
+    """
+    enviados = escribir_consolidado(
+        [_fila_stripe('Andy Faz_2026-08-11_169', '69715127')],
+        ya_en_base={'Andy Faz_2026-08-11_169': {
+            'registration_date': '2026-08-11', 'identification': '69715127'}},
+    )
+
+    assert len(enviados) == 1
+    assert enviados[0]['registration_date'] == '2026-08-11', (
+        'ni la de hoy (re-sella) ni ausente (rechaza la tanda entera)')
+
+
+def test_un_pago_que_ya_existe_no_pierde_el_documento_corregido_a_mano(escribir_consolidado):
+    """El archivo NO puede pisar el documento que corrigió una persona.
+
+    Caso real: 59 pagos de Stripe tienen el documento puesto a mano, y en 55 de
+    ellos es porque el archivo lo trae VACÍO. Este camino nunca llegó a correr
+    en producción (siempre reventaba antes), así que al destrabarlo empezaría a
+    escribir la celda vacía encima y esos pagos perderían su cruce en silencio.
+    """
+    enviados = escribir_consolidado(
+        [_fila_stripe('Andy Faz_2026-08-11_169', '')],
+        ya_en_base={'Andy Faz_2026-08-11_169': {
+            'registration_date': '2026-08-11', 'identification': '69715127'}},
+    )
+
+    assert enviados[0]['identification'] == '69715127', (
+        'el documento de un pago que ya existe es el que la base tiene')
+
+
+def test_las_dos_tandas_llevan_las_mismas_claves(escribir_consolidado):
+    """PGRST102: un array de merge exige el mismo set de claves en cada objeto.
+
+    Es la razón por la que los pagos nuevos y los que ya existen van en dos POST
+    separados. Con la fecha de vuelta en su sitio los dos objetos son iguales,
+    así que la diferencia deja de existir — y si alguien vuelve a quitarle una
+    clave a un grupo, esta prueba lo caza.
+    """
+    enviados = escribir_consolidado(
+        [_fila_stripe('nuevo_1', '111'), _fila_stripe('viejo_1', '222')],
+        ya_en_base={'viejo_1': {
+            'registration_date': '2026-08-11', 'identification': '222'}},
+    )
+
+    assert len(enviados) == 2
+    assert {tuple(sorted(f)) for f in enviados} == {tuple(sorted(enviados[0]))}, (
+        'todos los objetos del lote tienen que compartir las claves')
+
+
+def test_un_pago_nuevo_estrena_la_fecha_de_hoy(escribir_consolidado):
+    """Guardo de regresión: el pago que entra por primera vez no cambia.
+
+    Pasa con el código viejo y con el nuevo — está para que arreglar el grupo
+    de los que ya existen no le toque la fecha a los que no.
+    """
+    hoy = datetime.now(pytz.timezone('America/Bogota')).strftime('%Y-%m-%d')
+    enviados = escribir_consolidado([_fila_stripe('nuevo_1', '111')])
+
+    assert enviados[0]['registration_date'] == hoy
+    assert enviados[0]['identification'] == '111'
 
 
 def test_dos_corridas_del_mismo_archivo_dan_las_mismas_llaves(bandeja):
