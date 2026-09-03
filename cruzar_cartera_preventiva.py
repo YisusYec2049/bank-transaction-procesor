@@ -176,13 +176,14 @@ import logging
 import os
 import re
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import pytz
 import requests
 from dotenv import load_dotenv
 
 from utils import dry_run
+from utils.dias_habiles import ventana_abierta, ventana_vencida
 from utils.parser import normalizar_nit, normalizar_sufijo
 from utils.supabase import (
     delete_by_keys,
@@ -1291,9 +1292,9 @@ def main():
 
     tz_bogota = pytz.timezone('America/Bogota')
     hoy = datetime.now(tz_bogota).strftime('%Y-%m-%d')
-    # La ventana de un pago llega hasta la corrida diaria del día siguiente, así
-    # que lo de ayer todavía es elegible: se sella recién al cerrar esta corrida.
-    ayer = (datetime.now(tz_bogota) - timedelta(days=1)).strftime('%Y-%m-%d')
+    # La ventana de un pago la decide `utils.dias_habiles` (dos corridas de día
+    # hábil, sin que el fin de semana ni los festivos le descuenten margen).
+    # Antes acá vivía un `ayer` de calendario que ya no hace falta.
 
     log.info('Cargando overrides y asociaciones existentes...')
     _cols_override = ('llave,cerrado_manual,fecha_pago_manual,valor_cuota_manual,'
@@ -1931,9 +1932,9 @@ def main():
     def _fuera_de_su_ventana(pago: dict) -> bool:
         """¿Es un pago que ya tuvo su oportunidad y no la usó?
 
-        REGLA VIGENTE (5 de agosto): la ventana de un pago va desde que entra
-        hasta **la corrida diaria del día siguiente** — esa corrida todavía
-        puede aplicarlo. Al terminarla queda **sellado**
+        REGLA VIGENTE (3 de septiembre): la ventana de un pago va desde que
+        entra hasta **la segunda corrida de un día hábil** — esa corrida
+        todavía puede aplicarlo. Al terminarla queda **sellado**
         (`cruce_cartera.aplicacion_cerrada_at`, ver `marcar_aplicacion_cerrada`)
         y no vuelve a mover plata nunca: ni solo, ni a mano, ni aunque después
         aparezca una cuota que calce exacto.
@@ -1943,15 +1944,30 @@ def main():
         1. **El sello**, que es el que manda. Está escrito en la base, así que
            no se puede recalcular mal ni depende de que ninguna fecha se
            conserve.
-        2. **La ventana de fechas** (hoy o ayer), que es la red mientras el
-           sello no exista o mientras la corrida diaria no haya pasado. Sin
-           ella, el día que se agregue la columna y todavía no se haya sellado
-           nada, TODO lo viejo quedaría elegible de golpe — medido el 5 de
-           agosto: 267 pagos por $247.448.773 cayendo sobre las cuotas nuevas.
+        2. **La ventana de días hábiles** (`utils.dias_habiles`), que es la red
+           mientras el sello no exista o mientras la corrida diaria no haya
+           pasado. Sin ella, el día que se agregue la columna y todavía no se
+           haya sellado nada, TODO lo viejo quedaría elegible de golpe — medido
+           el 5 de agosto: 267 pagos por $247.448.773 cayendo sobre las cuotas
+           nuevas.
 
-        Amplía en un día lo que regía desde el 3 de agosto (que cortaba a la
-        medianoche): un pago que entra el lunes por la tarde por el vigilante
-        alcanza la corrida del martes. Decisión explícita del usuario.
+        REGLA DEL USUARIO (3 de septiembre), del requerimiento 3 del área: **el
+        pago sobrevive DOS corridas de día hábil**, y sábados, domingos y
+        festivos no le descuentan margen. Textual: *"los pagos pueden entrar
+        sábado, domingo, festivo, lo que dé la gana, de momento no se trabaja
+        esos días, así que no entran a la automatización hasta el siguiente día
+        hábil o laboral"*.
+
+        Reemplaza la ventana de **un día calendario** que regía desde el 5 de
+        agosto (`entrada in (hoy, ayer)`), que tenía un agujero que nadie había
+        mirado: el fin de semana gastaba margen igual que un martes, así que un
+        pago que entraba el viernes se sellaba el **domingo**, sin que ninguna
+        persona hubiera tenido un día laborable para tocarlo. Medido sobre los
+        710 pagos sellados: **98 ($104.817.149) se sellaron con menos de dos
+        días hábiles**, 3 de ellos en la corrida del propio 3 de septiembre.
+
+        El cambio aplica **de aquí en adelante**: los ya sellados se quedan
+        sellados (decisión del usuario, *"no me han dicho eso"*).
 
         REGLA DEL USUARIO (3 de agosto): **un pago se reparte el día que entra
         al sistema. Si ese día no encontró cuota, no se reparte nunca más
@@ -1998,7 +2014,7 @@ def main():
         entrada = pago.get('registration_date')
         if not entrada:
             return False
-        return str(entrada)[:10] not in (hoy, ayer)
+        return not ventana_abierta(entrada, hoy)
 
     pagos_nuevos = [
         p for p in pagos_cruzados
@@ -2610,7 +2626,11 @@ def main():
             p['matching_key'] for p in pagos_cruzados
             if not p.get('aplicacion_cerrada_at')
             and p.get('registration_date')
-            and str(p['registration_date'])[:10] < hoy
+            # La misma función que decide la elegibilidad arriba, para que las
+            # dos no se puedan desalinear. En la corrida que completa los días
+            # hábiles el pago se aplica Y se sella: `ventana_abierta` usa `<=`
+            # y ésta `>=` sobre el mismo contador.
+            and ventana_vencida(p['registration_date'], hoy)
             and p['matching_key'] not in con_cuota
             and p['matching_key'] not in en_ledger
             and p['matching_key'] not in matching_keys_en_excel

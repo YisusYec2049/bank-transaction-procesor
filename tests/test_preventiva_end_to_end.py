@@ -362,6 +362,28 @@ def _dia_relativo(dias: int) -> str:
             + timedelta(days=dias)).strftime('%Y-%m-%d')
 
 
+def _entrada_con_habiles(n: int) -> str:
+    """Una fecha de entrada tal que HOY hayan pasado exactamente `n` días
+    hábiles desde ella.
+
+    Desde el 3 de septiembre la ventana de un pago se mide en días hábiles, así
+    que estas pruebas no pueden contar días de calendario: correr la suite un
+    lunes haría que "anteayer" fuera un sábado y el resultado cambiaría según el
+    día. Se busca hacia atrás con el mismo contador que usa el pipeline, así que
+    la prueba dice lo mismo cualquier día del año — incluido un fin de semana.
+    """
+    from datetime import date, timedelta
+
+    from utils.dias_habiles import habiles_transcurridos
+    hoy = date.fromisoformat(_hoy_bogota())
+    d = hoy
+    for _ in range(60):
+        if habiles_transcurridos(d, hoy) == n:
+            return d.isoformat()
+        d -= timedelta(days=1)
+    raise AssertionError(f'no se encontró una entrada con {n} días hábiles')
+
+
 def _mundo_de_un_pago(pago, cuotas=None):
     return {
         'cartera_cargas': [_carga(f'{_hoy_bogota()}T15:23:32+00:00')],
@@ -398,12 +420,16 @@ def test_un_pago_de_ayer_todavia_alcanza_la_corrida_de_hoy(mundo):
     assert float(cuota['valor_pago']) == 500_000
 
 
-def test_un_pago_de_anteayer_ya_no_entra(mundo):
-    """El otro borde: dos días es tarde aunque nadie lo haya sellado todavía.
-    Es la red que evita que, el día que se agregue la columna, TODO lo viejo
-    quede elegible de golpe."""
+def test_un_pago_pasados_sus_dos_dias_habiles_ya_no_entra(mundo):
+    """El otro borde: tres días hábiles es tarde aunque nadie lo haya sellado
+    todavía. Es la red que evita que, el día que se agregue la columna, TODO lo
+    viejo quede elegible de golpe.
+
+    Se mide en días HÁBILES desde el 3 de septiembre: con días de calendario
+    esta prueba pasaba o fallaba según el día de la semana en que se corriera.
+    """
     pago = _pago_cruzado('PAGO-DE-ANTEAYER', '1002003102', 'INS12', 500_000)
-    pago['registration_date'] = _dia_relativo(-2)
+    pago['registration_date'] = _entrada_con_habiles(3)
     capturado = mundo(ccp, tablas=_mundo_de_un_pago(
         pago, [_cuota('INS12-A', 'INS12', '1002003102', 500_000, '2026-08-13')]))
 
@@ -411,13 +437,32 @@ def test_un_pago_de_anteayer_ya_no_entra(mundo):
 
 
 def test_el_cierre_diario_sella_el_pago_que_se_quedo_sin_cuota(mundo):
+    """Se sella en la corrida que completa los DOS días hábiles, no antes."""
     pago = _pago_cruzado('PAGO-SIN-CUOTA', '1002003103', 'INS13', 500_000)
-    pago['registration_date'] = _dia_relativo(-1)
+    pago['registration_date'] = _entrada_con_habiles(2)
     capturado = mundo(ccp, tablas=_mundo_de_un_pago(pago),
                        argv=['--cierre-diario'])
 
     assert capturado.get('sellados') == ['PAGO-SIN-CUOTA']
     assert capturado.get('sellados_fecha') == _hoy_bogota()
+
+
+def test_el_cierre_diario_NO_sella_al_primer_dia_habil(mundo):
+    """El requerimiento 3 del área: con un solo día hábil el pago sigue vivo.
+
+    Antes del 3 de septiembre esta corrida lo sellaba, y con un pago que entraba
+    el viernes eso ocurría el domingo — sin que nadie hubiera tenido un día
+    laborable para tocarlo. Medido entonces: 98 pagos ($104.817.149) sellados
+    con menos de dos días hábiles.
+    """
+    pago = _pago_cruzado('PAGO-DE-AYER', '1002003113', 'INS23', 500_000)
+    pago['registration_date'] = _entrada_con_habiles(1)
+    capturado = mundo(ccp, tablas=_mundo_de_un_pago(pago),
+                       argv=['--cierre-diario'])
+
+    assert not capturado.get('sellados'), (
+        'se selló un pago que todavía tenía su segundo día hábil'
+    )
 
 
 def test_un_reproceso_manual_no_sella_nada(mundo):
