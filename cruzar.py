@@ -76,8 +76,12 @@ reales). Ahora, al inicio de main(), cada transacción se revisa contra:
     canal fijos (ID_CANAL_PAGO_LLAVE) — NO son cédulas de personas, son
     llaves de la universidad que aparecen idénticas en pagos de decenas de
     estudiantes distintos.
+  - Números de la UC (4 de septiembre): identification o email es el NIT de
+    la universidad o una de sus cuentas (NUMEROS_UC) — quien paga los
+    escribió en la referencia en vez de su cédula. Mismo problema que el
+    anterior, distinto origen.
 Las que matchean y todavía no están en pagos_apartados se insertan ahí
-(tipo='cesantias'/'pago_llave', origen='automatico') y se excluyen por
+(tipo='cesantias'/'pago_llave'/'numeros_uc', origen='automatico') y se excluyen por
 completo del cruce (ni INCP ni CORREO(2), tampoco _sugerir_por_cadencia) —
 si alguna ya estaba en cruce_cartera de una corrida anterior, se borra
 (retroactivo). Las que YA están en pagos_apartados con incp_resuelto
@@ -256,6 +260,31 @@ COINCIDENCIA_DIAS = 3
 # ni sugerirse por cadencia — se apartan del proceso por completo.
 ID_CANAL_PAGO_LLAVE = {'90473364', '800138188'}
 
+# Números de la UNIVERSIDAD que quien paga escribe en la referencia en vez de
+# su cédula: el NIT (con y sin dígito de verificación) y las dos cuentas de
+# Bancolombia. Tampoco identifican a nadie, y por el mismo motivo que los de
+# arriba — cada uno vive en la hoja de ingresos apuntando a decenas de
+# inscripciones distintas, porque muchos cometieron el mismo error antes y
+# cada caso se resolvió a mano. Medido el 4 de septiembre de 2026: el NIT con
+# DV está 55 veces con 32 inscripciones, la cuenta 2576 40 veces con 24.
+#
+# Así que un pago que traiga uno de estos sale SIEMPRE 'cruce_ambiguo', y
+# empeora solo: cada resolución manual le agrega una fila más a la hoja.
+# Pedido del área (requerimiento 4, 3 de septiembre de 2026): tratarlos igual
+# que cesantías o pago por llave — que aparezcan en el consolidado pero no
+# corran el proceso y se vayan de una a "pagos apartados", donde una persona
+# les escribe el INCP y vuelven al flujo con él.
+#
+# Se comparan por sus DÍGITOS, no por el texto: así '901032802-6' cae en la
+# misma bolsa sin tener que escribir cada variante a mano (la lección del 20
+# de agosto — aceptar las dos formas de un dato es mejor que elegir una).
+NUMEROS_UC = frozenset({
+    '901032802',    # NIT de la universidad
+    '9010328026',   # el mismo, con el dígito de verificación pegado
+    '16869342576',  # cuenta Bancolombia 2576
+    '19100002833',  # cuenta Bancolombia 2833
+})
+
 # Semilla fija para detectar cesantías por descripción (Bancolombia). NO
 # agregar fondos especulativos (PORVENIR, COLFONDOS...) que no aparecen en
 # los datos reales — decisión explícita del 16 de julio. "PAGO DE PROV" NO
@@ -279,6 +308,20 @@ def _es_cesantias(transaction_code_1: str, patrones_aprendidos: set[str]) -> boo
 
 def _es_pago_llave(identification: str, email: str) -> bool:
     return identification in ID_CANAL_PAGO_LLAVE or email in ID_CANAL_PAGO_LLAVE
+
+
+def _solo_digitos(valor: str) -> str:
+    return ''.join(c for c in str(valor or '') if c.isdigit())
+
+
+def _es_numeros_uc(identification: str, email: str) -> bool:
+    """True si el pago viene referenciado con un número de la universidad.
+
+    Mira los dos campos porque en Bancolombia el del correo es copia de la
+    referencia que reportó el banco: si el número equivocado entró por ahí,
+    tiene el mismo problema.
+    """
+    return any(_solo_digitos(v) in NUMEROS_UC for v in (identification, email) if v)
 
 
 def _inscripciones_en_valor(valor: str) -> list[str]:
@@ -1483,7 +1526,12 @@ def main():
         if _es_pago_llave(identification, email):
             tipo = 'pago_llave'
         elif _es_cesantias(t.get('transaction_code_1'), patrones_cesantias):
+            # Cesantías va ANTES que los números de la UC a propósito: la
+            # descripción dice de qué es el pago y el número solo dice que la
+            # referencia está mal, así que la etiqueta más informativa gana.
             tipo = 'cesantias'
+        elif _es_numeros_uc(identification, email):
+            tipo = 'numeros_uc'
         else:
             continue
         nuevas_apartadas.append({
@@ -1511,8 +1559,9 @@ def main():
         upsert_pagos_apartados(supabase_url, srk, nuevas_apartadas)
         n_cesantias = sum(1 for a in nuevas_apartadas if a['tipo'] == 'cesantias')
         n_llave     = sum(1 for a in nuevas_apartadas if a['tipo'] == 'pago_llave')
-        log.info('%d pago(s) apartados automáticamente (cesantias=%d, pago_llave=%d).',
-                  len(nuevas_apartadas), n_cesantias, n_llave)
+        n_uc        = sum(1 for a in nuevas_apartadas if a['tipo'] == 'numeros_uc')
+        log.info('%d pago(s) apartados automáticamente (cesantias=%d, pago_llave=%d, numeros_uc=%d).',
+                  len(nuevas_apartadas), n_cesantias, n_llave, n_uc)
 
     excluir_sin_incp    = {mk for mk, info in apartados_map.items() if not info.get('incp_resuelto')}
     reintegrar_con_incp = {mk: info['incp_resuelto'] for mk, info in apartados_map.items()

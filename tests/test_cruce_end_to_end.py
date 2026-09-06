@@ -131,6 +131,90 @@ def test_pago_por_llave_sale_del_proceso(mundo):
     assert 'PAGO-1' not in _filas(capturado), 'un pago apartado no va al cruce'
 
 
+@pytest.mark.parametrize('numero', [
+    '901032802',     # NIT de la universidad
+    '9010328026',    # el mismo, con el dígito de verificación pegado
+    '901032802-6',   # y escrito con guion: se compara por dígitos
+    '16869342576',   # cuenta Bancolombia 2576
+    '19100002833',   # cuenta Bancolombia 2833
+])
+def test_los_numeros_de_la_universidad_salen_del_proceso(mundo, numero):
+    """Quien paga escribió el NIT o la cuenta de la UC en vez de su cédula.
+
+    Ese número no es de nadie: en la hoja de ingresos apunta a decenas de
+    inscripciones distintas, así que el pago salía 'cruce_ambiguo' siempre y
+    sin salida. Requerimiento 4 del área (3 de septiembre de 2026): se aparta,
+    como cesantías o pago por llave, para que alguien le escriba el INCP.
+    """
+    capturado = mundo(cruzar, tablas={
+        'consolidated_transactions': [_pago('PAGO-1', identification=numero)],
+        'cartera_inscrip': [],
+    })
+
+    apartados = {a['matching_key']: a for a in capturado.get('pagos_apartados', [])}
+    assert 'PAGO-1' in apartados, 'un número de la UC debió apartarse del proceso'
+    assert apartados['PAGO-1']['tipo'] == 'numeros_uc'
+    assert 'PAGO-1' not in _filas(capturado), 'un pago apartado no va al cruce'
+
+
+def test_el_numero_de_la_universidad_tambien_se_mira_en_el_correo(mundo):
+    """En Bancolombia el campo del correo es copia de la referencia del banco.
+
+    Si el número equivocado entró por ahí, tiene el mismo problema: no puede
+    quedar fuera solo porque el documento venga vacío.
+    """
+    capturado = mundo(cruzar, tablas={
+        'consolidated_transactions': [_pago('PAGO-1', email='16869342576')],
+        'cartera_inscrip': [],
+    })
+
+    assert any(a['matching_key'] == 'PAGO-1'
+               for a in capturado.get('pagos_apartados', []))
+
+
+def test_una_cedula_normal_no_se_confunde_con_un_numero_de_la_uc(mundo):
+    """La guarda del cambio: el resto de los pagos siguen cruzando igual."""
+    capturado = mundo(cruzar, tablas={
+        'consolidated_transactions': [_pago('PAGO-1', identification='1032445566')],
+        'cartera_inscrip': [{'numero_id': '1032445566', 'id_inscripcion': '4321PN'}],
+    })
+
+    assert not capturado.get('pagos_apartados'), 'no debió apartarse nada'
+    assert _filas(capturado)['PAGO-1']['estado_cruce'] == 'cruzado'
+
+
+def test_un_pago_de_la_uc_con_incp_escrito_a_mano_vuelve_al_proceso(mundo):
+    """Es lo que hace útil apartarlo: no es un callejón sin salida.
+
+    Cuando alguien le escribe el INCP desde el panel de Pagos Apartados, el
+    pago vuelve al cruce con ese INCP forzado y cierra 'cruzado'.
+    """
+    capturado = mundo(cruzar, tablas={
+        'consolidated_transactions': [_pago('PAGO-1', identification='901032802')],
+        'pagos_apartados': [{'matching_key': 'PAGO-1', 'tipo': 'numeros_uc',
+                             'incp_resuelto': '4321PN'}],
+        'cartera_inscrip': [],
+    })
+
+    fila = _filas(capturado)['PAGO-1']
+    assert fila['estado_cruce'] == 'cruzado'
+    assert fila['incp'] == '4321PN'
+
+
+def test_las_cesantias_conservan_su_etiqueta_aunque_traigan_un_numero_de_la_uc(mundo):
+    """La descripción dice de qué es el pago; el número solo dice que la
+    referencia está mal. Gana la etiqueta más informativa."""
+    pago = _pago('PAGO-1', identification='901032802')
+    pago['transaction_code_1'] = 'PAGO DE PROV PROTECCION SA'
+
+    capturado = mundo(cruzar, tablas={
+        'consolidated_transactions': [pago], 'cartera_inscrip': [],
+    })
+
+    apartados = {a['matching_key']: a for a in capturado.get('pagos_apartados', [])}
+    assert apartados['PAGO-1']['tipo'] == 'cesantias'
+
+
 def test_una_fila_ya_cerrada_no_se_recalcula(mundo):
     """Lo que resolvió una persona no se pisa.
 
