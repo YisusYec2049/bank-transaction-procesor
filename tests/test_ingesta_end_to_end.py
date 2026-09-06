@@ -73,11 +73,15 @@ def bandeja(monkeypatch):
         # la corre no prueba lo mismo en dos máquinas.
         monkeypatch.setattr(procesar_todos, 'load_dotenv', lambda *_a, **_k: None)
 
-        monkeypatch.setattr(procesar_todos, '_build_services', lambda: 'drive')
-        monkeypatch.setattr(procesar_todos, 'list_files',
-                            lambda _d, _f: [{'id': 'f1', 'name': 'extracto.pdf'}])
-        monkeypatch.setattr(procesar_todos, 'download_file',
-                            lambda _d, _i: io.BytesIO(b'%PDF'))
+        # El script pide archivos por BANDEJA y no sabe de dónde salen: se
+        # simula la capa `utils/origen`, no Drive. El `origen` que viaja en cada
+        # archivo es lo que decide a quién le pide el contenido y dónde lo
+        # archiva, así que tiene que estar puesto igual que en producción.
+        monkeypatch.setattr(procesar_todos, 'listar',
+                            lambda _b: [{'id': 'f1', 'name': 'extracto.pdf',
+                                         'origen': 'drive', 'fuente': banco}])
+        monkeypatch.setattr(procesar_todos, 'descargar',
+                            lambda _a: io.BytesIO(b'%PDF'))
 
         paginas = json.loads((FIXTURES / fixture_pdf).read_text(encoding='utf-8'))
         modulo = procesar_todos.BANCOS_BANCOLOMBIA[banco]['mod']
@@ -95,8 +99,8 @@ def bandeja(monkeypatch):
         monkeypatch.setattr(procesar_todos, 'existing_matching_keys',
                             lambda *_a, **_k: set())
         monkeypatch.setattr(procesar_todos, 'select_all', lambda *_a, **_k: [])
-        monkeypatch.setattr(procesar_todos, 'move_file',
-                            lambda _d, fid, _dest: movidos.append(fid))
+        monkeypatch.setattr(procesar_todos, 'mover_a_historico',
+                            lambda archivo, _b: (movidos.append(archivo['id']), True)[1])
 
         procesar_todos.main()
         escrito['_movidos'] = movidos

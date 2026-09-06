@@ -33,8 +33,6 @@ from datetime import datetime
 
 import pytz
 from dotenv import load_dotenv
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
 
 import fuentes.bancolombia_2576 as mod_bc2576
 import fuentes.bancolombia_2833 as mod_bc2833
@@ -45,8 +43,7 @@ import fuentes.placetopay as mod_placetopay
 import fuentes.stripe as mod_stripe
 import fuentes.wompi as mod_wompi
 from utils import dry_run
-from utils.drive import download_pdf as download_file
-from utils.drive import list_files, move_file
+from utils.origen import Bandeja, descargar, listar, mover_a_historico
 from utils.supabase import (
     existing_matching_keys,
     keys_del_dia_anterior,
@@ -62,10 +59,6 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 log = logging.getLogger(__name__)
-
-SCOPES = [
-    'https://www.googleapis.com/auth/drive',
-]
 
 BANCOS = {
     # dedup_sufijo: True para bancos cuya matching_key es fecha+documento+monto
@@ -97,13 +90,10 @@ _PIPELINE = [
 ]
 
 
-# ── Google API ────────────────────────────────────────────────────────────────
-
-def _build_services():
-    creds  = service_account.Credentials.from_service_account_file(
-        os.environ['GOOGLE_SA_JSON'], scopes=SCOPES
-    )
-    return build('drive', 'v3', credentials=creds, cache_discovery=False)
+# El cliente de Drive ya no se arma acá: lo construye y lo cachea `utils/origen`,
+# que es quien decide de qué sitio sale cada archivo. Este script pasó a pedir
+# archivos por bandeja y no sabe —ni tiene por qué saber— si vinieron de Drive o
+# del depósito de la plataforma.
 
 
 # ── Dedup / colisiones de matching_key ────────────────────────────────────────
@@ -282,18 +272,19 @@ def _apartar_cheques(cheques: list[tuple], banco: str, supabase_url: str, srk: s
 
 # ── Procesamiento genérico ────────────────────────────────────────────────────
 
-def _procesar_banco(drive, banco: str, cfg: dict,
+def _procesar_banco(banco: str, cfg: dict,
                     yesterday_keys: set[str], dry_run: bool):
     mod    = cfg['mod']
     prefix = cfg['prefix']
     inbox  = os.environ.get(f'{prefix}_INBOX_FOLDER_ID', '')
     hist   = os.environ.get(f'{prefix}_HISTORICO_FOLDER_ID', '')
+    bandeja = Bandeja(fuente=banco, drive_entrada=inbox, drive_historico=hist)
 
     if not inbox:
         log.warning('[%s] Sin INBOX configurado, saltando.', banco)
         return
 
-    archivos = list_files(drive, inbox)
+    archivos = listar(bandeja)
     if not archivos:
         log.info('[%s] Sin archivos nuevos.', banco)
         return
@@ -305,12 +296,11 @@ def _procesar_banco(drive, banco: str, cfg: dict,
     skip_supa    = os.environ.get('SKIP_SUPABASE', '').lower() == 'true'
 
     for f in archivos:
-        fid   = f['id']
         fname = f['name']
         log.info('[%s] Procesando: %s', banco, fname)
 
         try:
-            buf        = download_file(drive, fid)
+            buf        = descargar(f)
             raw_rows   = mod.parse_file(buf, fname)
             if not raw_rows:
                 log.warning('[%s] Sin filas válidas, se deja en Inbox para revisión: %s', banco, fname)
@@ -343,8 +333,7 @@ def _procesar_banco(drive, banco: str, cfg: dict,
                         _alertar_colision_supabase(filtradas, banco, supabase_url, srk)
                     upsert(supabase_url, srk, filtradas)
 
-            if hist:
-                move_file(drive, fid, hist)
+            if mover_a_historico(f, bandeja):
                 log.info('[%s] Movido a Histórico: %s', banco, fname)
 
         except Exception:
@@ -353,18 +342,19 @@ def _procesar_banco(drive, banco: str, cfg: dict,
 
 # ── Bancolombia (PDFs con lógica de cheques) ─────────────────────────────────
 
-def _procesar_bancolombia(drive, banco: str, cfg: dict,
+def _procesar_bancolombia(banco: str, cfg: dict,
                           yesterday_keys: set[str], dry_run: bool):
     mod    = cfg['mod']
     prefix = cfg['prefix']
     inbox  = os.environ.get(f'{prefix}_INBOX_FOLDER_ID', '')
     hist   = os.environ.get(f'{prefix}_HISTORICO_FOLDER_ID', '')
+    bandeja = Bandeja(fuente=banco, drive_entrada=inbox, drive_historico=hist)
 
     if not inbox:
         log.warning('[%s] Sin INBOX configurado, saltando.', banco)
         return
 
-    archivos = list_files(drive, inbox)
+    archivos = listar(bandeja)
     if not archivos:
         log.info('[%s] Sin archivos nuevos.', banco)
         return
@@ -376,12 +366,11 @@ def _procesar_bancolombia(drive, banco: str, cfg: dict,
     skip_supa    = os.environ.get('SKIP_SUPABASE', '').lower() == 'true'
 
     for f in archivos:
-        fid   = f['id']
         fname = f['name']
         log.info('[%s] Procesando: %s', banco, fname)
 
         try:
-            buf        = download_file(drive, fid)
+            buf        = descargar(f)
             raw_rows   = mod.parse_pdf(buf)
             if not raw_rows:
                 log.warning('[%s] Sin filas válidas, se deja en Inbox para revisión: %s', banco, fname)
@@ -412,8 +401,7 @@ def _procesar_bancolombia(drive, banco: str, cfg: dict,
                 else:
                     log.info('[%s] SKIP_SUPABASE=true — no se escribe nada.', banco)
 
-            if hist:
-                move_file(drive, fid, hist)
+            if mover_a_historico(f, bandeja):
                 log.info('[%s] Movido a Histórico: %s', banco, fname)
 
         except Exception:
@@ -422,18 +410,23 @@ def _procesar_bancolombia(drive, banco: str, cfg: dict,
 
 # ── PayU (caso especial: dos archivos) ────────────────────────────────────────
 
-def _procesar_payu(drive, yesterday_keys: set[str], dry_run: bool):
+def _procesar_payu(yesterday_keys: set[str], dry_run: bool):
     payu_inbox   = os.environ.get('PAYU_INBOX_FOLDER_ID', '')
     moneda_inbox = os.environ.get('PAYU_MONEDA_INBOX_FOLDER_ID', '')
     payu_hist    = os.environ.get('PAYU_HISTORICO_FOLDER_ID', '')
     moneda_hist  = os.environ.get('PAYU_MONEDA_HISTORICO_FOLDER_ID', payu_hist)
 
+    bandeja_payu   = Bandeja(fuente='payu', drive_entrada=payu_inbox,
+                             drive_historico=payu_hist)
+    bandeja_moneda = Bandeja(fuente='payu_moneda', drive_entrada=moneda_inbox,
+                             drive_historico=moneda_hist)
+
     if not payu_inbox or not moneda_inbox:
         log.warning('[PAYU] Sin INBOX configurado, saltando.')
         return
 
-    payu_files   = list_files(drive, payu_inbox)
-    moneda_files = list_files(drive, moneda_inbox)
+    payu_files   = listar(bandeja_payu)
+    moneda_files = listar(bandeja_moneda)
 
     if not payu_files and not moneda_files:
         log.info('[PAYU] Sin archivos nuevos.')
@@ -449,8 +442,8 @@ def _procesar_payu(drive, yesterday_keys: set[str], dry_run: bool):
         log.info('[PAYU] Par: %s + %s', pf['name'], mf['name'])
 
         try:
-            payu_buf   = download_file(drive, pf['id'])
-            moneda_buf = download_file(drive, mf['id'])
+            payu_buf   = descargar(pf)
+            moneda_buf = descargar(mf)
             raw_rows   = mod_payu.parse_file(payu_buf, moneda_buf,
                                              payu_filename=pf['name'],
                                              moneda_filename=mf['name'])
@@ -482,10 +475,8 @@ def _procesar_payu(drive, yesterday_keys: set[str], dry_run: bool):
                 else:
                     log.info('[PAYU] SKIP_SUPABASE=true — no se escribe nada.')
 
-            if payu_hist:
-                move_file(drive, pf['id'], payu_hist)
-            if moneda_hist:
-                move_file(drive, mf['id'], moneda_hist)
+            mover_a_historico(pf, bandeja_payu)
+            mover_a_historico(mf, bandeja_moneda)
 
         except Exception:
             log.exception('[PAYU] Error procesando par %s / %s', pf['name'], mf['name'])
@@ -525,8 +516,6 @@ def main():
     if args.dry_run:
         log.info('=== DRY RUN activado ===')
 
-    drive = _build_services()
-
     # Llaves del último día con ingresos, para no re-escribir lo que ya entró.
     yesterday_keys = keys_del_dia_anterior(
         os.environ['SUPABASE_URL'], os.environ['SUPABASE_SERVICE_ROLE_KEY'])
@@ -536,12 +525,12 @@ def main():
         if args.bank and args.bank != banco:
             continue
         if tipo == 'payu':
-            _procesar_payu(drive, yesterday_keys, args.dry_run)
+            _procesar_payu(yesterday_keys, args.dry_run)
         elif tipo == 'bancolombia':
-            _procesar_bancolombia(drive, banco, BANCOS_BANCOLOMBIA[banco],
+            _procesar_bancolombia(banco, BANCOS_BANCOLOMBIA[banco],
                                   yesterday_keys, args.dry_run)
         else:
-            _procesar_banco(drive, banco, BANCOS[banco],
+            _procesar_banco(banco, BANCOS[banco],
                             yesterday_keys, args.dry_run)
 
     log.info('procesar_todos.py completado.')

@@ -48,8 +48,6 @@ import pytz
 from dotenv import load_dotenv
 
 from utils import dry_run
-from utils.drive import build_drive_service, find_latest_any_file, move_file
-from utils.drive import download_pdf as download_file
 from utils.excel_cartera import (
     read_bancolombia_2576,
     read_bancolombia_2833,
@@ -58,6 +56,7 @@ from utils.excel_cartera import (
     read_stripe_usa,
     read_wompi,
 )
+from utils.origen import Bandeja, descargar, mas_reciente, mover_a_historico
 from utils.supabase import (
     delete_by_keys,
     replace_cartera_preventiva_staging,
@@ -100,28 +99,27 @@ def _registrar_carga_staged(supabase_url: str, srk: str, filas: int) -> str:
     return carga_id
 
 
-def _procesar_opcional(drive, nombre: str, folder_id: str, hist_folder_id: str,
-                        buscar_archivo, cargar) -> None:
-    """Patrón común a los 3 archivos de referencia: buscar en su carpeta →
+def _procesar_opcional(nombre: str, bandeja: Bandeja, cargar) -> None:
+    """Patrón común a los 3 archivos de referencia: buscar en su bandeja →
     si está, descargar + cargar (`cargar` hace el replace_table y devuelve
     True/False según si tocó la tabla) + mover a Histórico; si no está,
-    loguear y seguir SIN error — los 3 son opcionales."""
-    file_id = buscar_archivo(drive, folder_id)
-    if not file_id:
-        log.info('%s: no hay archivo en su carpeta (%s) esta corrida, se omite.', nombre, folder_id)
+    loguear y seguir SIN error — los 3 son opcionales.
+
+    Cada bandeja está dedicada a un solo tipo de archivo, así que se toma el
+    más reciente que haya sin importar cómo se llame."""
+    archivo = mas_reciente(bandeja)
+    if not archivo:
+        log.info('%s: no hay archivo en su carpeta (%s) esta corrida, se omite.',
+                 nombre, bandeja.drive_entrada)
         return
 
     log.info('Descargando %s ...', nombre)
-    ok = cargar(drive, file_id)
+    ok = cargar(archivo)
     if not ok:
         return  # `cargar` ya logueó por qué no se movió (ej. lectura vacía)
 
-    if hist_folder_id:
-        move_file(drive, file_id, hist_folder_id)
+    if mover_a_historico(archivo, bandeja):
         log.info('%s movido a Histórico.', nombre)
-    else:
-        log.warning('%s cargado, pero no se movió a Histórico: falta el ID de carpeta '
-                    '(*_HIST_FOLDER_ID) en .env.', nombre)
 
 
 def main():
@@ -164,18 +162,16 @@ def main():
                    'CARTERA_DRIVE_FOLDER_ID como fallback).')
         sys.exit(1)
 
-    drive = build_drive_service(sa_json)
-
-    def _cargar_payu_uc(drive, file_id) -> bool:
-        rows = read_inscrip(download_file(drive, file_id))
+    def _cargar_payu_uc(archivo) -> bool:
+        rows = read_inscrip(descargar(archivo))
         if not rows:
             log.warning('Payu UC: 0 filas leídas, se omite la carga (no se toca cartera_inscrip).')
             return False
         replace_table(supabase_url, srk, 'cartera_inscrip', rows)
         return True
 
-    def _cargar_ingresos(drive, file_id) -> bool:
-        ingresos_bytes = download_file(drive, file_id).read()
+    def _cargar_ingresos(archivo) -> bool:
+        ingresos_bytes = descargar(archivo).read()
         bc2576_rows = read_bancolombia_2576(io.BytesIO(ingresos_bytes))
         bc2833_rows = read_bancolombia_2833(io.BytesIO(ingresos_bytes))
         wompi_rows  = read_wompi(io.BytesIO(ingresos_bytes))
@@ -198,8 +194,8 @@ def main():
                       '(se conserva la carga anterior).')
         return True
 
-    def _cargar_cartera_prev(drive, file_id) -> bool:
-        rows = read_cartera_preventiva(download_file(drive, file_id))
+    def _cargar_cartera_prev(archivo) -> bool:
+        rows = read_cartera_preventiva(descargar(archivo))
         ok = replace_cartera_preventiva_staging(supabase_url, srk, rows)
         if ok:
             carga_id = _registrar_carga_staged(supabase_url, srk, len(rows))
@@ -207,17 +203,22 @@ def main():
                       len(rows), carga_id)
         return ok
 
-    # Cada carpeta es dedicada a un tipo: se toma el archivo más reciente que
-    # haya en ella, sin importar el nombre (find_latest_any_file). El `nombre`
-    # que se pasa es solo la etiqueta para los logs.
-    _procesar_opcional(drive, PAYU_UC_FILENAME, payu_uc_folder_id, payu_uc_hist_folder_id,
-                       lambda d, f: find_latest_any_file(d, f), _cargar_payu_uc)
+    # El `nombre` que se pasa es solo la etiqueta para los logs; la bandeja es
+    # la que sabe de dónde sale el archivo y a dónde se archiva.
+    _procesar_opcional(PAYU_UC_FILENAME,
+                       Bandeja(fuente='payu_uc', drive_entrada=payu_uc_folder_id,
+                               drive_historico=payu_uc_hist_folder_id),
+                       _cargar_payu_uc)
 
-    _procesar_opcional(drive, INGRESOS_FILENAME, ingresos_folder_id, ingresos_hist_folder_id,
-                       lambda d, f: find_latest_any_file(d, f), _cargar_ingresos)
+    _procesar_opcional(INGRESOS_FILENAME,
+                       Bandeja(fuente='ingresos', drive_entrada=ingresos_folder_id,
+                               drive_historico=ingresos_hist_folder_id),
+                       _cargar_ingresos)
 
-    _procesar_opcional(drive, CARTERA_PREV_PATTERN, cartera_prev_folder_id, cartera_prev_hist_folder_id,
-                       lambda d, f: find_latest_any_file(d, f), _cargar_cartera_prev)
+    _procesar_opcional(CARTERA_PREV_PATTERN,
+                       Bandeja(fuente='cartera_prev', drive_entrada=cartera_prev_folder_id,
+                               drive_historico=cartera_prev_hist_folder_id),
+                       _cargar_cartera_prev)
 
     log.info('sync_cartera.py completado.')
 

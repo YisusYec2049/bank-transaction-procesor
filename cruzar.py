@@ -222,9 +222,8 @@ import requests
 from dotenv import load_dotenv
 
 from utils import dry_run
-from utils.drive import build_drive_service, find_all_files, move_file
-from utils.drive import download_pdf as download_file
 from utils.excel_cartera import read_pagos_wompi_reporte
+from utils.origen import Bandeja, descargar, mover_a_historico, todos_los_que_contienen
 from utils.parser import normalizar_nit as _normalizar_nit
 from utils.parser import normalizar_sufijo as _normalizar_sufijo
 from utils.supabase import (
@@ -775,6 +774,20 @@ def _con_y_sin_digito(rows: list[dict]) -> list[dict]:
     return out
 
 
+def _bandeja_reporte_wompi(folder_id: str) -> Bandeja:
+    """La bandeja del ReportePagosWompi.
+
+    Su Histórico tiene su propia variable y cae al de WOMPI si no está puesta,
+    que es como venía funcionando desde que se archivan estos reportes.
+    """
+    return Bandeja(
+        fuente='wompi_reporte',
+        drive_entrada=folder_id,
+        drive_historico=(os.environ.get('WOMPI_REPORTE_HISTORICO_FOLDER_ID', '')
+                         or os.environ.get('WOMPI_HISTORICO_FOLDER_ID', '')),
+    )
+
+
 def _cargar_lookup_wompi_reporte(sa_json: str, folder_id: str) -> tuple[dict[str, dict], bool, list[dict]]:
     """Lee TODOS los ReportePagosWompi_*.xlsx que haya en la carpeta de Drive
     y arma {id_transaccion: {pagador, comprobante, inscripcion, id_transaccion,
@@ -815,8 +828,8 @@ def _cargar_lookup_wompi_reporte(sa_json: str, folder_id: str) -> tuple[dict[str
                     'se omite el cruce NOMBRE/CI/MÉTODO DE PAGO de WOMPI.')
         return {}, False, []
 
-    drive = build_drive_service(sa_json)
-    archivos = find_all_files(drive, folder_id, WOMPI_REPORTE_PATTERN)
+    archivos = todos_los_que_contienen(_bandeja_reporte_wompi(folder_id),
+                                       WOMPI_REPORTE_PATTERN)
     if not archivos:
         log.warning('No se encontró ningún archivo "%s*" en la carpeta de Drive (%s), '
                     'se omite el cruce NOMBRE/CI/MÉTODO DE PAGO de WOMPI esta corrida.',
@@ -829,7 +842,7 @@ def _cargar_lookup_wompi_reporte(sa_json: str, folder_id: str) -> tuple[dict[str
     # o sea a la entrega más nueva.
     for f in archivos:
         try:
-            filas = read_pagos_wompi_reporte(download_file(drive, f['id']))
+            filas = read_pagos_wompi_reporte(descargar(f))
         except Exception:
             log.exception('ReportePagosWompi: no se pudo leer %s, se omite ese archivo.', f['name'])
             continue
@@ -863,18 +876,16 @@ def _archivar_reportes_wompi(sa_json: str, archivos: list[dict]) -> None:
     antes, los archivos siguen en su sitio y la corrida siguiente los reintenta."""
     if len(archivos) < 2:
         return
-    destino = (os.environ.get('WOMPI_REPORTE_HISTORICO_FOLDER_ID', '')
-               or os.environ.get('WOMPI_HISTORICO_FOLDER_ID', ''))
-    if not destino:
+    bandeja = _bandeja_reporte_wompi(os.environ.get('WOMPI_REPORTE_DRIVE_FOLDER_ID', ''))
+    if not bandeja.drive_historico:
         log.warning('Sin carpeta de Histórico configurada para el ReportePagosWompi, '
                     'se dejan los %d archivo(s) en su sitio.', len(archivos))
         return
 
-    drive = build_drive_service(sa_json)
     for f in archivos[:-1]:
         try:
-            move_file(drive, f['id'], destino)
-            log.info('ReportePagosWompi movido a Histórico: %s', f['name'])
+            if mover_a_historico(f, bandeja):
+                log.info('ReportePagosWompi movido a Histórico: %s', f['name'])
         except Exception:
             log.exception('No se pudo mover %s a Histórico (se queda en la carpeta).', f['name'])
 

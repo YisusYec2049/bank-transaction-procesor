@@ -79,7 +79,7 @@ import sys
 from dotenv import load_dotenv
 
 from procesar_todos import BANCOS, BANCOS_BANCOLOMBIA
-from utils.drive import build_drive_service, find_all_files, list_files
+from utils.origen import Bandeja, listar, todos_los_que_contienen
 
 # force=True porque importar procesar_todos ya configuró el logger raíz, y la
 # primera llamada gana: sin esto el prefijo [vigilante] se perdía y en
@@ -150,12 +150,12 @@ def _carpetas_referencia() -> list[tuple[str, str]]:
     return carpetas
 
 
-def hay_trabajo(drive) -> bool:
+def hay_trabajo() -> bool:
     encontrado = False
 
     # 1. Los archivos de REFERENCIA, primero: son contra lo que se cruza.
     for etiqueta, folder_id in _carpetas_referencia():
-        archivos = list_files(drive, folder_id)
+        archivos = listar(Bandeja(fuente=etiqueta, drive_entrada=folder_id))
         if archivos:
             log.info('%s: %d archivo(s) esperando -> %s',
                      etiqueta, len(archivos), ', '.join(f['name'] for f in archivos[:5]))
@@ -167,7 +167,9 @@ def hay_trabajo(drive) -> bool:
     # un archivo" no puede ser la señal. La señal es tener DOS O MÁS.
     reporte_folder = os.environ.get('WOMPI_REPORTE_DRIVE_FOLDER_ID', '')
     if reporte_folder:
-        reportes = find_all_files(drive, reporte_folder, WOMPI_REPORTE_PATTERN)
+        reportes = todos_los_que_contienen(
+            Bandeja(fuente='wompi_reporte', drive_entrada=reporte_folder),
+            WOMPI_REPORTE_PATTERN)
         if len(reportes) >= 2:
             log.info('ReportePagosWompi: %d entregas sin archivar -> %s',
                      len(reportes), ', '.join(f['name'] for f in reportes))
@@ -175,7 +177,7 @@ def hay_trabajo(drive) -> bool:
 
     # 2. Las bandejas de los bancos y pasarelas, después.
     for etiqueta, folder_id in _bandejas():
-        archivos = list_files(drive, folder_id)
+        archivos = listar(Bandeja(fuente=etiqueta, drive_entrada=folder_id))
         if archivos:
             log.info('%s: %d archivo(s) esperando -> %s',
                      etiqueta, len(archivos), ', '.join(f['name'] for f in archivos[:5]))
@@ -199,8 +201,7 @@ def main():
         sys.exit(0 if args.dry_run else 0)
 
     try:
-        drive = build_drive_service(sa_json)
-        encontrado = hay_trabajo(drive)
+        encontrado = hay_trabajo()
     except Exception:
         # Ante un fallo de Drive se deja pasar la cadena a propósito: un
         # cargue que se queda sin procesar es peor que una corrida de más,
