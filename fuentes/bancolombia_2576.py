@@ -176,7 +176,16 @@ def _build_sucursal_lookup(pdf_bytes: io.BytesIO) -> dict:
 
 # ── API pública ───────────────────────────────────────────────────────────────
 
-def parse_pdf(pdf_bytes: io.BytesIO) -> list[dict]:
+def parse_pdf(pdf_bytes: io.BytesIO, stats: dict | None = None) -> list[dict]:
+    """Los pagos del extracto. En `stats['brutas']` deja cuántos MOVIMIENTOS se
+    reconocieron antes de filtrar.
+
+    Ese número separa dos cosas que hasta hoy se confundían, y la diferencia
+    decide si el archivo se archiva o se queda en la bandeja: un extracto que
+    **no se pudo leer** (0 brutas) es un problema; uno que se leyó entero y
+    resultó no traer ningún pago de estudiante (N brutas, 0 válidas) ya hizo su
+    trabajo. Ver el comentario largo en `bancolombia_2833.parse_pdf`.
+    """
     suc_lookup = _build_sucursal_lookup(pdf_bytes)
     pdf_bytes.seek(0)
 
@@ -263,6 +272,8 @@ def parse_pdf(pdf_bytes: io.BytesIO) -> list[dict]:
     # Las colisiones de matching_key que esto genera las numera
     # _asignar_sufijos_duplicados() en procesar_todos.py (Fase 1.2).
     log.info('parse_pdf 2576: %d brutas → %d tras filtros', len(filas), len(validas))
+    if stats is not None:
+        stats['brutas'] = len(filas)
     return validas
 
 

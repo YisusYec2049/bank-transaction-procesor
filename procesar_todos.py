@@ -390,11 +390,40 @@ def _procesar_bancolombia(banco: str, cfg: dict,
         try:
             buf        = descargar(f)
             hf, tam    = registro.huella(buf), len(buf.getvalue())
-            raw_rows   = mod.parse_pdf(buf)
+            stats      = {}
+            raw_rows   = mod.parse_pdf(buf, stats)
             if not raw_rows:
-                log.warning('[%s] Sin filas válidas, se deja en Inbox para revisión: %s', banco, fname)
-                registro.anotar(f, huella_contenido=hf, tamano=tam, filas_leidas=0,
-                                resultado='error', detalle='Sin filas válidas')
+                brutas = stats.get('brutas', 0)
+                if brutas:
+                    # Se leyó entero y no traía ningún pago de estudiante: solo
+                    # liquidaciones del datáfono y de PSE (plata que ya entra por
+                    # las pasarelas), el 4x1000, intereses del ahorro o pagos a
+                    # proveedores. El archivo YA HIZO SU TRABAJO, así que se
+                    # archiva.
+                    #
+                    # Hasta el 2026-09-06 se quedaba en la bandeja, confundido
+                    # con un archivo ilegible, y el vigilante lo veía como
+                    # trabajo nuevo: dos extractos de 2833 dispararon la cadena
+                    # cada 15 minutos durante 11 días.
+                    #
+                    # Que esto no esconda un filtro roto es responsabilidad del
+                    # registro: la fila queda con sus N líneas leídas y 0 pagos,
+                    # visible desde la pantalla sin que el archivo tenga que
+                    # atascarse para avisar.
+                    log.info('[%s] %d movimiento(s) leídos, ninguno es un pago: %s',
+                             banco, brutas, fname)
+                    registro.anotar(f, huella_contenido=hf, tamano=tam,
+                                    filas_leidas=brutas, pagos_nuevos=0,
+                                    detalle='Sin pagos: solo movimientos de la cuenta '
+                                            'o plata que ya reporta la pasarela')
+                    if mover_a_historico(f, bandeja):
+                        log.info('[%s] Movido a Histórico: %s', banco, fname)
+                else:
+                    log.warning('[%s] No se pudo leer ningún movimiento, se deja en Inbox '
+                                'para revisión: %s', banco, fname)
+                    registro.anotar(f, huella_contenido=hf, tamano=tam, filas_leidas=0,
+                                    resultado='error',
+                                    detalle='No se reconoció ningún movimiento en el archivo')
                 continue
 
             normalized = mod.normalize(raw_rows)

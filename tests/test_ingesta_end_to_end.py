@@ -89,6 +89,14 @@ def bandeja(monkeypatch):
 
         escrito: dict[str, list] = {}
         movidos: list[str] = []
+        anotados: list[dict] = []
+
+        # El registro habla con Supabase, y estas pruebas corren sin red ni
+        # credenciales. Se captura en vez de dejarlo fallar: sin esto cada
+        # archivo procesado intenta una petición HTTP que muere por DNS, y el
+        # error queda tapado por la guarda de `registro.anotar`.
+        monkeypatch.setattr(procesar_todos.registro, 'anotar',
+                            lambda archivo, **kw: anotados.append({'nombre': archivo['name'], **kw}))
 
         monkeypatch.setattr(procesar_todos, 'upsert',
                             lambda _u, _k, filas: escrito.setdefault('consolidado', []).extend(filas))
@@ -99,11 +107,16 @@ def bandeja(monkeypatch):
         monkeypatch.setattr(procesar_todos, 'existing_matching_keys',
                             lambda *_a, **_k: set())
         monkeypatch.setattr(procesar_todos, 'select_all', lambda *_a, **_k: [])
+        # El de verdad NO mueve nada en simulación: el freno vive en la puerta
+        # (`utils/drive.py`), no en este script. El doble tiene que hacer lo
+        # mismo, o una prueba de dry-run mediría el doble y no el código.
         monkeypatch.setattr(procesar_todos, 'mover_a_historico',
-                            lambda archivo, _b: (movidos.append(archivo['id']), True)[1])
+                            lambda archivo, _b: True if dry_run.activo()
+                            else (movidos.append(archivo['id']), True)[1])
 
         procesar_todos.main()
         escrito['_movidos'] = movidos
+        escrito['_anotados'] = anotados
         return escrito
 
     return correr
@@ -360,3 +373,55 @@ def test_dos_corridas_del_mismo_archivo_dan_las_mismas_llaves(bandeja):
     una = [f[10] for f in bandeja('bc2576', 'bc2576_extracto.json')['consolidado']]
     otra = [f[10] for f in bandeja('bc2576', 'bc2576_extracto.json')['consolidado']]
     assert una == otra
+
+
+# ── Un archivo que se leyó pero no traía pagos ───────────────────────────────
+
+def _extracto_sin_pagos(monkeypatch, brutas):
+    """Simula un extracto que el parser lee bien y cuyas líneas se filtran
+    TODAS: solo liquidaciones del datáfono, de PSE, el 4x1000 e intereses."""
+    def _parse(_buf, stats=None):
+        if stats is not None:
+            stats['brutas'] = brutas
+        return []
+    monkeypatch.setattr(procesar_todos.BANCOS_BANCOLOMBIA['bc2576']['mod'], 'parse_pdf', _parse)
+
+
+def test_un_extracto_leido_sin_pagos_se_archiva(bandeja, monkeypatch):
+    """Ya hizo su trabajo. Dejarlo en la bandeja lo convierte en trabajo eterno:
+    el vigilante lo ve como archivo nuevo y dispara la cadena cada 15 minutos —
+    dos extractos de 2833 lo hicieron durante 11 días."""
+    _extracto_sin_pagos(monkeypatch, brutas=21)
+
+    escrito = bandeja('bc2576', 'bc2576_extracto.json')
+
+    assert escrito['_movidos'] == ['f1'], 'el archivo se quedó atascado en la bandeja'
+    assert not escrito.get('consolidado')
+
+    # Y queda constancia: 21 líneas leídas, 0 pagos. Es lo que permite archivarlo
+    # sin esconder un filtro roto — la visibilidad ya no depende de que el
+    # archivo se atasque.
+    anotado = escrito['_anotados'][0]
+    assert anotado['filas_leidas'] == 21
+    assert anotado['pagos_nuevos'] == 0
+    assert anotado.get('resultado', 'ok') == 'ok'
+
+
+def test_un_extracto_que_no_se_pudo_leer_se_queda_en_la_bandeja(bandeja, monkeypatch):
+    """El otro caso, que hasta hoy se confundía con el anterior: si no se
+    reconoció NINGÚN movimiento, el archivo puede estar roto y tiene que quedar
+    a la vista."""
+    _extracto_sin_pagos(monkeypatch, brutas=0)
+
+    escrito = bandeja('bc2576', 'bc2576_extracto.json')
+
+    assert escrito['_movidos'] == [], 'un archivo ilegible no se puede archivar'
+    assert escrito['_anotados'][0]['resultado'] == 'error'
+
+
+def test_un_extracto_sin_pagos_tampoco_se_archiva_en_simulacion(bandeja, monkeypatch):
+    _extracto_sin_pagos(monkeypatch, brutas=21)
+
+    escrito = bandeja('bc2576', 'bc2576_extracto.json', argv_extra=('--dry-run',))
+
+    assert escrito['_movidos'] == []
