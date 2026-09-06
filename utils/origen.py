@@ -16,16 +16,13 @@ Lo que NO cambia, y es la mitad del valor: los parsers, la deduplicación, las
 llaves, el apartado de cheques y todo el cruce siguen recibiendo exactamente lo
 mismo. Un archivo tiene que producir los mismos pagos entre por donde entre.
 
-Estado (Fase 1). Detrás solo está Drive: este módulo es hoy una capa fina sobre
-`utils/drive.py`, a propósito, para poder demostrar con el modo simulación que
-no cambió ni un dato antes de agregarle nada. El depósito entra en la Fase 2, y
-el único punto que hay que tocar para eso son las tres funciones marcadas con
-`origen == DRIVE`.
+El orden de lectura es **primero el depósito y después Drive**, en una sola
+lista: decisión del usuario del 2026-09-05, Drive pasa a ser el camino
+secundario mientras el área cambia su rutina. No es cosmético — para PayU el
+orden de la lista decide qué archivo se empareja con cuál.
 
-Sobre el orden de lectura: cuando exista el depósito, `listar()` devolverá
-primero lo suyo y después lo de Drive —decisión del usuario, Drive pasa a ser
-secundario— en una sola lista. Importa además para PayU, donde el orden de la
-lista decide qué archivo se empareja con cuál.
+Si `DEPOSITO_BUCKET` no está configurada, el depósito se apaga entero y esto se
+comporta igual que antes de que existiera.
 """
 
 from __future__ import annotations
@@ -35,6 +32,7 @@ import logging
 import os
 from dataclasses import dataclass
 
+from utils import deposito as _deposito
 from utils import drive as _drive
 
 log = logging.getLogger(__name__)
@@ -49,10 +47,11 @@ DEPOSITO = 'deposito'
 class Bandeja:
     """Una fuente y sus dos direcciones.
 
-    `fuente` es el nombre corto ('wompi', 'bc2576', 'cartera_prev'): hoy solo
-    se usa para etiquetar y para los logs, y en la Fase 2 será además la
-    carpeta dentro del depósito (`entrada/<fuente>/`), que por eso NO necesita
-    una variable de entorno propia.
+    `fuente` es el nombre corto ('wompi', 'bc2576', 'cartera_prev') y es además
+    la carpeta dentro del depósito (`entrada/<fuente>/`), que por eso NO
+    necesita una variable de entorno propia. ⚠️ Cambiarle el nombre a una fuente
+    cambia dónde busca el pipeline, y tiene que coincidir con lo que escribe la
+    pantalla de carga de `financial-platform`.
 
     Las dos de Drive son los identificadores de carpeta de siempre. Vacías
     significa "esta bandeja no tiene lado de Drive", que es lo que va a pasar
@@ -102,10 +101,17 @@ def listar(bandeja: Bandeja) -> list[dict]:
     ascendente y pagina hasta agotar la carpeta: sin paginar, los que se perdían
     eran justamente los últimos, o sea los más nuevos.
     """
-    if not bandeja.drive_entrada:
-        return []
-    return _como_archivos(_drive.list_files(_drive_svc(), bandeja.drive_entrada),
-                          bandeja, DRIVE)
+    archivos: list[dict] = []
+
+    # El depósito va PRIMERO: es el camino nuevo y Drive el de respaldo.
+    if _deposito.activo():
+        archivos += _como_archivos(_deposito.listar(bandeja.fuente), bandeja, DEPOSITO)
+
+    if bandeja.drive_entrada:
+        archivos += _como_archivos(_drive.list_files(_drive_svc(), bandeja.drive_entrada),
+                                   bandeja, DRIVE)
+
+    return archivos
 
 
 def mas_reciente(bandeja: Bandeja) -> dict | None:
@@ -134,6 +140,8 @@ def descargar(archivo: dict) -> io.BytesIO:
     """Baja el contenido del archivo, venga de donde venga."""
     if archivo['origen'] == DRIVE:
         return _drive.download_pdf(_drive_svc(), archivo['id'])
+    if archivo['origen'] == DEPOSITO:
+        return _deposito.descargar(archivo['id'])
     raise ValueError(f'Origen desconocido: {archivo.get("origen")!r}')
 
 
@@ -160,6 +168,12 @@ def mover_a_historico(archivo: dict, bandeja: Bandeja) -> bool:
                         bandeja.fuente, archivo['name'])
             return False
         _drive.move_file(_drive_svc(), archivo['id'], bandeja.drive_historico)
+        return True
+
+    if archivo['origen'] == DEPOSITO:
+        # El destino no se configura: se deriva de la fuente, igual que la
+        # entrada. Por eso el depósito no puede quedarse "sin histórico".
+        _deposito.mover_a_historico(archivo['id'], archivo['fuente'], archivo['name'])
         return True
 
     raise ValueError(f'Origen desconocido: {archivo.get("origen")!r}')

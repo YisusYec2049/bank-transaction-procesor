@@ -4,8 +4,8 @@ Las pruebas de ingesta sustituyen `listar`/`descargar`/`mover_a_historico`
 enteras, así que sin este archivo la capa nueva no tendría ninguna prueba: el
 día que alguien rompa el despacho por origen, todo seguiría en verde.
 
-Acá se prueba la capa contra un Drive simulado, que es la única dependencia
-externa que tiene hoy.
+Acá se prueba la capa contra sus dos dependencias simuladas: Drive y el
+depósito.
 """
 
 import io
@@ -120,3 +120,86 @@ def test_un_origen_desconocido_falla_a_gritos(drive, accion):
             origen.descargar(archivo)
         else:
             origen.mover_a_historico(archivo, BANDEJA)
+
+
+# ── El depósito, y la convivencia con Drive ──────────────────────────────────
+
+class _DepositoFalso:
+    """Se hace pasar por `utils.deposito`."""
+
+    def __init__(self, archivos=None, encendido=True):
+        self.archivos = archivos if archivos is not None else []
+        self.encendido = encendido
+        self.descargados: list[str] = []
+        self.archivados: list[tuple[str, str, str]] = []
+
+    def activo(self):
+        return self.encendido
+
+    def listar(self, fuente):
+        return [{'id': f'entrada/{fuente}/{n}', 'name': n} for n in self.archivos]
+
+    def descargar(self, ruta):
+        self.descargados.append(ruta)
+        return io.BytesIO(b'del deposito')
+
+    def mover_a_historico(self, ruta, fuente, nombre):
+        self.archivados.append((ruta, fuente, nombre))
+
+
+@pytest.fixture
+def deposito(monkeypatch):
+    falso = _DepositoFalso(['subido.pdf'])
+    monkeypatch.setattr(origen, '_deposito', falso)
+    return falso
+
+
+def test_el_deposito_va_primero_y_drive_despues(drive, deposito):
+    """Decisión del usuario: Drive pasa a ser el camino secundario. El orden no
+    es cosmético — para PayU decide qué archivo se empareja con cuál."""
+    archivos = origen.listar(BANDEJA)
+
+    assert [a['name'] for a in archivos] == ['subido.pdf', 'extracto viejo.pdf',
+                                             'ReportePagosWompi_20260903.xlsx']
+    assert [a['origen'] for a in archivos] == [origen.DEPOSITO, origen.DRIVE, origen.DRIVE]
+
+
+def test_sin_deposito_configurado_todo_sigue_como_antes(drive, deposito):
+    """Con `DEPOSITO_BUCKET` vacía el pipeline se comporta igual que antes de
+    que el depósito existiera. Es lo que permite desplegar el código antes de
+    crear el bucket."""
+    deposito.encendido = False
+
+    archivos = origen.listar(BANDEJA)
+    assert [a['origen'] for a in archivos] == [origen.DRIVE, origen.DRIVE]
+
+
+def test_cada_archivo_se_descarga_de_donde_vino(drive, deposito):
+    delDeposito, deDrive = origen.listar(BANDEJA)[0], origen.listar(BANDEJA)[1]
+
+    assert origen.descargar(delDeposito).read() == b'del deposito'
+    assert origen.descargar(deDrive).read() == b'contenido'
+    assert deposito.descargados == ['entrada/wompi/subido.pdf']
+    assert drive.descargados == ['a']
+
+
+def test_cada_archivo_se_archiva_donde_vino(drive, deposito):
+    """Un archivo que entró por la pantalla no puede terminar archivado en
+    Drive, ni al revés: son dos mundos que conviven sin pisarse."""
+    delDeposito, deDrive = origen.listar(BANDEJA)[0], origen.listar(BANDEJA)[1]
+
+    assert origen.mover_a_historico(delDeposito, BANDEJA) is True
+    assert origen.mover_a_historico(deDrive, BANDEJA) is True
+
+    assert deposito.archivados == [('entrada/wompi/subido.pdf', 'wompi', 'subido.pdf')]
+    assert drive.movidos == [('a', 'carpeta-hist')]
+
+
+def test_el_deposito_no_depende_de_que_drive_este_configurado(deposito, monkeypatch):
+    """El día que se apague Drive, una bandeja sin carpeta tiene que seguir
+    entregando lo que subió el área."""
+    monkeypatch.setattr(origen, '_drive', _DriveFalso([]))
+    origen.reiniciar()
+
+    archivos = origen.listar(origen.Bandeja(fuente='wompi'))
+    assert [a['origen'] for a in archivos] == [origen.DEPOSITO]

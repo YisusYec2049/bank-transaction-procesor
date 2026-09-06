@@ -7,6 +7,7 @@ compartido es la **única** autenticación que hay, así que conviene que su
 comparación esté fijada por una prueba.
 """
 
+import contextlib
 import os
 
 import pytest
@@ -259,3 +260,114 @@ def test_sync_comparte_el_carril_del_pipeline():
     finally:
         trigger_server._state['status'] = 'idle'
         trigger_server._pendiente = None
+
+
+# ── La ingesta: la corrida que lee los archivos ──────────────────────────────
+
+def _espiar_scripts(monkeypatch):
+    ejecutados = []
+
+    class _Res:
+        returncode, stdout, stderr = 0, '', ''
+
+    monkeypatch.setattr(trigger_server.subprocess, 'run',
+                        lambda cmd, **_kw: ejecutados.append(cmd) or _Res())
+    return ejecutados
+
+
+def test_la_ingesta_lee_los_archivos_y_despues_cruza(monkeypatch):
+    """Es el único disparador que corre `procesar_todos.py`: los otros tres
+    trabajan sobre pagos que YA entraron. Y el orden importa — `cruzar.py` deja
+    el cruce al día y cartera preventiva lee de ahí."""
+    ejecutados = _espiar_scripts(monkeypatch)
+
+    trigger_server._correr_cadena(sync=True, ingesta=True)
+
+    nombres = [cmd[1].split('/')[-1] for cmd in ejecutados]
+    assert nombres == ['sync_cartera.py', 'procesar_todos.py',
+                       'cruzar.py', 'cruzar_cartera_preventiva.py']
+
+
+def test_la_ingesta_NO_sella(monkeypatch):
+    """El sello lo pone únicamente la corrida de las 9:30. Un botón no puede
+    cerrarle la puerta a un pago: el sello no se deshace desde la pantalla."""
+    ejecutados = _espiar_scripts(monkeypatch)
+
+    trigger_server._correr_cadena(sync=True, ingesta=True)
+
+    assert all('--cierre-diario' not in cmd for cmd in ejecutados)
+
+
+def test_ningun_otro_disparador_lee_archivos(monkeypatch):
+    """Si `procesar_todos.py` se colara en el reproceso de un pago, corregir un
+    documento metería archivos nuevos de contrabando."""
+    for kwargs in ({'sync': True, 'solo': None}, {'sync': False, 'solo': 'PAGO-1'},
+                   {'sync': True, 'solo_sync': True}):
+        ejecutados = _espiar_scripts(monkeypatch)
+        trigger_server._correr_cadena(**kwargs)
+        assert all('procesar_todos.py' not in cmd[1] for cmd in ejecutados), kwargs
+
+
+def test_una_ingesta_encolada_le_gana_a_un_pago_puntual():
+    """La cola colapsa siempre al alcance MÁS AMPLIO: si mientras corre algo se
+    piden una ingesta y un pago suelto, la re-corrida tiene que ser la ingesta
+    completa. Quedarse con el pago dejaría los archivos sin entrar."""
+    trigger_server._pendiente = {'sync': False, 'solo': 'PAGO-1',
+                                 'solo_sync': False, 'ingesta': False}
+    trigger_server._state['status'] = 'running'
+    try:
+        with trigger_server.app.test_request_context('/'):
+            trigger_server._disparar(sync=True, ingesta=True)
+        assert trigger_server._pendiente['ingesta'] is True
+        assert trigger_server._pendiente['solo'] is None
+        assert trigger_server._pendiente['solo_sync'] is False
+    finally:
+        trigger_server._pendiente = None
+        trigger_server._state['status'] = 'idle'
+
+
+# ── El candado que se comparte con el cron ───────────────────────────────────
+
+def test_el_boton_espera_a_que_el_cron_suelte_el_candado(monkeypatch, tmp_path):
+    """Hasta el 2026-09-06 el cron y este servicio NO se protegían entre sí: el
+    cron usaba un archivo en /tmp y el servicio un candado en memoria, y encima
+    la unidad de systemd le da su propio /tmp. Dos corridas a la vez reparten
+    plata sobre las mismas cuotas."""
+    import fcntl
+
+    candado = tmp_path / 'pipeline.lock'
+    monkeypatch.setattr(trigger_server, 'CANDADO', str(candado))
+
+    otro = open(candado, 'w')
+    fcntl.flock(otro, fcntl.LOCK_EX)
+    try:
+        with pytest.raises(TimeoutError):
+            with trigger_server._candado_del_pipeline(espera_s=0):
+                raise AssertionError('no debía entrar con el candado tomado')
+    finally:
+        fcntl.flock(otro, fcntl.LOCK_UN)
+        otro.close()
+
+
+def test_con_el_candado_libre_la_corrida_entra(monkeypatch, tmp_path):
+    monkeypatch.setattr(trigger_server, 'CANDADO', str(tmp_path / 'pipeline.lock'))
+
+    with trigger_server._candado_del_pipeline(espera_s=0):
+        pass
+
+    # Y queda libre al salir: dos corridas seguidas no se bloquean entre sí.
+    with trigger_server._candado_del_pipeline(espera_s=0):
+        pass
+
+
+def test_el_candado_se_suelta_aunque_la_corrida_falle(monkeypatch, tmp_path):
+    """Si un error dejara el candado tomado, el cron se quedaría sin correr
+    para siempre y nadie lo notaría hasta que faltaran pagos."""
+    monkeypatch.setattr(trigger_server, 'CANDADO', str(tmp_path / 'pipeline.lock'))
+
+    with contextlib.suppress(RuntimeError):
+        with trigger_server._candado_del_pipeline(espera_s=0):
+            raise RuntimeError('revienta a mitad')
+
+    with trigger_server._candado_del_pipeline(espera_s=0):
+        pass

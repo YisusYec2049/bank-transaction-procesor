@@ -42,7 +42,7 @@ import fuentes.payu as mod_payu
 import fuentes.placetopay as mod_placetopay
 import fuentes.stripe as mod_stripe
 import fuentes.wompi as mod_wompi
-from utils import dry_run
+from utils import deposito, dry_run, registro
 from utils.origen import Bandeja, descargar, listar, mover_a_historico
 from utils.supabase import (
     existing_matching_keys,
@@ -76,6 +76,17 @@ BANCOS_BANCOLOMBIA = {
     'bc2576': {'mod': mod_bc2576, 'prefix': 'BC2576'},
     'bc2833': {'mod': mod_bc2833, 'prefix': 'BC2833'},
 }
+
+# Las 13 carpetas del depósito. Incluye las 4 de referencia, que las consumen
+# `sync_cartera.py` y `cruzar.py` — se limpian desde acá porque la caducidad es
+# una sola tarea y este script es el que corre siempre primero en la cadena.
+# ⚠️ Tienen que coincidir con lo que escribe la pantalla de carga: el nombre de
+# la fuente ES la carpeta.
+FUENTES_DEL_DEPOSITO = [
+    'bc2576', 'bc2833', 'placetopay', 'wompi', 'stripe', 'colpatria',
+    'davivienda', 'payu', 'payu_moneda',
+    'payu_uc', 'ingresos', 'cartera_prev', 'wompi_reporte',
+]
 
 # Orden de procesamiento (coincide con el orden en el consolidado)
 _PIPELINE = [
@@ -301,9 +312,12 @@ def _procesar_banco(banco: str, cfg: dict,
 
         try:
             buf        = descargar(f)
+            hf, tam    = registro.huella(buf), len(buf.getvalue())
             raw_rows   = mod.parse_file(buf, fname)
             if not raw_rows:
                 log.warning('[%s] Sin filas válidas, se deja en Inbox para revisión: %s', banco, fname)
+                registro.anotar(f, huella_contenido=hf, tamano=tam, filas_leidas=0,
+                                resultado='error', detalle='Sin filas válidas')
                 continue
 
             normalized = mod.normalize(raw_rows)
@@ -333,11 +347,15 @@ def _procesar_banco(banco: str, cfg: dict,
                         _alertar_colision_supabase(filtradas, banco, supabase_url, srk)
                     upsert(supabase_url, srk, filtradas)
 
+            registro.anotar(f, huella_contenido=hf, tamano=tam,
+                            filas_leidas=len(normalized), pagos_nuevos=len(filtradas))
+
             if mover_a_historico(f, bandeja):
                 log.info('[%s] Movido a Histórico: %s', banco, fname)
 
-        except Exception:
+        except Exception as e:
             log.exception('[%s] Error procesando %s', banco, fname)
+            registro.anotar(f, resultado='error', detalle=str(e))
 
 
 # ── Bancolombia (PDFs con lógica de cheques) ─────────────────────────────────
@@ -371,9 +389,12 @@ def _procesar_bancolombia(banco: str, cfg: dict,
 
         try:
             buf        = descargar(f)
+            hf, tam    = registro.huella(buf), len(buf.getvalue())
             raw_rows   = mod.parse_pdf(buf)
             if not raw_rows:
                 log.warning('[%s] Sin filas válidas, se deja en Inbox para revisión: %s', banco, fname)
+                registro.anotar(f, huella_contenido=hf, tamano=tam, filas_leidas=0,
+                                resultado='error', detalle='Sin filas válidas')
                 continue
 
             normalized = mod.normalize(raw_rows)
@@ -401,14 +422,90 @@ def _procesar_bancolombia(banco: str, cfg: dict,
                 else:
                     log.info('[%s] SKIP_SUPABASE=true — no se escribe nada.', banco)
 
+            registro.anotar(f, huella_contenido=hf, tamano=tam,
+                            filas_leidas=len(normalized), pagos_nuevos=len(filtradas))
+
             if mover_a_historico(f, bandeja):
                 log.info('[%s] Movido a Histórico: %s', banco, fname)
 
-        except Exception:
+        except Exception as e:
             log.exception('[%s] Error procesando %s', banco, fname)
+            registro.anotar(f, resultado='error', detalle=str(e))
 
 
 # ── PayU (caso especial: dos archivos) ────────────────────────────────────────
+
+# La pantalla de carga sube los dos archivos de un par con el mismo prefijo,
+# separado del nombre real por esto. Es lo que reemplaza al emparejamiento por
+# orden de llegada.
+_SEPARADOR_LOTE = '__'
+
+
+def _lote_de(nombre: str) -> str:
+    """El lote que le puso la pantalla al subir el archivo, o '' si no tiene.
+
+    Un archivo que entra por Drive nunca lo trae, y por eso los dos caminos
+    tienen que convivir mientras Drive siga vivo.
+    """
+    if _SEPARADOR_LOTE not in nombre:
+        return ''
+    return nombre.split(_SEPARADOR_LOTE, 1)[0].strip()
+
+
+def _emparejar_payu(payu_files: list[dict], moneda_files: list[dict]):
+    """Junta cada archivo de PayU con su Moneda. Devuelve (pares, sobrantes).
+
+    Hasta hoy esto se hacía **por orden de llegada** —el primero de una bandeja
+    con el primero de la otra—, que es correcto solo si los dos archivos se
+    suben siempre juntos y en orden. Está anotado como riesgo desde agosto: un
+    par mal armado no falla, produce pagos con el monto de otra tanda.
+
+    Regla nueva: **un archivo que trae lote SOLO se empareja con su lote.** Si
+    su pareja todavía no llegó, espera a la próxima corrida en vez de agarrar
+    la que haya — que es justo el error que se está corrigiendo. Los que no
+    traen lote (los de Drive) se siguen emparejando por orden entre ellos.
+    """
+    pares: list[tuple[dict, dict]] = []
+
+    moneda_por_lote: dict[str, list[dict]] = {}
+    for mf in moneda_files:
+        lote = _lote_de(mf['name'])
+        if lote:
+            moneda_por_lote.setdefault(lote, []).append(mf)
+
+    emparejadas: set[int] = set()
+    payu_sueltos: list[dict] = []
+
+    for pf in payu_files:
+        lote = _lote_de(pf['name'])
+        if not lote:
+            payu_sueltos.append(pf)
+            continue
+        candidatas = moneda_por_lote.get(lote) or []
+        if candidatas:
+            mf = candidatas.pop(0)
+            emparejadas.add(id(mf))
+            pf['lote'] = mf['lote'] = lote      # queda en el registro del archivo
+            pares.append((pf, mf))
+        else:
+            log.warning('[PAYU] %s espera a su archivo de Moneda (lote %s).', pf['name'], lote)
+
+    moneda_sueltas = [mf for mf in moneda_files
+                      if not _lote_de(mf['name']) and id(mf) not in emparejadas]
+
+    # Lo que no trae lote conserva el comportamiento de siempre.
+    while payu_sueltos and moneda_sueltas:
+        pares.append((payu_sueltos.pop(0), moneda_sueltas.pop(0)))
+
+    # Los que traen lote y se quedaron sin pareja vuelven a la lista de
+    # sobrantes, para que el aviso del final los cuente.
+    payu_sueltos += [pf for pf in payu_files
+                     if _lote_de(pf['name'])
+                     and not any(pf is p for p, _ in pares)]
+    moneda_sueltas += [mf for mf in moneda_files
+                       if _lote_de(mf['name']) and id(mf) not in emparejadas]
+
+    return pares, payu_sueltos, moneda_sueltas
 
 def _procesar_payu(yesterday_keys: set[str], dry_run: bool):
     payu_inbox   = os.environ.get('PAYU_INBOX_FOLDER_ID', '')
@@ -436,20 +533,31 @@ def _procesar_payu(yesterday_keys: set[str], dry_run: bool):
     srk          = os.environ['SUPABASE_SERVICE_ROLE_KEY']
     skip_supa    = os.environ.get('SKIP_SUPABASE', '').lower() == 'true'
 
-    while payu_files and moneda_files:
-        pf = payu_files.pop(0)
-        mf = moneda_files.pop(0)
+    pares, payu_files, moneda_files = _emparejar_payu(payu_files, moneda_files)
+
+    for pf, mf in pares:
         log.info('[PAYU] Par: %s + %s', pf['name'], mf['name'])
 
         try:
             payu_buf   = descargar(pf)
             moneda_buf = descargar(mf)
+            # Los dos archivos del par se anotan por separado, con su propia
+            # huella: la pantalla avisa del repetido archivo por archivo.
+            # Por `id` y no por nombre: los dos archivos viven en bandejas
+            # distintas y pueden llamarse igual, y ahí una clave por nombre
+            # dejaría a los dos con la huella del mismo archivo.
+            huellas = {pf['id']: (registro.huella(payu_buf), len(payu_buf.getvalue())),
+                       mf['id']: (registro.huella(moneda_buf), len(moneda_buf.getvalue()))}
             raw_rows   = mod_payu.parse_file(payu_buf, moneda_buf,
                                              payu_filename=pf['name'],
                                              moneda_filename=mf['name'])
             if not raw_rows:
                 log.warning('[PAYU] Sin filas tras JOIN, se dejan en Inbox para revisión: %s + %s',
                             pf['name'], mf['name'])
+                for a in (pf, mf):
+                    registro.anotar(a, huella_contenido=huellas[a['id']][0],
+                                    tamano=huellas[a['id']][1], filas_leidas=0,
+                                    resultado='error', detalle='Sin filas tras el JOIN')
                 continue
 
             normalized = mod_payu.normalize(raw_rows)
@@ -475,11 +583,23 @@ def _procesar_payu(yesterday_keys: set[str], dry_run: bool):
                 else:
                     log.info('[PAYU] SKIP_SUPABASE=true — no se escribe nada.')
 
+            # Los pagos los produce el PAR, así que se cuentan UNA vez: van en
+            # la fila del archivo de PayU. Si se anotaran en las dos, sumar la
+            # columna daría el doble de lo que entró.
+            registro.anotar(pf, huella_contenido=huellas[pf['id']][0],
+                            tamano=huellas[pf['id']][1],
+                            filas_leidas=len(normalized), pagos_nuevos=len(filtradas))
+            registro.anotar(mf, huella_contenido=huellas[mf['id']][0],
+                            tamano=huellas[mf['id']][1],
+                            detalle=f'Par de {pf["name"]}')
+
             mover_a_historico(pf, bandeja_payu)
             mover_a_historico(mf, bandeja_moneda)
 
-        except Exception:
+        except Exception as e:
             log.exception('[PAYU] Error procesando par %s / %s', pf['name'], mf['name'])
+            for a in (pf, mf):
+                registro.anotar(a, resultado='error', detalle=str(e))
 
     if payu_files:
         log.warning('[PAYU] %d archivo(s) PayU sin pareja Moneda.', len(payu_files))
@@ -532,6 +652,16 @@ def main():
         else:
             _procesar_banco(banco, BANCOS[banco],
                             yesterday_keys, args.dry_run)
+
+    # Los archivos del depósito caducan a los 3 meses (decisión del usuario del
+    # 2026-09-06). Va al final y sin poder tumbar nada: es limpieza, no proceso.
+    # Las filas de `archivos_procesados` NO se tocan — el aviso de "esto ya se
+    # procesó" tiene que valer para siempre.
+    try:
+        if deposito.activo():
+            deposito.caducar(FUENTES_DEL_DEPOSITO)
+    except Exception:
+        log.exception('No se pudo caducar el histórico del depósito (la corrida ya terminó bien).')
 
     log.info('procesar_todos.py completado.')
     if dry_run.activo():

@@ -33,10 +33,13 @@ autenticación, así que este servicio NUNCA debe quedar expuesto sin proxy/
 Funnel delante y sin el token configurado.
 """
 
+import contextlib
+import fcntl
 import hmac
 import os
 import subprocess
 import threading
+import time
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
@@ -47,6 +50,22 @@ load_dotenv()
 TRIGGER_TOKEN = os.environ["TRIGGER_TOKEN"]
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 PYTHON = os.path.join(REPO_DIR, "venv", "bin", "python3")
+
+# El MISMO archivo que toma el cron con `flock`. Hasta el 2026-09-06 el cron se
+# protegía con `/tmp/matching.lock` y este servicio solo con un candado en
+# memoria: **no se protegían entre sí**, y encima la unidad de systemd tiene
+# `PrivateTmp=true`, así que este proceso ni siquiera veía ese archivo. O sea
+# que una corrida del cron y un botón podían repartir plata sobre las mismas
+# cuotas al mismo tiempo.
+#
+# Vive en `logs/` porque es la única carpeta que la unidad deja escribir
+# (`ReadWritePaths`) y ya es del usuario `matching`, así que los dos lo ven.
+CANDADO = os.path.join(REPO_DIR, "logs", "pipeline.lock")
+
+# Cuánto espera el botón a que termine una corrida del cron antes de rendirse.
+# Una cadena completa tarda ~3 minutos; 10 le dan margen de sobra sin dejar el
+# hilo colgado para siempre si algo se traba del otro lado.
+ESPERA_CANDADO_S = 600
 
 app = Flask(__name__)
 
@@ -75,7 +94,40 @@ _state_cartera = {
 }
 
 
-def _correr_cadena(sync: bool, solo: str | None = None, solo_sync: bool = False):
+@contextlib.contextmanager
+def _candado_del_pipeline(espera_s: int = ESPERA_CANDADO_S):
+    """Toma el mismo candado que usa el cron, o se rinde avisando.
+
+    El cron lo toma con `flock -n`: si este servicio lo tiene, esa corrida del
+    cron se salta el turno y vuelve en el siguiente, que es lo correcto — el
+    trabajo es idempotente. Acá al revés se ESPERA, porque detrás de un botón
+    hay una persona mirando y su cambio tiene que aplicarse.
+
+    Si no se consigue en `espera_s`, se levanta la mano en vez de correr igual:
+    correr en paralelo con el cron es lo que este candado existe para impedir.
+    """
+    os.makedirs(os.path.dirname(CANDADO), exist_ok=True)
+    limite = time.monotonic() + espera_s
+    with open(CANDADO, 'w') as f:
+        while True:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= limite:
+                    raise TimeoutError(
+                        'Hay otra corrida del pipeline en curso (el cron) y no se liberó '
+                        f'en {espera_s}s. No se corre en paralelo a propósito.'
+                    ) from None
+                time.sleep(5)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def _correr_cadena(sync: bool, solo: str | None = None, solo_sync: bool = False,
+                   ingesta: bool = False):
     """Corre los scripts en orden, cortando en el primero que falle.
     Devuelve (exit_code, log). El orden importa: `cruzar.py` deja
     `cruce_cartera` al día y `cruzar_cartera_preventiva.py` lee de ahí.
@@ -85,7 +137,17 @@ def _correr_cadena(sync: bool, solo: str | None = None, solo_sync: bool = False)
     globales. `cruzar_cartera_preventiva.py` todavía no tiene modo puntual, así
     que corre completo — es lo que queda por hacer para que un botón responda
     en segundos."""
-    if solo_sync:
+    if ingesta:
+        # La cadena COMPLETA, empezando por leer los archivos. Es lo que dispara
+        # el botón de la pantalla de carga, y desde el 2026-09-06 es la corrida
+        # principal del día: el área sube sus archivos y aprieta.
+        #
+        # 🔴 SIN `--cierre-diario`, a propósito y no negociable: el sello lo
+        # pone únicamente la corrida de las 9:30. Un botón no puede cerrarle la
+        # puerta a un pago, porque el sello no se deshace desde la pantalla.
+        scripts = [["sync_cartera.py"], ["procesar_todos.py"],
+                   ["cruzar.py"], ["cruzar_cartera_preventiva.py"]]
+    elif solo_sync:
         # Solo bajar archivos de Drive y refrescar las tablas de referencia. No
         # se recalcula nada: la cartera nueva queda EN ESPERA hasta que alguien
         # aprete "Cargar Cartera", así que no hay nada que recalcular todavía.
@@ -107,7 +169,8 @@ def _correr_cadena(sync: bool, solo: str | None = None, solo_sync: bool = False)
     return 0, log
 
 
-def _run_pipeline(sync: bool, solo: str | None = None, solo_sync: bool = False):
+def _run_pipeline(sync: bool, solo: str | None = None, solo_sync: bool = False,
+                  ingesta: bool = False):
     """Carril único del pipeline. Al terminar revisa si se encoló otra
     petición mientras corría y, si la hay, vuelve a correr sin soltar el
     estado a `done` — así el frontend que está haciendo polling ve una sola
@@ -123,7 +186,8 @@ def _run_pipeline(sync: bool, solo: str | None = None, solo_sync: bool = False):
         )
     while True:
         try:
-            returncode, log = _correr_cadena(sync, solo, solo_sync)
+            with _candado_del_pipeline():
+                returncode, log = _correr_cadena(sync, solo, solo_sync, ingesta)
         except Exception as exc:
             returncode, log = -1, str(exc)
 
@@ -135,6 +199,7 @@ def _run_pipeline(sync: bool, solo: str | None = None, solo_sync: bool = False):
                 sync = _pendiente["sync"]
                 solo = _pendiente["solo"]
                 solo_sync = _pendiente["solo_sync"]
+                ingesta = _pendiente["ingesta"]
                 _pendiente = None
                 continue
             _state.update(
@@ -216,7 +281,8 @@ def trigger_activar_cartera_status():
         return jsonify(**_state_cartera)
 
 
-def _disparar(sync: bool, solo: str | None = None, solo_sync: bool = False):
+def _disparar(sync: bool, solo: str | None = None, solo_sync: bool = False,
+              ingesta: bool = False):
     """Arranca el pipeline, o encola una re-corrida si ya hay una en curso.
     Nunca descarta la petición: el llamador siempre puede asumir que su
     cambio va a reprocesarse.
@@ -229,17 +295,24 @@ def _disparar(sync: bool, solo: str | None = None, solo_sync: bool = False):
     with _lock:
         if _state["status"] == "running":
             if _pendiente is None:
-                _pendiente = {"sync": sync, "solo": solo, "solo_sync": solo_sync}
+                _pendiente = {"sync": sync, "solo": solo, "solo_sync": solo_sync,
+                              "ingesta": ingesta}
             else:
+                encolado_ingesta = ingesta or _pendiente["ingesta"]
                 _pendiente = {
                     "sync": sync or _pendiente["sync"],
-                    "solo": solo if solo == _pendiente["solo"] else None,
+                    # Una ingesta abarca todo: pedirla junto con un pago puntual
+                    # tiene que correr completa, no solo ese pago.
+                    "solo": None if encolado_ingesta
+                            else (solo if solo == _pendiente["solo"] else None),
                     # Solo sigue siendo "solo sync" si TODO lo encolado lo era.
                     # Si alguien pidió también un recálculo, hay que hacerlo.
-                    "solo_sync": solo_sync and _pendiente["solo_sync"],
+                    "solo_sync": solo_sync and _pendiente["solo_sync"] and not encolado_ingesta,
+                    "ingesta": encolado_ingesta,
                 }
             return jsonify({**_state, "status": "queued"}), 202
-    threading.Thread(target=_run_pipeline, args=(sync, solo, solo_sync), daemon=True).start()
+    threading.Thread(target=_run_pipeline, args=(sync, solo, solo_sync, ingesta),
+                     daemon=True).start()
     return jsonify(status="started"), 202
 
 
@@ -267,6 +340,25 @@ def trigger_reproceso():
     cuerpo = request.get_json(silent=True) or {}
     solo = (cuerpo.get("matching_key") or request.args.get("matching_key") or "").strip()
     return _disparar(sync=False, solo=solo or None)
+
+
+@app.post("/trigger/ingesta")
+def trigger_ingesta():
+    """La corrida completa, empezando por LEER LOS ARCHIVOS.
+
+    Es lo que dispara el botón de la pantalla de carga, y desde el 2026-09-06 es
+    la corrida principal del día: el área sube sus archivos y aprieta. La del
+    cron de las 9:30 pasa a ser la red por si alguien sube y no aprieta.
+
+    Es el único disparador que corre `procesar_todos.py`. Los otros tres
+    (cruce, reproceso, sync) trabajan sobre pagos que YA entraron.
+
+    🔴 NO sella. El sello lo pone únicamente la corrida de las 9:30, que es la
+    que pasa `--cierre-diario`. Un botón no puede cerrarle la puerta a un pago.
+    """
+    if not _autorizado():
+        return jsonify(error="unauthorized"), 401
+    return _disparar(sync=True, ingesta=True)
 
 
 @app.post("/trigger/sync")
