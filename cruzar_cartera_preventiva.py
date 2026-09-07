@@ -907,6 +907,12 @@ def _sincronizar_lineas_falta_de_pago(
     un reflejo y pasa a ser la deuda que se arrastra al mes siguiente. Desde
     ese momento esta función no la vuelve a tocar.
 
+    Salvo que la original haya cerrado SIN DEBER NADA (7 de septiembre): ahí no
+    hay deuda que arrastrar, así que la línea se borra en vez de independizarse.
+    Es lo que pasa al descartarle el pago a una cuota que ya estaba pagada por
+    Cartera — el descarte solo deja la línea sin sentido si la madre sigue
+    abierta; si en el mismo movimiento se la cierra, la línea se salvaba.
+
     Guardas al borrar (una línea es una fila de cartera como cualquier otra,
     y puede tener trabajo humano encima): no se borra si tiene pago aplicado,
     asociaciones o cierre manual — en ese caso se avisa en el log en vez de
@@ -946,15 +952,35 @@ def _sincronizar_lineas_falta_de_pago(
         original = por_llave.get(base)
         if original is None:
             continue
-        if (_campo(original, 'pago_confirmado') is not None
-                or base in llaves_cerradas_manual):
-            continue  # cerrada: la línea ya es independiente
+        cerrada = (_campo(original, 'pago_confirmado') is not None
+                   or base in llaves_cerradas_manual)
 
         diferencia = _campo(original, 'diferencia')
         falta = round(-float(diferencia), 2) if diferencia is not None and float(diferencia) < 0 else 0.0
         existentes = sorted(lineas_por_original.get(base, []), key=lambda c: c['id'])
 
-        if falta >= _umbral_linea_nueva(original) and existentes:
+        if cerrada:
+            # Cerrada DEBIENDO: la línea se independiza y no se vuelve a tocar
+            # —es la deuda que se arrastra al mes siguiente—. Cerrada SIN deber
+            # nada, en cambio, la línea no refleja NADA y se queda cobrando una
+            # deuda que no existe (caso real doc 1000064130, 7 de septiembre:
+            # a una cuota ya pagada por Cartera le entró un pago que la partió
+            # en dos; el área descartó el pago y la cerró como Cartera, y la
+            # línea de $261.289 siguió viva). Medido ese día: 2 líneas así
+            # ($729.414) contra 9 que sí son deuda real.
+            #
+            # Se miran las DOS señales de lo que quedó después del cierre, en
+            # OR: `valor_a_cobrar` (que el cierre baja a `valor_cuota - pago`,
+            # en pesos) y `diferencia` (que sí habla en la moneda de la cuota).
+            # Ante cualquier rastro de deuda no se toca nada — equivocarse
+            # hacia "todavía debe" deja las cosas como están, y hacia el otro
+            # lado hace desaparecer plata por cobrar. `_saldo_a_cobrar` no
+            # sirve acá: en una cuota cerrada devuelve el saldo de ANTES del
+            # cierre, sumándole `pago_confirmado` de vuelta.
+            if falta > 0 or float(_campo(original, 'valor_a_cobrar') or 0) > 0:
+                continue
+            sobrantes = existentes
+        elif falta >= _umbral_linea_nueva(original) and existentes:
             # Ya hay línea: se ajusta esa y no se crea ninguna otra.
             viva = existentes[0]
             # La línea también sigue la FECHA de su madre (11 de agosto): si

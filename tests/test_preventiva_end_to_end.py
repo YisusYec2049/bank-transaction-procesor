@@ -1861,3 +1861,111 @@ def test_el_reparto_de_dos_pagos_del_mismo_dia_no_depende_del_orden_de_lectura(m
     assert _correr(False) == _correr(True), (
         'el reparto cambió según cómo vinieran leídos los pagos'
     )
+
+
+# ── La línea de una cuota cerrada que ya no debe nada (7 de septiembre) ───────
+# Caso real doc 1000064130 (Jeison Bojacá): la cuota de $411.289 ya estaba
+# pagada por Cartera y aun así le entró un pago de $150.000 que la partió en
+# dos. El área descartó el pago y la cerró como Cartera —correcto—, pero la
+# línea de FALTA DE PAGO de $261.289 quedó viva cobrando una deuda que ya no
+# existe: al cerrarse la madre, la línea se independiza y nadie la vuelve a
+# mirar. Esa regla vale cuando la madre queda DEBIENDO; acá cerró en cero.
+
+def _mundo_madre_cerrada_con_linea(valor_a_cobrar, diferencia, override=True):
+    """Cuota de $411.289 cerrada a mano, con su línea de deuda de $261.289.
+
+    `valor_a_cobrar`/`diferencia` son lo que decide si la madre quedó debiendo:
+    en cero es "Cartera la cobró entera" (las 2 huérfanas medidas en
+    producción), con saldo es un cierre que dejó deuda a la vista (las otras 9,
+    donde la línea es lo que se arrastra al mes siguiente).
+
+    `override` es la marca de "Marcar pagada por Cartera". Sin ella el pase de
+    reconciliación resetea la cuota —`_fila_reset` limpia `pago_confirmado`— y
+    la madre deja de contar como cerrada, que es otro caso.
+    """
+    madre = _cuota('INS64-A', 'INS64', '1000064130', 411_289, '2026-07-16',
+                   valor_a_cobrar=valor_a_cobrar, diferencia=diferencia,
+                   pago='411289.0', pago_confirmado=411_289,
+                   fecha_pago='2026-07-11', medio_pago='Cartera',
+                   valor_pago=411_289, notificacion='CARTERA',
+                   fecha_cruce=_hoy_bogota())
+    linea = _cuota('INS64-A (2026-09-04)', 'INS64', '1000064130', 261_289,
+                   '2026-07-16')
+    tablas = {
+        'cartera_cargas': [_carga(f'{_hoy_bogota()}T15:23:32+00:00')],
+        'cartera_preventiva': [madre, linea],
+    }
+    if override:
+        tablas['cartera_preventiva_overrides'] = [
+            {'llave': 'INS64-A', 'cerrado_manual': True,
+             'fecha_pago_manual': '2026-07-11', 'valor_pago_manual': 411_289,
+             'medio_pago_manual': 'Cartera', 'valor_cuota_manual': None,
+             'fecha_vencimiento_manual': None, 'pago_manual': None},
+        ]
+    return tablas
+
+
+def test_la_linea_se_borra_cuando_su_cuota_cerro_sin_deber_nada(mundo):
+    """El caso reportado: la madre quedó en $0 y su línea sigue cobrando
+    $261.289 que nadie debe."""
+    capturado = mundo(ccp, tablas=_mundo_madre_cerrada_con_linea(0, 0))
+
+    borradas = set(capturado.get('borrado:cartera_preventiva', []) or [])
+    assert 'INS64-A (2026-09-04)' in borradas, (
+        'la línea de FALTA DE PAGO de $261.289 sigue viva sobre una cuota que '
+        f'Cartera ya cobró entera (borradas: {borradas})'
+    )
+
+
+def test_la_linea_de_una_cuota_cerrada_no_se_borra_si_tiene_pago_encima(mundo):
+    """Los guardos de siempre siguen mandando: una línea con plata aplicada es
+    trabajo humano, no un reflejo que sobra."""
+    tablas = _mundo_madre_cerrada_con_linea(0, 0)
+    tablas['pago_asociaciones'] = [
+        {'id': 9601, 'matching_key': 'PAGO-LINEA', 'llave': 'INS64-A (2026-09-04)',
+         'monto': 261_289, 'origen': 'manual'},
+    ]
+    # El pago tiene que existir: una asociación cuyo pago no está en
+    # `cruce_cartera` la borra el pase de reconciliación por huérfana, y
+    # entonces la línea se quedaría sin el guardo que esta prueba mide.
+    tablas['cruce_cartera'] = [
+        _pago_cruzado('PAGO-LINEA', '1000064130', 'INS64', 261_289, fecha='2026-09-04'),
+    ]
+
+    capturado = mundo(ccp, tablas=tablas)
+
+    borradas = set(capturado.get('borrado:cartera_preventiva', []) or [])
+    assert 'INS64-A (2026-09-04)' not in borradas, (
+        'se borró una línea que tenía un pago asociado encima'
+    )
+
+
+def test_la_linea_se_queda_cuando_su_cuota_cerro_debiendo_con_pago_encima(mundo):
+    """La forma exacta de las 9 medidas en producción (ej. `3643PN46345`): la
+    madre recibió un pago que no alcanzó, alguien la cerró con "Cerrar Cuota" y
+    quedó con el faltante a la vista. Ahí la línea es la deuda real."""
+    madre = _cuota('INS65-A', 'INS65', '1000065131', 531_361, '2026-07-16',
+                   valor_a_cobrar=131_361, diferencia=-131_361,
+                   pago='400000.0', pago_confirmado=400_000,
+                   fecha_pago='2026-09-01', medio_pago='WOMPI PSE',
+                   valor_pago=400_000, notificacion='FALTA DE PAGO',
+                   fecha_cruce=_hoy_bogota())
+    capturado = mundo(ccp, tablas={
+        'cartera_cargas': [_carga(f'{_hoy_bogota()}T15:23:32+00:00')],
+        'cartera_preventiva': [
+            madre,
+            _cuota('INS65-A (2026-09-01)', 'INS65', '1000065131', 131_361, '2026-07-16'),
+        ],
+        'pago_asociaciones': [
+            {'id': 9602, 'matching_key': 'PAGO-CORTO', 'llave': 'INS65-A',
+             'monto': 400_000, 'origen': 'automatico'},
+        ],
+        'cruce_cartera': [_pago_cruzado('PAGO-CORTO', '1000065131', 'INS65',
+                                         400_000, fecha='2026-09-01')],
+    })
+
+    borradas = set(capturado.get('borrado:cartera_preventiva', []) or [])
+    assert 'INS65-A (2026-09-01)' not in borradas, (
+        'se borró la deuda de $131.361 que la cuota cerrada arrastra al mes '
+        'siguiente'
+    )
