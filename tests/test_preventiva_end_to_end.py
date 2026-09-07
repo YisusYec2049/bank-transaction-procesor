@@ -732,6 +732,70 @@ def test_un_pago_que_no_paga_ninguna_cuota_no_avisa_nada(mundo):
     )
 
 
+# ── El sobrante que se queda SOBRE la cuota también avisa (7 de septiembre) ─
+#
+# Reportado por el área con la cuota 614PN46224: pago de $990.000 asociado a
+# mano sobre una cuota de $525.000, la fila mostrando $465.000 de más y la
+# columna de aviso vacía. El aviso solo sabía leer el saldo a favor del ledger,
+# y una asociación manual por el monto completo no deja saldo a favor.
+
+def _mundo_asociado_a_mano(valor_cuota, monto_pago, **extra_cuota):
+    return {
+        'cartera_cargas': [_carga(f'{_hoy_bogota()}T15:23:32+00:00')],
+        'cartera_preventiva': [
+            _cuota('INS9-A', 'INS9', '1002003012', valor_cuota, '2026-09-21',
+                   fecha_pago='2026-09-06', valor_pago=monto_pago,
+                   fecha_cruce=_hoy_bogota(), **extra_cuota),
+        ],
+        'pago_asociaciones': [
+            {'id': 9601, 'matching_key': 'PAGO-A-MANO', 'llave': 'INS9-A',
+             'monto': monto_pago, 'origen': 'manual'},
+        ],
+        # Sin filas en `cartera_saldos_favor`: es justo lo que distingue una
+        # asociación hecha a mano del reparto del pipeline.
+        'cruce_cartera': [_pago_cruzado('PAGO-A-MANO', '1002003012', 'INS9',
+                                        monto_pago, fecha='2026-09-06')],
+    }
+
+
+def test_el_sobrante_de_una_asociacion_manual_avisa(mundo):
+    """Caso 614PN46224 (Tatiana): cuota de $525.000 con $990.000 encima."""
+    capturado = mundo(ccp, tablas=_mundo_asociado_a_mano(525_000, 990_000))
+
+    assert _notificacion_de(capturado, 'INS9-A') == '1 CUOTA + ABONO', (
+        'la cuota tiene $465.000 de más encima y no avisa nada'
+    )
+
+
+def test_el_sobrante_avisa_aunque_la_cuota_este_cerrada_a_mano(mundo):
+    """Caso 613PN46287 (Oscar): cuota de $336.362 cerrada a mano con un pago de
+    $900.000. La plata sobra igual, y el aviso es solo texto — no toca el
+    cierre ni mueve un peso."""
+    capturado = mundo(ccp, tablas=_mundo_asociado_a_mano(
+        336_362, 900_000,
+        valor_a_cobrar=-563_638, pago='900000', pago_confirmado=900_000,
+        diferencia=563_638))
+
+    assert _notificacion_de(capturado, 'INS9-A') == '2 CUOTAS + ABONO', (
+        'la cuota cerrada tiene $563.638 de más encima y no avisa nada'
+    )
+
+
+def test_la_diferencia_positiva_que_trae_el_excel_no_avisa(mundo):
+    """El Excel del proceso manual trae sus propias diferencias positivas (144
+    filas al 28 de julio). Sin pago nuestro encima, esa plata no es nuestra
+    para comentarla — el aviso habla de un pago que pagó cuotas."""
+    tablas = _mundo_asociado_a_mano(525_000, 990_000)
+    tablas['pago_asociaciones'] = []
+    tablas['cruce_cartera'] = []
+    tablas['cartera_preventiva'][0]['diferencia'] = 465_000
+
+    assert _notificacion_de(capturado := mundo(ccp, tablas=tablas), 'INS9-A') in (
+        None, '__sin_escribir__'), (
+        f'avisó sobre una diferencia del Excel: {_notificacion_de(capturado, "INS9-A")!r}'
+    )
+
+
 # ── `valor_pago` muestra lo que entró por ese pago (3 de agosto) ───────────
 #
 # Regla del usuario: un pago de $1.000.000 contra una única cuota de $500.000
@@ -1027,7 +1091,11 @@ def test_una_cuota_ya_correcta_no_se_reescribe(mundo):
     en cada corrida."""
     tablas = _mundo_cuota_corregida()
     tablas['cartera_preventiva'][0]['diferencia'] = 25_000
-    tablas['cartera_preventiva'][0]['notificacion'] = None
+    # El aviso es parte del resultado desde el 7 de septiembre: a la cuota le
+    # sobran $25.000 que se quedaron encima, así que "ya correcta" incluye
+    # decirlo. Sin esto, la fila sí tiene algo que escribir y la prueba mide
+    # otra cosa.
+    tablas['cartera_preventiva'][0]['notificacion'] = '1 CUOTA + ABONO'
     tablas['cartera_preventiva'] = [tablas['cartera_preventiva'][0]]
 
     capturado = mundo(ccp, tablas=tablas)

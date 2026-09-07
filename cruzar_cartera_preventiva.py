@@ -2451,6 +2451,49 @@ def main():
         if etiqueta:
             etiqueta_por_llave[destino] = etiqueta
 
+    # El sobrante que quedó SOBRE LA CUOTA también avisa (7 de septiembre).
+    #
+    # El bloque de arriba solo conoce lo que el pipeline dejó en el ledger, así
+    # que un pago asociado A MANO por más de lo que la cuota pedía no avisaba
+    # nada: esa plata queda entera "gastada" en la cuota y no nace saldo a
+    # favor. La fila mostraba la Diferencia de más y la columna de aviso vacía
+    # — reportado por el área con la cuota 614PN46224 ($525.000 con $990.000
+    # encima). Regla del usuario: si el sobrante se queda ahí, se avisa; solo
+    # calla cuando alguien lo reparte a otra cuota, y eso sale solo — al
+    # repartirlo baja la Diferencia y el aviso se limpia en la corrida
+    # siguiente.
+    #
+    # Se lee la `diferencia` ya calculada en vez de restar de nuevo: en una
+    # cuota cerrada `valor_a_cobrar` es lo que quedó DESPUÉS del cierre, así
+    # que la resta daría todo lo aplicado como si sobrara (4 cuotas hoy con esa
+    # forma, las 4 con `diferencia` en 0, que es lo correcto).
+    for cuota in cuotas_rows:
+        llave = cuota.get('llave') or ''
+        if not llave or llave in etiqueta_por_llave:
+            continue
+        sobrante = round(float(_campo_final(cuota, 'diferencia') or 0), 2)
+        if sobrante < _umbral_notificacion(cuota):
+            continue
+        # Mismo criterio que arriba: el aviso habla de un pago que pagó cuotas.
+        # Sin asociaciones vivas, esa diferencia positiva es la que trae el
+        # propio Excel del proceso manual y no es nuestra para comentarla.
+        cubiertas = len({
+            cubierta
+            for a in (asociaciones_por_llave_final.get(llave) or [])
+            for cubierta in (llaves_vigentes_por_pago.get(a['matching_key']) or [])
+        })
+        if not cubiertas:
+            continue
+        # En una cuota cerrada el saldo a cobrar ya es 0 o negativo; ahí lo que
+        # mide "cuántas cuotas pagó" es el valor de la cuota.
+        valor = _saldo_a_cobrar(cuota)
+        if valor <= 0:
+            valor = round(float(cuota.get('valor_cuota') or 0), 2)
+        etiqueta = _etiqueta_notificacion(valor, sobrante, cubiertas,
+                                           _umbral_notificacion(cuota))
+        if etiqueta:
+            etiqueta_por_llave[llave] = etiqueta
+
     sync_notificacion = []
     for cuota in cuotas_rows:
         llave = cuota.get('llave') or ''
