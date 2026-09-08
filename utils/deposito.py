@@ -120,7 +120,8 @@ def listar(fuente: str) -> list[dict]:
             # Sin `id` es una carpeta, no un archivo.
             if not obj.get('id') or not nombre or nombre == _PLACEHOLDER:
                 continue
-            encontrados.append({'id': ruta(ENTRADA, fuente, nombre), 'name': nombre})
+            encontrados.append({'id': ruta(ENTRADA, fuente, nombre), 'name': nombre,
+                                'created_at': obj.get('created_at')})
 
         if len(pagina) < _POR_PAGINA:
             return encontrados
@@ -223,6 +224,77 @@ def descargar(ruta_archivo: str) -> io.BytesIO:
     return io.BytesIO(resp.content)
 
 
+def _ya_esta_en_historico(fuente: str, nombre: str) -> bool:
+    """¿El histórico de esa fuente ya tiene un archivo con ese nombre exacto?
+
+    `search` del listado busca por coincidencia parcial, así que el nombre se
+    compara aparte: `Payu UC.xlsx` no puede darse por ocupado porque exista
+    `Payu UC (2026-09-08).xlsx`.
+
+    Si no se puede preguntar, se responde que NO está: así el comportamiento
+    ante un fallo del almacenamiento es el de siempre (intentar con el nombre
+    original) en vez de renombrar archivos por una consulta que no respondió.
+    """
+    bucket, url, srk = _config()
+    try:
+        resp = http.post(
+            f'{url}/storage/v1/object/list/{bucket}',
+            headers={**_headers(srk), 'Content-Type': 'application/json'},
+            json={'prefix': f'{HISTORICO}/{fuente}/', 'limit': _POR_PAGINA,
+                  'offset': 0, 'search': nombre},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return any((o.get('name') or '') == nombre for o in (resp.json() or []))
+    except Exception:
+        log.warning('DEPÓSITO [%s]: no se pudo revisar si %s ya está en el histórico.',
+                    fuente, nombre)
+        return False
+
+
+def _nombre_para_historico(fuente: str, nombre: str) -> str:
+    """El nombre con el que se archiva, esquivando el que ya esté ocupado.
+
+    Existe porque mover en el depósito es ESCRIBIR UNA RUTA, no cambiar un
+    archivo de carpeta como en Drive: si la ruta ya existe, el almacenamiento
+    responde 400 y el archivo se queda sin archivar.
+
+    Y no es un caso raro, es el de todos los días: los archivos de referencia
+    llegan siempre con el mismo nombre (`Payu UC.xlsx` está fijo en
+    `sync_cartera.py`), así que el segundo día chocan sí o sí. El 2026-09-08 eso
+    tumbó la corrida entera y 152 pagos no entraron.
+
+    Se le pega la fecha, y la hora si ese mismo día ya se archivó otro igual:
+
+        Payu UC.xlsx  →  Payu UC (2026-09-08).xlsx  →  Payu UC (2026-09-08 09-56-49).xlsx
+
+    Los dos se conservan a propósito: el archivo es la única copia de lo que
+    entró ese día, y el histórico del depósito ya se limpia solo a los 3 meses.
+    """
+    if not _ya_esta_en_historico(fuente, nombre):
+        return nombre
+
+    base, punto, ext = nombre.rpartition('.')
+    if not punto:            # un nombre sin extensión: el sufijo va al final
+        base, ext = nombre, ''
+    sufijo_ext = f'.{ext}' if punto else ''
+
+    ahora = datetime.now(timezone.utc)
+    for marca in (ahora.strftime('%Y-%m-%d'), ahora.strftime('%Y-%m-%d %H-%M-%S')):
+        candidato = f'{base} ({marca}){sufijo_ext}'
+        if not _ya_esta_en_historico(fuente, candidato):
+            log.info('DEPÓSITO [%s]: "%s" ya está en el histórico, se archiva como "%s".',
+                     fuente, nombre, candidato)
+            return candidato
+
+    # Hasta acá no se llega archivando de a un archivo por vez: el segundo
+    # candidato lleva los segundos. Si pasara, se avisa y se deja fallar el
+    # move — antes que archivar dos cosas distintas bajo el mismo nombre.
+    log.error('DEPÓSITO [%s]: no se encontró un nombre libre en el histórico para %s.',
+              fuente, nombre)
+    return nombre
+
+
 def mover_a_historico(ruta_archivo: str, fuente: str, nombre: str) -> None:
     """Archiva el archivo ya procesado dentro del mismo depósito.
 
@@ -235,10 +307,10 @@ def mover_a_historico(ruta_archivo: str, fuente: str, nombre: str) -> None:
     if not (bucket and url and srk):
         raise RuntimeError('DEPÓSITO no configurado.')
 
-    destino = ruta(HISTORICO, fuente, nombre)
-    if dry_run.registrar(f'deposito:{destino}', 'move', [ruta_archivo]):
+    if dry_run.registrar(f'deposito:{ruta(HISTORICO, fuente, nombre)}', 'move', [ruta_archivo]):
         return
 
+    destino = ruta(HISTORICO, fuente, _nombre_para_historico(fuente, nombre))
     resp = http.post(
         f'{url}/storage/v1/object/move',
         headers={**_headers(srk), 'Content-Type': 'application/json'},

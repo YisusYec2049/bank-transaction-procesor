@@ -35,6 +35,20 @@ def entorno(monkeypatch):
     dry_run.desactivar()
 
 
+@pytest.fixture
+def reloj(monkeypatch):
+    """Congela el reloj para poder afirmar el sufijo con el que se archiva."""
+    from datetime import datetime as _dt
+    from datetime import timezone as _tz
+
+    class _Congelado:
+        @staticmethod
+        def now(tz=None):
+            return _dt(2026, 9, 8, 9, 56, 49, tzinfo=tz or _tz.utc)
+
+    monkeypatch.setattr(deposito, 'datetime', _Congelado)
+
+
 def _objeto(nombre, con_id=True):
     return {'name': nombre, 'id': 'uuid' if con_id else None}
 
@@ -130,20 +144,90 @@ def test_descargar_pide_el_objeto_por_su_ruta(monkeypatch):
     assert urls == ['https://falso.supabase.co/storage/v1/object/archivos-pipeline/entrada/wompi/x.csv']
 
 
-def test_archivar_manda_el_objeto_a_historico(monkeypatch):
-    cuerpos = []
+def _almacenamiento(monkeypatch, ya_archivados, falla_el_listado=False):
+    """Simula el depósito: un histórico con los nombres que se le pasen, y un
+    `move` que anota a dónde se mandó cada archivo. Devuelve esa lista."""
+    movidos = []
 
-    def _post(_url, **kw):
-        cuerpos.append(kw['json'])
-        return _Resp()
+    def _post(url, **kw):
+        if '/object/move' in url:
+            movidos.append(kw['json']['destinationKey'])
+            return _Resp()
+        # El listado con `search`, tal como se comporta el real (verificado
+        # contra producción el 2026-09-08): busca por PREFIJO y SIN distinguir
+        # mayúsculas, así que devuelve de más y nunca alcanza como respuesta.
+        if falla_el_listado:
+            raise ConnectionError('el almacenamiento no responde')
+        buscado = kw['json'].get('search', '').lower()
+        return _Resp([_objeto(n) for n in ya_archivados if n.lower().startswith(buscado)])
 
     monkeypatch.setattr(deposito.http, 'post', _post)
+    return movidos
+
+
+def test_archivar_manda_el_objeto_a_historico(monkeypatch):
+    movidos = _almacenamiento(monkeypatch, ya_archivados=[])
 
     deposito.mover_a_historico('entrada/wompi/x.csv', 'wompi', 'x.csv')
 
-    assert cuerpos == [{'bucketId': 'archivos-pipeline',
-                        'sourceKey': 'entrada/wompi/x.csv',
-                        'destinationKey': 'historico/wompi/x.csv'}]
+    assert movidos == ['historico/wompi/x.csv']
+
+
+# ── El choque de nombres: los archivos de referencia llegan a diario ─────────
+#
+# `Payu UC.xlsx` tiene el nombre fijo en `sync_cartera.py`, así que el segundo
+# día su ruta en el histórico ya está ocupada. Mover en el depósito es escribir
+# una ruta (no cambiar de carpeta como en Drive), así que eso es un 400 y el
+# archivo se queda sin archivar. El 2026-09-08 tumbó la corrida entera.
+
+def test_un_nombre_ya_ocupado_se_archiva_con_la_fecha(monkeypatch, reloj):
+    movidos = _almacenamiento(monkeypatch, ya_archivados=['Payu UC.xlsx'])
+
+    deposito.mover_a_historico('entrada/payu_uc/Payu UC.xlsx', 'payu_uc', 'Payu UC.xlsx')
+
+    assert movidos == ['historico/payu_uc/Payu UC (2026-09-08).xlsx']
+
+
+def test_dos_veces_el_mismo_dia_lleva_tambien_la_hora(monkeypatch, reloj):
+    """Se puede recargar cartera a media mañana: el de la fecha ya está tomado."""
+    movidos = _almacenamiento(
+        monkeypatch, ya_archivados=['Payu UC.xlsx', 'Payu UC (2026-09-08).xlsx'])
+
+    deposito.mover_a_historico('entrada/payu_uc/Payu UC.xlsx', 'payu_uc', 'Payu UC.xlsx')
+
+    assert movidos == ['historico/payu_uc/Payu UC (2026-09-08 09-56-49).xlsx']
+
+
+def test_un_nombre_PARECIDO_no_ocupa_el_lugar(monkeypatch, reloj):
+    """El `search` del almacenamiento devuelve de más: busca por prefijo y sin
+    distinguir mayúsculas. Pero las rutas SÍ distinguen, así que `payu uc.xlsx`
+    y `Payu UC.xlsx` son dos archivos que conviven — dar el nombre por ocupado
+    ahí renombraría todos los días sin ninguna necesidad. De ahí que la
+    respuesta del listado no alcance y el nombre se compare exacto."""
+    movidos = _almacenamiento(
+        monkeypatch, ya_archivados=['payu uc.xlsx', 'Payu UC (2026-09-07).xlsx'])
+
+    deposito.mover_a_historico('entrada/payu_uc/Payu UC.xlsx', 'payu_uc', 'Payu UC.xlsx')
+
+    assert movidos == ['historico/payu_uc/Payu UC.xlsx']
+
+
+def test_un_nombre_sin_extension_no_pierde_su_sufijo(monkeypatch, reloj):
+    movidos = _almacenamiento(monkeypatch, ya_archivados=['extracto'])
+
+    deposito.mover_a_historico('entrada/bc2576/extracto', 'bc2576', 'extracto')
+
+    assert movidos == ['historico/bc2576/extracto (2026-09-08)']
+
+
+def test_si_no_se_puede_revisar_el_historico_se_intenta_con_su_nombre(monkeypatch, reloj):
+    """Ante un fallo del listado, el comportamiento es el de siempre. Renombrar
+    por una consulta que no respondió sería inventar nombres a ciegas."""
+    movidos = _almacenamiento(monkeypatch, ya_archivados=[], falla_el_listado=True)
+
+    deposito.mover_a_historico('entrada/wompi/x.csv', 'wompi', 'x.csv')
+
+    assert movidos == ['historico/wompi/x.csv']
 
 
 def test_en_simulacion_no_se_archiva_nada(monkeypatch, tmp_path):
