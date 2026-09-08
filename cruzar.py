@@ -123,8 +123,8 @@ resuelve limpio) y 'pendiente' — nunca cierra un 'no_identificable' solo.
 
 NOMBRE / MÉTODO DE PAGO / CI / VAL / PROGRAM — WOMPI LINK vs MANUAL (13-14 de
 julio, reescrito el 16 como Fase 9 del rediseño): se lee
-ReportePagosWompi_*.xlsx directo de Drive en cada corrida (subcarpeta "wompi"
-dentro de Archivos Cruce, WOMPI_REPORTE_DRIVE_FOLDER_ID) — NO se sincroniza a
+ReportePagosWompi_*.xlsx de su bandeja de la plataforma en cada corrida
+(carpeta `wompi_reporte` del depósito) — NO se sincroniza a
 ninguna tabla mirror, se arma el lookup en memoria y se descarta al terminar
 la corrida (decisión explícita del usuario: es un reporte de pagos del día
 para cruzar en el momento, no un dato de referencia que haga falta guardar).
@@ -165,8 +165,8 @@ período del reporte más reciente (no se rehace un histórico acumulado), así
 que esta re-evaluación solo alcanza filas viejas cuyo pago siga apareciendo
 en el archivo más reciente que se suba a Drive.
 
-Si el reporte no se pudo cargar en absoluto esta corrida (archivo no
-encontrado en Drive, o WOMPI_REPORTE_DRIVE_FOLDER_ID sin configurar), se
+Si el reporte no se pudo cargar en absoluto esta corrida (nadie lo subió, o
+DEPOSITO_BUCKET sin configurar), se
 omite toda esta sección (LINK/MANUAL y la re-evaluación 9.4 por igual) —
 NOMBRE/MÉTODO DE PAGO/CI/VAL quedan NULL y PROGRAM vacío para todas las
 transacciones WOMPI de esa corrida, sin afectar estado_cruce de ninguna
@@ -223,7 +223,13 @@ from dotenv import load_dotenv
 
 from utils import dry_run
 from utils.excel_cartera import read_pagos_wompi_reporte
-from utils.origen import Bandeja, descargar, mover_a_historico, todos_los_que_contienen
+from utils.origen import (
+    Bandeja,
+    descargar,
+    hay_de_donde_leer,
+    mover_a_historico,
+    todos_los_que_contienen,
+)
 from utils.parser import normalizar_nit as _normalizar_nit
 from utils.parser import normalizar_sufijo as _normalizar_sufijo
 from utils.supabase import (
@@ -774,22 +780,15 @@ def _con_y_sin_digito(rows: list[dict]) -> list[dict]:
     return out
 
 
-def _bandeja_reporte_wompi(folder_id: str) -> Bandeja:
-    """La bandeja del ReportePagosWompi.
-
-    Su Histórico tiene su propia variable y cae al de WOMPI si no está puesta,
-    que es como venía funcionando desde que se archivan estos reportes.
-    """
-    return Bandeja(
-        fuente='wompi_reporte',
-        drive_entrada=folder_id,
-        drive_historico=(os.environ.get('WOMPI_REPORTE_HISTORICO_FOLDER_ID', '')
-                         or os.environ.get('WOMPI_HISTORICO_FOLDER_ID', '')),
-    )
+def _bandeja_reporte_wompi() -> Bandeja:
+    """La bandeja del ReportePagosWompi: la carpeta `wompi_reporte` de la
+    plataforma. Su destino de archivado se deriva de la fuente, así que ya no
+    hay ninguna variable de entorno de por medio."""
+    return Bandeja(fuente='wompi_reporte')
 
 
-def _cargar_lookup_wompi_reporte(sa_json: str, folder_id: str) -> tuple[dict[str, dict], bool, list[dict]]:
-    """Lee TODOS los ReportePagosWompi_*.xlsx que haya en la carpeta de Drive
+def _cargar_lookup_wompi_reporte() -> tuple[dict[str, dict], bool, list[dict]]:
+    """Lee TODOS los ReportePagosWompi_*.xlsx que haya en su bandeja
     y arma {id_transaccion: {pagador, comprobante, inscripcion, id_transaccion,
     proyecto, fecha_pago}} en memoria — no se guarda en ninguna tabla, se
     descarta al terminar la corrida.
@@ -823,17 +822,20 @@ def _cargar_lookup_wompi_reporte(sa_json: str, folder_id: str) -> tuple[dict[str
     de golpe todas las transacciones WOMPI del día como sin identificar).
     `archivos` son los que se leyeron, del más viejo al más reciente, para que
     el llamador archive los ya consumidos al terminar."""
-    if not sa_json or not folder_id:
-        log.warning('GOOGLE_SA_JSON / WOMPI_REPORTE_DRIVE_FOLDER_ID no configurados, '
-                    'se omite el cruce NOMBRE/CI/MÉTODO DE PAGO de WOMPI.')
+    bandeja = _bandeja_reporte_wompi()
+    # ⚠️ Esto pregunta si el DEPÓSITO está encendido, no si hay archivos. Sin
+    # depósito no hay de dónde leer el reporte y los pagos de WOMPI se quedan sin
+    # nombre, sin CI, sin método, sin programa y sin la corrección de documento.
+    if not hay_de_donde_leer(bandeja):
+        log.error('El depósito no está configurado (DEPOSITO_BUCKET): no hay de dónde leer el '
+                  'ReportePagosWompi, se omite el cruce NOMBRE/CI/MÉTODO DE PAGO de WOMPI.')
         return {}, False, []
 
-    archivos = todos_los_que_contienen(_bandeja_reporte_wompi(folder_id),
-                                       WOMPI_REPORTE_PATTERN)
+    archivos = todos_los_que_contienen(bandeja, WOMPI_REPORTE_PATTERN)
     if not archivos:
-        log.warning('No se encontró ningún archivo "%s*" en la carpeta de Drive (%s), '
+        log.warning('No se encontró ningún archivo "%s*" en su bandeja de la plataforma, '
                     'se omite el cruce NOMBRE/CI/MÉTODO DE PAGO de WOMPI esta corrida.',
-                    WOMPI_REPORTE_PATTERN, folder_id)
+                    WOMPI_REPORTE_PATTERN)
         return {}, False, []
 
     log.info('ReportePagosWompi: %d archivo(s) en la carpeta.', len(archivos))
@@ -860,7 +862,7 @@ def _cargar_lookup_wompi_reporte(sa_json: str, folder_id: str) -> tuple[dict[str
     return lookup, True, archivos
 
 
-def _archivar_reportes_wompi(sa_json: str, archivos: list[dict]) -> None:
+def _archivar_reportes_wompi(archivos: list[dict]) -> None:
     """Mueve a Histórico los ReportePagosWompi ya leídos, dejando SOLO el más
     reciente en la carpeta.
 
@@ -876,12 +878,7 @@ def _archivar_reportes_wompi(sa_json: str, archivos: list[dict]) -> None:
     antes, los archivos siguen en su sitio y la corrida siguiente los reintenta."""
     if len(archivos) < 2:
         return
-    bandeja = _bandeja_reporte_wompi(os.environ.get('WOMPI_REPORTE_DRIVE_FOLDER_ID', ''))
-    if not bandeja.drive_historico:
-        log.warning('Sin carpeta de Histórico configurada para el ReportePagosWompi, '
-                    'se dejan los %d archivo(s) en su sitio.', len(archivos))
-        return
-
+    bandeja = _bandeja_reporte_wompi()
     for f in archivos[:-1]:
         try:
             if mover_a_historico(f, bandeja):
@@ -1300,18 +1297,14 @@ def main():
     log.info('%d inscripciones (base) con al menos una cuota sin pago identificado.', len(bases_con_deuda))
     log.info('%d documentos con inscripción conocida en cartera preventiva.', len(inscripciones_por_documento))
 
-    sa_json = os.environ.get('GOOGLE_SA_JSON', '')
-    wompi_reporte_folder_id = os.environ.get('WOMPI_REPORTE_DRIVE_FOLDER_ID', '')
-
-    # El reporte solo aporta datos a los pagos de WOMPI, y bajarlo de Drive
-    # cuesta ~2 s. En modo puntual sobre un pago de otro banco no hace falta
+    # El reporte solo aporta datos a los pagos de WOMPI, y bajarlo cuesta ~2 s. En modo puntual sobre un pago de otro banco no hace falta
     # ni mirarlo — y las correcciones de documento, que son el botón más usado,
     # casi nunca son de WOMPI.
     necesita_reporte = not pago_puntual or str(
         pago_puntual.get('payment_method') or '').upper().startswith('WOMPI')
     if necesita_reporte:
         lookup_wompi_reporte, wompi_reporte_disponible, reportes_wompi = (
-            _cargar_lookup_wompi_reporte(sa_json, wompi_reporte_folder_id))
+            _cargar_lookup_wompi_reporte())
     else:
         log.info('Modo puntual sobre un pago que no es WOMPI: se omite el reporte.')
         lookup_wompi_reporte, wompi_reporte_disponible, reportes_wompi = {}, False, []
@@ -1937,7 +1930,7 @@ def main():
     # Mantenimiento GLOBAL de la carpeta de Drive: no corresponde a un reproceso
     # de un solo pago. Un botón de la plataforma no debe mover archivos.
     if not pago_puntual:
-        _archivar_reportes_wompi(sa_json, reportes_wompi)
+        _archivar_reportes_wompi(reportes_wompi)
 
 
 if __name__ == '__main__':

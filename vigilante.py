@@ -1,6 +1,6 @@
 #!/opt/matching-test/venv/bin/python3
 """
-vigilante.py — ¿hay algo nuevo que procesar en Drive?
+vigilante.py — ¿hay algo nuevo que procesar?
 
 Responde con el CÓDIGO DE SALIDA, para encadenarlo con `&&` en el cron:
 
@@ -31,7 +31,7 @@ minuto :50. Los minutos :05 y :20 caerían antes de la corrida del día, y :35
 encima de ella — a cinco minutos de que arranque, con el `flock` todavía
 tomado.
 
-Es deliberadamente barato: solo lista carpetas (unas pocas llamadas a Drive),
+Es deliberadamente barato: solo lista bandejas (unas pocas llamadas al depósito),
 no descarga ni escribe nada. La corrida real la hacen los scripts de siempre,
 encadenados después de este.
 
@@ -44,18 +44,17 @@ los pagos. No cambia el resultado —se revisan todas las carpetas siempre, sin
 salir en la primera que tenga algo— pero deja el log en el mismo orden en que
 va a ocurrir todo después.
 
-Lo que hace vigilable a una carpeta es una sola propiedad: **se vacía sola al
-procesarse**. `procesar_todos.py` mueve cada archivo de banco a su Histórico,
+Lo que hace vigilable a una bandeja es una sola propiedad: **se vacía sola al
+procesarse**. `procesar_todos.py` mueve cada archivo de banco a su histórico,
 y `sync_cartera.py` hace lo mismo con los de referencia. Procesado el
-archivo, la carpeta queda vacía y el vigilante se calla — sin eso, dispararía
+archivo, la bandeja queda vacía y el vigilante se calla — sin eso, dispararía
 la cadena cada 15 minutos para siempre.
 
-Las de referencia NO se vigilaban antes porque vivían en una carpeta única
-(`CARTERA_DRIVE_FOLDER_ID`) sin Histórico propio, así que el archivo se
-quedaba ahí después de cargarse. Eso dejó de ser cierto: hoy tienen carpeta e
-Histórico dedicados en el `.env`. Agregadas el 2026-08-10, con la condición de
-seguridad escrita en `_carpetas_referencia`: solo se vigila la carpeta que
-tenga su Histórico configurado.
+Desde que los archivos entran por la plataforma (Drive se desconectó el
+2026-09-08) esa propiedad se cumple SIEMPRE, porque el destino de archivado se
+deriva de la fuente y no de una variable que alguien pueda olvidar. Antes había
+que exigirle a cada carpeta de Drive su Histórico configurado, y por eso las de
+referencia no se vigilaron hasta el 2026-08-10.
 
 **CARTERA PREVENTIVA queda fuera a propósito** (decisión del usuario,
 2026-08-10), aunque cumple la condición: para esa está el botón "Buscar
@@ -73,13 +72,13 @@ todavía no se ha archivado.
 
 import argparse
 import logging
-import os
 import sys
 
 from dotenv import load_dotenv
 
 from procesar_todos import BANCOS, BANCOS_BANCOLOMBIA
-from utils.origen import Bandeja, listar, todos_los_que_contienen
+from utils import deposito
+from utils.origen import Bandeja, hay_de_donde_leer, listar, todos_los_que_contienen
 
 # force=True porque importar procesar_todos ya configuró el logger raíz, y la
 # primera llamada gana: sin esto el prefijo [vigilante] se perdía y en
@@ -104,58 +103,58 @@ WOMPI_REPORTE_PATTERN = 'ReportePagosWompi'
 # que corre solo `sync_cartera.py` (~4 s) en vez de la cadena entera. Si una
 # sesión futura la agrega "por consistencia", subir esa cartera pasaría a
 # disparar el pipeline completo sin que nadie lo haya pedido.
+#
+# El primer valor es el nombre de la FUENTE, que es además la carpeta dentro
+# del depósito — tiene que coincidir con `FUENTES_DEL_DEPOSITO` en
+# `procesar_todos.py` y con lo que escribe la pantalla de carga.
 CARPETAS_REFERENCIA = [
-    ('Payu UC.xlsx',             'PAYU_UC_FOLDER_ID',  'PAYU_UC_HIST_FOLDER_ID'),
-    ('Ingresos PSE y PAYU.xlsx', 'INGRESOS_FOLDER_ID', 'INGRESOS_HIST_FOLDER_ID'),
+    ('payu_uc',  'Payu UC.xlsx'),
+    ('ingresos', 'Ingresos PSE y PAYU.xlsx'),
 ]
 
 
-def _bandejas() -> list[tuple[str, str]]:
-    """(etiqueta, folder_id) de cada bandeja de entrada configurada."""
-    prefijos = [cfg['prefix'] for cfg in BANCOS_BANCOLOMBIA.values()]
-    prefijos += [cfg['prefix'] for cfg in BANCOS.values()]
-    prefijos += ['PAYU', 'PAYU_MONEDA']
+def _bandejas() -> list[tuple[str, Bandeja]]:
+    """(etiqueta, bandeja) de cada bandeja de pagos que se vigila.
 
-    bandejas = []
-    for p in prefijos:
-        folder_id = os.environ.get(f'{p}_INBOX_FOLDER_ID', '')
-        if folder_id:
-            bandejas.append((p, folder_id))
-    return bandejas
-
-
-def _carpetas_referencia() -> list[tuple[str, str]]:
-    """(etiqueta, folder_id) de las carpetas de referencia que es SEGURO vigilar.
-
-    La condición es que la carpeta tenga configurado su Histórico: sin él,
-    `sync_cartera.py` carga el archivo y lo DEJA donde está (solo avisa con un
-    warning), así que la carpeta nunca se vacía y el vigilante dispararía la
-    cadena cada 15 minutos para siempre. Con Histórico, el archivo sale al
-    cargarse y el vigilante se calla solo — la misma propiedad que hace que
-    esto funcione con las bandejas de los bancos.
-
-    Por eso se exigen las DOS variables y no se usa el fallback
-    `CARTERA_DRIVE_FOLDER_ID` (la carpeta única de antes, que no tiene
-    Histórico propio). Si alguien le quita el Histórico a una carpeta, esa
-    deja de vigilarse sola en vez de entrar en bucle.
+    La lista sale de las FUENTES, que son las mismas que procesa
+    `procesar_todos.py`. Antes salía de las carpetas de Drive configuradas, y
+    eso ató lo que el vigilante mira a una variable de entorno: el día que se
+    desconectó Drive se habría quedado mirando una lista VACÍA, sin volver a
+    avisar nunca de un archivo subido por la plataforma — que es justamente su
+    razón de existir.
     """
-    carpetas = []
-    for etiqueta, var_folder, var_hist in CARPETAS_REFERENCIA:
-        folder_id = os.environ.get(var_folder, '')
-        hist_id   = os.environ.get(var_hist, '')
-        if folder_id and hist_id:
-            carpetas.append((etiqueta, folder_id))
-        elif folder_id:
-            log.debug('%s no se vigila: le falta %s en .env.', etiqueta, var_hist)
-    return carpetas
+    if not hay_de_donde_leer(Bandeja(fuente='bc2576')):
+        return []
+    fuentes = list({**BANCOS_BANCOLOMBIA, **BANCOS}) + ['payu', 'payu_moneda']
+    return [(f, Bandeja(fuente=f)) for f in fuentes]
+
+
+def _carpetas_referencia() -> list[tuple[str, Bandeja]]:
+    """(etiqueta, bandeja) de las referencias que es SEGURO vigilar.
+
+    La condición de siempre: que el archivo SALGA de su bandeja al cargarse. Si
+    no sale, la bandeja nunca se vacía y el vigilante dispara la cadena cada 15
+    minutos para siempre.
+
+    En el depósito eso se cumple SIEMPRE, porque el destino de archivado se
+    deriva de la fuente y no de una variable que alguien pueda olvidar. Era la
+    condición que en Drive obligaba a exigir una carpeta de Histórico
+    configurada.
+
+    CARTERA PREVENTIVA sigue fuera a propósito (ver el comentario de
+    `CARPETAS_REFERENCIA`).
+    """
+    if not hay_de_donde_leer(Bandeja(fuente='payu_uc')):
+        return []
+    return [(etiqueta, Bandeja(fuente=fuente)) for fuente, etiqueta in CARPETAS_REFERENCIA]
 
 
 def hay_trabajo() -> bool:
     encontrado = False
 
     # 1. Los archivos de REFERENCIA, primero: son contra lo que se cruza.
-    for etiqueta, folder_id in _carpetas_referencia():
-        archivos = listar(Bandeja(fuente=etiqueta, drive_entrada=folder_id))
+    for etiqueta, bandeja in _carpetas_referencia():
+        archivos = listar(bandeja)
         if archivos:
             log.info('%s: %d archivo(s) esperando -> %s',
                      etiqueta, len(archivos), ', '.join(f['name'] for f in archivos[:5]))
@@ -165,19 +164,17 @@ def hay_trabajo() -> bool:
     # 1 archivo es el estado normal (su carpeta conserva a propósito el más
     # reciente, ver `_archivar_reportes_wompi` en cruzar.py), así que "tener
     # un archivo" no puede ser la señal. La señal es tener DOS O MÁS.
-    reporte_folder = os.environ.get('WOMPI_REPORTE_DRIVE_FOLDER_ID', '')
-    if reporte_folder:
-        reportes = todos_los_que_contienen(
-            Bandeja(fuente='wompi_reporte', drive_entrada=reporte_folder),
-            WOMPI_REPORTE_PATTERN)
+    bandeja_reporte = Bandeja(fuente='wompi_reporte')
+    if hay_de_donde_leer(bandeja_reporte):
+        reportes = todos_los_que_contienen(bandeja_reporte, WOMPI_REPORTE_PATTERN)
         if len(reportes) >= 2:
             log.info('ReportePagosWompi: %d entregas sin archivar -> %s',
                      len(reportes), ', '.join(f['name'] for f in reportes))
             encontrado = True
 
     # 2. Las bandejas de los bancos y pasarelas, después.
-    for etiqueta, folder_id in _bandejas():
-        archivos = listar(Bandeja(fuente=etiqueta, drive_entrada=folder_id))
+    for etiqueta, bandeja in _bandejas():
+        archivos = listar(bandeja)
         if archivos:
             log.info('%s: %d archivo(s) esperando -> %s',
                      etiqueta, len(archivos), ', '.join(f['name'] for f in archivos[:5]))
@@ -190,30 +187,33 @@ def main():
     load_dotenv()
 
     parser = argparse.ArgumentParser(
-        description='Sale con 0 si hay archivos nuevos en Drive, con 1 si no hay nada.')
+        description='Sale con 0 si hay archivos nuevos por procesar, con 1 si no hay nada.')
     parser.add_argument('--dry-run', action='store_true',
                         help='Informativo: reporta pero siempre sale con 0.')
     args = parser.parse_args()
 
-    sa_json = os.environ.get('GOOGLE_SA_JSON', '')
-    if not sa_json:
-        log.error('GOOGLE_SA_JSON no configurado.')
-        sys.exit(0 if args.dry_run else 0)
+    # ⚠️ Este script responde con el CÓDIGO DE SALIDA, así que una condición de
+    # error nunca puede salir con 0 "por las dudas" sin mirar antes si de verdad
+    # hay algo que revisar: 0 significa "corré la cadena completa", y repetido
+    # cada 15 minutos es la forma exacta del atasco de Stripe.
+    if not deposito.activo():
+        log.error('DEPOSITO_BUCKET no está configurada: el vigilante no tiene dónde mirar.')
+        sys.exit(1)
 
     try:
         encontrado = hay_trabajo()
     except Exception:
-        # Ante un fallo de Drive se deja pasar la cadena a propósito: un
-        # cargue que se queda sin procesar es peor que una corrida de más,
+        # Ante un fallo del almacenamiento se deja pasar la cadena a propósito:
+        # un cargue que se queda sin procesar es peor que una corrida de más,
         # que además es idempotente y está protegida por flock.
-        log.exception('No se pudo consultar Drive; se deja pasar la cadena por precaución.')
+        log.exception('No se pudo consultar el depósito; se deja pasar la cadena por precaución.')
         sys.exit(0)
 
     if encontrado:
         log.info('Hay trabajo: se dispara el pipeline.')
         sys.exit(0)
 
-    log.info('Nada nuevo en Drive.')
+    log.info('Nada nuevo por procesar.')
     sys.exit(0 if args.dry_run else 1)
 
 

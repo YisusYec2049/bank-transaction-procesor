@@ -2,22 +2,18 @@
 """
 sync_cartera.py — sincroniza los Excel de referencia del cruce de cartera a Supabase.
 
-Los 3 archivos (Payu UC, Ingresos PSE y PAYU, Cartera Preventiva) pasan a
-vivir cada uno en SU PROPIA carpeta de Drive (Spec C — "Carpetas de Drive +
-versión de carga", 21 de julio), con su propia carpeta Histórico:
-  - PAYU_UC_FOLDER_ID / PAYU_UC_HIST_FOLDER_ID
-  - INGRESOS_FOLDER_ID / INGRESOS_HIST_FOLDER_ID
-  - CARTERA_PREV_FOLDER_ID / CARTERA_PREV_HIST_FOLDER_ID
-Si alguna de estas variables no está seteada en .env, cae a
-CARTERA_DRIVE_FOLDER_ID (la carpeta única de antes) como fallback, para no
-romper el VPS mientras el usuario crea las carpetas nuevas.
+Los 3 archivos (Payu UC, Ingresos PSE y PAYU, Cartera Preventiva) los sube el
+área desde `financial-platform`, cada uno a SU carpeta del depósito
+(`payu_uc`, `ingresos`, `cartera_prev`). Ya no hay ninguna variable de entorno
+de carpetas: el nombre de la fuente ES la carpeta, y el destino de archivado se
+deriva de él. **Google Drive se desconectó el 2026-09-08.**
 
-Los 3 archivos son OPCIONALES: si un archivo no está en su carpeta esta
+Los 3 archivos son OPCIONALES: si un archivo no está en su bandeja esta
 corrida, no es error — se salta y se mantiene lo que ya se cargó antes.
 Ingresos PSE y PAYU en particular solo se sube el primer y el último día de
 la semana; su ausencia el resto de los días es normal. Tras cargar un
-archivo con éxito, se MUEVE a su carpeta Histórico (nunca se borra) para que
-la carpeta de trabajo quede limpia — así "no hay archivo esta corrida" y
+archivo con éxito, se MUEVE a su histórico (nunca se borra) para que
+la bandeja quede limpia — así "no hay archivo esta corrida" y
 "ya se cargó" son indistinguibles por diseño, y detectar si Cartera
 Preventiva tiene una versión nueva pendiente de activar se reduce a mirar
 `cartera_cargas` (ver más abajo), sin comparar nombres de archivo.
@@ -47,7 +43,7 @@ from datetime import datetime
 import pytz
 from dotenv import load_dotenv
 
-from utils import dry_run
+from utils import deposito, dry_run
 from utils.excel_cartera import (
     read_bancolombia_2576,
     read_bancolombia_2833,
@@ -109,8 +105,8 @@ def _procesar_opcional(nombre: str, bandeja: Bandeja, cargar) -> None:
     más reciente que haya sin importar cómo se llame."""
     archivo = mas_reciente(bandeja)
     if not archivo:
-        log.info('%s: no hay archivo en su carpeta (%s) esta corrida, se omite.',
-                 nombre, bandeja.drive_entrada)
+        log.info('%s: nadie lo subió esta corrida (bandeja "%s"), se omite.',
+                 nombre, bandeja.fuente)
         return
 
     log.info('Descargando %s ...', nombre)
@@ -118,49 +114,50 @@ def _procesar_opcional(nombre: str, bandeja: Bandeja, cargar) -> None:
     if not ok:
         return  # `cargar` ya logueó por qué no se movió (ej. lectura vacía)
 
-    if mover_a_historico(archivo, bandeja):
-        log.info('%s movido a Histórico.', nombre)
+    # ⚠️ Archivar es el ÚLTIMO paso y el menos importante: la tabla de
+    # referencia ya quedó cargada arriba. Si falla, se avisa fuerte y la corrida
+    # sigue — este script es el primero de la cadena, así que una excepción acá
+    # se lleva por delante `procesar_todos.py` y NINGÚN pago del día entra. Pasó
+    # el 2026-09-08: `Payu UC.xlsx` chocó con el del día anterior en el histórico
+    # del depósito y quedaron 152 pagos ($122.112.305) sin ingresar.
+    #
+    # El costo de seguir es acotado y conocido: el archivo se queda en su
+    # bandeja, así que el vigilante lo va a ver como trabajo nuevo cada 15
+    # minutos hasta que alguien lo saque. Volver a cargarlo no ensucia nada
+    # (los 3 archivos de referencia reemplazan su tabla entera), y es
+    # muchísimo menos grave que frenar los pagos del día.
+    try:
+        if mover_a_historico(archivo, bandeja):
+            log.info('%s movido a Histórico.', nombre)
+    except Exception:
+        log.exception('%s: se cargó bien pero NO se pudo archivar. Se queda en su bandeja y '
+                      'la corrida SIGUE; hay que sacarlo a mano o se va a releer cada corrida.',
+                      nombre)
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Refresca las tablas de referencia desde Google Drive.')
+    parser = argparse.ArgumentParser(description='Refresca las tablas de referencia desde la plataforma.')
     dry_run.agregar_flags(parser)
     args = parser.parse_args()
     dry_run.desde_args(args, 'sync')
 
     load_dotenv()
 
-    folder_id_fallback = os.environ.get('CARTERA_DRIVE_FOLDER_ID', '')
-    sa_json      = os.environ.get('GOOGLE_SA_JSON', '')
     supabase_url = os.environ.get('SUPABASE_URL', '')
     srk          = os.environ.get('SUPABASE_SERVICE_ROLE_KEY', '')
 
-    faltantes = [
-        n for n, v in [
-            ('GOOGLE_SA_JSON', sa_json),
-            ('SUPABASE_URL', supabase_url),
-            ('SUPABASE_SERVICE_ROLE_KEY', srk),
-        ] if not v
-    ]
+    faltantes = [n for n, v in [('SUPABASE_URL', supabase_url),
+                                ('SUPABASE_SERVICE_ROLE_KEY', srk)] if not v]
     if faltantes:
         log.error('Variables faltantes en .env: %s', ', '.join(faltantes))
         sys.exit(1)
 
-    # Carpeta por archivo (Parte 1) — cae a CARTERA_DRIVE_FOLDER_ID (P4) si la
-    # variable específica no está seteada, para no romper el VPS mientras el
-    # usuario crea las carpetas nuevas. Histórico no tiene fallback: si no
-    # está configurada, simplemente no se mueve el archivo tras cargarlo.
-    payu_uc_folder_id      = os.environ.get('PAYU_UC_FOLDER_ID') or folder_id_fallback
-    payu_uc_hist_folder_id = os.environ.get('PAYU_UC_HIST_FOLDER_ID', '')
-    ingresos_folder_id      = os.environ.get('INGRESOS_FOLDER_ID') or folder_id_fallback
-    ingresos_hist_folder_id = os.environ.get('INGRESOS_HIST_FOLDER_ID', '')
-    cartera_prev_folder_id      = os.environ.get('CARTERA_PREV_FOLDER_ID') or folder_id_fallback
-    cartera_prev_hist_folder_id = os.environ.get('CARTERA_PREV_HIST_FOLDER_ID', '')
-
-    if not any([payu_uc_folder_id, ingresos_folder_id, cartera_prev_folder_id]):
-        log.error('Ninguna carpeta de origen configurada (ni las nuevas *_FOLDER_ID ni '
-                   'CARTERA_DRIVE_FOLDER_ID como fallback).')
-        sys.exit(1)
+    # ⚠️ Sin depósito no hay de dónde leer NADA, pero eso NO corta la corrida:
+    # este script es el primero de la cadena y un `exit(1)` acá se lleva por
+    # delante la ingesta de pagos del día. Se grita en el log y se sigue.
+    if not deposito.activo():
+        log.error('DEPOSITO_BUCKET no está configurada: no hay de dónde leer los archivos de '
+                  'referencia. Las tablas de referencia se quedan como estaban.')
 
     def _cargar_payu_uc(archivo) -> bool:
         rows = read_inscrip(descargar(archivo))
@@ -205,19 +202,9 @@ def main():
 
     # El `nombre` que se pasa es solo la etiqueta para los logs; la bandeja es
     # la que sabe de dónde sale el archivo y a dónde se archiva.
-    _procesar_opcional(PAYU_UC_FILENAME,
-                       Bandeja(fuente='payu_uc', drive_entrada=payu_uc_folder_id,
-                               drive_historico=payu_uc_hist_folder_id),
-                       _cargar_payu_uc)
-
-    _procesar_opcional(INGRESOS_FILENAME,
-                       Bandeja(fuente='ingresos', drive_entrada=ingresos_folder_id,
-                               drive_historico=ingresos_hist_folder_id),
-                       _cargar_ingresos)
-
-    _procesar_opcional(CARTERA_PREV_PATTERN,
-                       Bandeja(fuente='cartera_prev', drive_entrada=cartera_prev_folder_id,
-                               drive_historico=cartera_prev_hist_folder_id),
+    _procesar_opcional(PAYU_UC_FILENAME, Bandeja(fuente='payu_uc'), _cargar_payu_uc)
+    _procesar_opcional(INGRESOS_FILENAME, Bandeja(fuente='ingresos'), _cargar_ingresos)
+    _procesar_opcional(CARTERA_PREV_PATTERN, Bandeja(fuente='cartera_prev'),
                        _cargar_cartera_prev)
 
     log.info('sync_cartera.py completado.')

@@ -43,7 +43,13 @@ import fuentes.placetopay as mod_placetopay
 import fuentes.stripe as mod_stripe
 import fuentes.wompi as mod_wompi
 from utils import deposito, dry_run, registro
-from utils.origen import Bandeja, descargar, listar, mover_a_historico
+from utils.origen import (
+    Bandeja,
+    descargar,
+    hay_de_donde_leer,
+    listar,
+    mover_a_historico,
+)
 from utils.supabase import (
     existing_matching_keys,
     keys_del_dia_anterior,
@@ -286,13 +292,10 @@ def _apartar_cheques(cheques: list[tuple], banco: str, supabase_url: str, srk: s
 def _procesar_banco(banco: str, cfg: dict,
                     yesterday_keys: set[str], dry_run: bool):
     mod    = cfg['mod']
-    prefix = cfg['prefix']
-    inbox  = os.environ.get(f'{prefix}_INBOX_FOLDER_ID', '')
-    hist   = os.environ.get(f'{prefix}_HISTORICO_FOLDER_ID', '')
-    bandeja = Bandeja(fuente=banco, drive_entrada=inbox, drive_historico=hist)
+    bandeja = Bandeja(fuente=banco)
 
-    if not inbox:
-        log.warning('[%s] Sin INBOX configurado, saltando.', banco)
+    if not hay_de_donde_leer(bandeja):
+        log.warning('[%s] Sin ningún origen configurado (ni depósito ni Drive), saltando.', banco)
         return
 
     archivos = listar(bandeja)
@@ -363,13 +366,10 @@ def _procesar_banco(banco: str, cfg: dict,
 def _procesar_bancolombia(banco: str, cfg: dict,
                           yesterday_keys: set[str], dry_run: bool):
     mod    = cfg['mod']
-    prefix = cfg['prefix']
-    inbox  = os.environ.get(f'{prefix}_INBOX_FOLDER_ID', '')
-    hist   = os.environ.get(f'{prefix}_HISTORICO_FOLDER_ID', '')
-    bandeja = Bandeja(fuente=banco, drive_entrada=inbox, drive_historico=hist)
+    bandeja = Bandeja(fuente=banco)
 
-    if not inbox:
-        log.warning('[%s] Sin INBOX configurado, saltando.', banco)
+    if not hay_de_donde_leer(bandeja):
+        log.warning('[%s] Sin ningún origen configurado (ni depósito ni Drive), saltando.', banco)
         return
 
     archivos = listar(bandeja)
@@ -537,18 +537,11 @@ def _emparejar_payu(payu_files: list[dict], moneda_files: list[dict]):
     return pares, payu_sueltos, moneda_sueltas
 
 def _procesar_payu(yesterday_keys: set[str], dry_run: bool):
-    payu_inbox   = os.environ.get('PAYU_INBOX_FOLDER_ID', '')
-    moneda_inbox = os.environ.get('PAYU_MONEDA_INBOX_FOLDER_ID', '')
-    payu_hist    = os.environ.get('PAYU_HISTORICO_FOLDER_ID', '')
-    moneda_hist  = os.environ.get('PAYU_MONEDA_HISTORICO_FOLDER_ID', payu_hist)
+    bandeja_payu   = Bandeja(fuente='payu')
+    bandeja_moneda = Bandeja(fuente='payu_moneda')
 
-    bandeja_payu   = Bandeja(fuente='payu', drive_entrada=payu_inbox,
-                             drive_historico=payu_hist)
-    bandeja_moneda = Bandeja(fuente='payu_moneda', drive_entrada=moneda_inbox,
-                             drive_historico=moneda_hist)
-
-    if not payu_inbox or not moneda_inbox:
-        log.warning('[PAYU] Sin INBOX configurado, saltando.')
+    if not (hay_de_donde_leer(bandeja_payu) and hay_de_donde_leer(bandeja_moneda)):
+        log.warning('[PAYU] Sin ningún origen configurado (ni depósito ni Drive), saltando.')
         return
 
     payu_files   = listar(bandeja_payu)

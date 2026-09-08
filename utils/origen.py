@@ -1,116 +1,131 @@
-"""De dónde sale un archivo: Google Drive o el depósito de la plataforma.
+"""De dónde salen los archivos: el depósito de la plataforma, y nada más.
 
-Por qué existe. Hasta hoy los archivos de bancos y pasarelas entraban por una
-sola puerta —una carpeta de Drive por fuente— y los 4 módulos que los leen
-llamaban directo a `utils/drive.py`. La carga de archivos desde
-`financial-platform` agrega una segunda puerta, y sin una capa en medio cada uno
-de esos módulos tendría que saber cuál mirar, en qué orden, y dónde archivar
-después.
+Por qué existe. Hasta el 2026-09-05 los archivos entraban por una sola puerta
+—una carpeta de Google Drive por fuente— y los 4 módulos que los leen llamaban
+directo a `utils/drive.py`. La carga de archivos desde `financial-platform`
+agregó una segunda puerta, y esta capa nació para que ninguno de esos módulos
+tuviera que saber cuál mirar, en qué orden, y dónde archivar después.
 
-Qué resuelve. Este módulo expone las mismas operaciones de siempre (listar,
-descargar, mover) sobre una **bandeja**, que es el par "carpeta de Drive +
-carpeta del depósito" de una misma fuente. Los módulos siguen recorriendo una
-lista de archivos y no se enteran de que hay dos sitios.
+**Drive se desconectó el 2026-09-08** (decisión del usuario: *"todo pasa dentro
+de la plataforma"*), después de dos días de convivencia que dejaron tres
+incidentes en uno solo:
 
-Lo que NO cambia, y es la mitad del valor: los parsers, la deduplicación, las
-llaves, el apartado de cheques y todo el cruce siguen recibiendo exactamente lo
-mismo. Un archivo tiene que producir los mismos pagos entre por donde entre.
+  1. Un archivo que se archiva con el mismo nombre del día anterior chocaba, y
+     la corrida entera moría — 152 pagos ($122.112.305) no ingresaron.
+  2. Al juntar los archivos de los dos sitios, el ÚLTIMO de la lista dejó de
+     ser el más nuevo, y el pipeline tomó como vigente un ReportePagosWompi de
+     Drive de 4 días antes, archivando el del día.
+  3. En 8 lugares el código preguntaba "¿hay carpeta de Drive?" para decidir si
+     había fuente, así que apagar Drive equivalía a apagar el pipeline.
 
-El orden de lectura es **primero el depósito y después Drive**, en una sola
-lista: decisión del usuario del 2026-09-05, Drive pasa a ser el camino
-secundario mientras el área cambia su rutina. No es cosmético — para PayU el
-orden de la lista decide qué archivo se empareja con cuál.
+Esta capa se queda igual —los módulos siguen pidiendo archivos POR BANDEJA— y
+lo que desapareció es el segundo sitio. Sigue existiendo porque es lo que
+mantiene a los 4 módulos sin saber cómo se guarda un archivo, y porque es donde
+viviría una tercera puerta el día que haga falta.
 
-Si `DEPOSITO_BUCKET` no está configurada, el depósito se apaga entero y esto se
-comporta igual que antes de que existiera.
+Lo que NO cambió, y es la mitad del valor: los parsers, la deduplicación, las
+llaves, el apartado de cheques y todo el cruce reciben exactamente lo mismo.
+
+⚠️ `utils/drive.py` sigue en el repo a propósito, pero YA NO LO USA EL PIPELINE:
+los Históricos de Drive guardan todos los archivos anteriores al 2026-09-08 y
+hubo tres ocasiones en que hubo que releerlos. Es una herramienta suelta para
+un script puntual, no una fuente.
+
+Si `DEPOSITO_BUCKET` no está configurada, el depósito se apaga entero y este
+módulo no devuelve ningún archivo — el pipeline corre sin procesar nada y lo
+grita en el log.
 """
 
 from __future__ import annotations
 
 import io
 import logging
-import os
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from utils import deposito as _deposito
-from utils import drive as _drive
 
 log = logging.getLogger(__name__)
 
 # De dónde vino un archivo. Viaja dentro de cada diccionario de archivo para que
 # `descargar` y `mover` sepan a quién preguntarle sin que el llamador se entere.
-DRIVE = 'drive'
+# Hoy hay un solo valor posible; se conserva la clave porque es lo que hace que
+# agregar una puerta nueva no obligue a tocar los 4 módulos que leen archivos.
 DEPOSITO = 'deposito'
 
 
 @dataclass(frozen=True)
 class Bandeja:
-    """Una fuente y sus dos direcciones.
+    """Una fuente de archivos.
 
     `fuente` es el nombre corto ('wompi', 'bc2576', 'cartera_prev') y es además
     la carpeta dentro del depósito (`entrada/<fuente>/`), que por eso NO
     necesita una variable de entorno propia. ⚠️ Cambiarle el nombre a una fuente
     cambia dónde busca el pipeline, y tiene que coincidir con lo que escribe la
     pantalla de carga de `financial-platform`.
-
-    Las dos de Drive son los identificadores de carpeta de siempre. Vacías
-    significa "esta bandeja no tiene lado de Drive", que es lo que va a pasar
-    el día que se apague.
     """
 
     fuente: str
-    drive_entrada: str = ''
-    drive_historico: str = ''
 
 
-# El servicio de Drive es caro de construir (lee el JSON de la cuenta de
-# servicio y arma el cliente), así que se hace una vez por corrida y se
-# reutiliza. Antes cada módulo lo construía por su cuenta y se lo pasaba a las
-# funciones; ahora vive acá y los llamadores no lo ven.
-_servicio_drive = None
-
-
-def _drive_svc():
-    global _servicio_drive
-    if _servicio_drive is None:
-        _servicio_drive = _drive.build_drive_service(os.environ.get('GOOGLE_SA_JSON', ''))
-    return _servicio_drive
-
-
-def reiniciar() -> None:
-    """Olvida el servicio cacheado. Existe para las pruebas, que cambian el
-    entorno entre casos y no deben heredar el cliente del caso anterior."""
-    global _servicio_drive
-    _servicio_drive = None
-
-
-def _como_archivos(items: list[dict], bandeja: Bandeja, origen: str) -> list[dict]:
-    """Normaliza lo que devuelve un backend al diccionario que ven los módulos.
+def _como_archivos(items: list[dict], bandeja: Bandeja) -> list[dict]:
+    """Normaliza lo que devuelve el depósito al diccionario que ven los módulos.
 
     Se conservan las claves `id` y `name` con el mismo significado de siempre
-    —hay código que las lee directo— y se agregan `origen` y `fuente`.
+    —hay código que las lee directo— y se agregan `origen`, `fuente` y `fecha`.
     """
-    return [{'id': f['id'], 'name': f['name'], 'origen': origen, 'fuente': bandeja.fuente}
+    return [{'id': f['id'], 'name': f['name'], 'origen': DEPOSITO,
+             'fuente': bandeja.fuente, 'fecha': f.get('created_at')}
             for f in items]
 
 
-def listar(bandeja: Bandeja) -> list[dict]:
-    """Todos los archivos de la bandeja, del más viejo al más reciente.
+def hay_de_donde_leer(bandeja: Bandeja) -> bool:
+    """¿Hay de dónde leer los archivos de esta bandeja?
 
-    El orden lo hereda de `utils/drive.py`, que ordena por `createdTime`
-    ascendente y pagina hasta agotar la carpeta: sin paginar, los que se perdían
-    eran justamente los últimos, o sea los más nuevos.
+    Es la pregunta que decide si un módulo procesa una fuente o la saltea. Antes
+    cada uno preguntaba por su carpeta de Drive, y esa pregunta se volvió la
+    equivocada el día que Drive dejó de ser la fuente: los 3 sitios de
+    `procesar_todos.py` se habrían salteado TODOS los bancos y pasarelas, y
+    `sync_cartera.py` habría cortado la corrida entera.
+
+    ⚠️ La respuesta NO depende de la bandeja sino del depósito, y eso es a
+    propósito: una fuente sin archivos hoy sigue teniendo de dónde leer. "No hay
+    archivos" y "no hay de dónde leerlos" son dos cosas distintas, y confundirlas
+    es lo que hacía el código viejo.
     """
-    archivos: list[dict] = []
+    return _deposito.activo()
 
-    # El depósito va PRIMERO: es el camino nuevo y Drive el de respaldo.
-    if _deposito.activo():
-        archivos += _como_archivos(_deposito.listar(bandeja.fuente), bandeja, DEPOSITO)
 
-    if bandeja.drive_entrada:
-        archivos += _como_archivos(_drive.list_files(_drive_svc(), bandeja.drive_entrada),
-                                   bandeja, DRIVE)
+def _cuando(archivo: dict) -> datetime:
+    """La fecha del archivo, para ordenarlos del más viejo al más reciente.
 
+    Sin fecha se lo trata como lo MÁS VIEJO: así un archivo del que no se sabe
+    nada nunca se hace pasar por el más reciente, que es la decisión que puede
+    hacer daño (cargar un Excel viejo encima de la tabla, o dejar un
+    ReportePagosWompi vencido como el vigente).
+    """
+    crudo = archivo.get('fecha')
+    if not crudo:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    try:
+        return datetime.fromisoformat(str(crudo).replace('Z', '+00:00'))
+    except ValueError:
+        return datetime.min.replace(tzinfo=timezone.utc)
+
+
+def listar(bandeja: Bandeja) -> list[dict]:
+    """Los archivos de la bandeja sin procesar, del más viejo al más reciente.
+
+    ⚠️ El orden se ordena acá por FECHA y no se hereda del almacenamiento. Hay
+    dos sitios que leen el último de la lista como si fuera el más nuevo
+    (`mas_reciente`, y el archivado del ReportePagosWompi en `cruzar.py`), y el
+    2026-09-08 un orden que no era por fecha dejó vigente un reporte de 4 días
+    antes. Ordenar acá es lo que hace que esa lectura sea siempre cierta.
+    """
+    if not _deposito.activo():
+        return []
+    archivos = _como_archivos(_deposito.listar(bandeja.fuente), bandeja)
+    archivos.sort(key=_cuando)
     return archivos
 
 
@@ -137,9 +152,7 @@ def todos_los_que_contienen(bandeja: Bandeja, texto: str) -> list[dict]:
 
 
 def descargar(archivo: dict) -> io.BytesIO:
-    """Baja el contenido del archivo, venga de donde venga."""
-    if archivo['origen'] == DRIVE:
-        return _drive.download_pdf(_drive_svc(), archivo['id'])
+    """Baja el contenido del archivo."""
     if archivo['origen'] == DEPOSITO:
         return _deposito.descargar(archivo['id'])
     raise ValueError(f'Origen desconocido: {archivo.get("origen")!r}')
@@ -148,31 +161,16 @@ def descargar(archivo: dict) -> io.BytesIO:
 def mover_a_historico(archivo: dict, bandeja: Bandeja) -> bool:
     """Archiva el archivo ya procesado. Devuelve si se movió.
 
-    Un archivo se archiva en el mismo sitio del que salió: el que entró por
-    Drive se va al Histórico de Drive, y el que entre por el depósito se irá al
-    del depósito. Así los dos caminos pueden convivir sin pisarse.
+    ⚠️ El destino NO se configura: se deriva de la fuente, igual que la entrada.
+    Por eso una bandeja del depósito no puede quedarse "sin histórico" —que era
+    la forma en que un archivo de Drive terminaba releyéndose para siempre— y
+    por eso el vigilante puede vigilar cualquier bandeja sin entrar en bucle.
 
-    Sin carpeta de destino configurada NO se mueve y se avisa: dejarlo en la
-    bandeja es molesto (se vuelve a leer la próxima corrida) pero es reversible;
-    perderlo de vista no.
-
-    ⚠️ La escritura pasa por `utils/drive.py`, que es donde vive el interruptor
-    del modo simulación: en dry-run se registra la intención y el archivo se
-    queda donde está. Mover un archivo al Histórico es de las escrituras que más
-    duelen —si la corrida no lo procesó bien, moverlo lo esconde— así que ese
-    freno no se puede saltar.
+    El modo simulación frena esta escritura dentro de `utils/deposito.py`: mover
+    un archivo al Histórico es de las que más duelen, porque si la corrida no lo
+    procesó bien, moverlo lo esconde.
     """
-    if archivo['origen'] == DRIVE:
-        if not bandeja.drive_historico:
-            log.warning('[%s] Sin carpeta de Histórico configurada, se deja en su sitio: %s',
-                        bandeja.fuente, archivo['name'])
-            return False
-        _drive.move_file(_drive_svc(), archivo['id'], bandeja.drive_historico)
-        return True
-
     if archivo['origen'] == DEPOSITO:
-        # El destino no se configura: se deriva de la fuente, igual que la
-        # entrada. Por eso el depósito no puede quedarse "sin histórico".
         _deposito.mover_a_historico(archivo['id'], archivo['fuente'], archivo['name'])
         return True
 

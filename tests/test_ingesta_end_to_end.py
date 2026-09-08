@@ -58,16 +58,12 @@ def bandeja(monkeypatch):
         for clave, valor in {
             'SUPABASE_URL': 'https://falso.supabase.co',
             'SUPABASE_SERVICE_ROLE_KEY': 'k',
-            'GOOGLE_SA_JSON': '/dev/null',
+            # Sin esto el depósito está apagado y `procesar_todos.py` saltea
+            # TODOS los bancos: desde que Drive se desconectó (2026-09-08),
+            # "no hay de dónde leer" es exactamente eso.
+            'DEPOSITO_BUCKET': 'archivos-pipeline',
         }.items():
             monkeypatch.setenv(clave, valor)
-        # Cada banco lee su bandeja y su Histórico de un id propio en el
-        # entorno. Los nombres importan: la primera versión de este test usaba
-        # `..._HIST_...` en vez de `..._HISTORICO_...` y pasaba igual, porque el
-        # `.env` de la máquina traía el nombre bueno. Falló recién en CI, donde
-        # no hay `.env` — de ahí el `load_dotenv` neutralizado más abajo.
-        for var in ('BC2576_INBOX_FOLDER_ID', 'BC2576_HISTORICO_FOLDER_ID'):
-            monkeypatch.setenv(var, 'carpeta')
 
         # Nada de leer el .env real: una prueba que depende del entorno de quien
         # la corre no prueba lo mismo en dos máquinas.
@@ -79,7 +75,7 @@ def bandeja(monkeypatch):
         # archiva, así que tiene que estar puesto igual que en producción.
         monkeypatch.setattr(procesar_todos, 'listar',
                             lambda _b: [{'id': 'f1', 'name': 'extracto.pdf',
-                                         'origen': 'drive', 'fuente': banco}])
+                                         'origen': 'deposito', 'fuente': banco}])
         monkeypatch.setattr(procesar_todos, 'descargar',
                             lambda _a: io.BytesIO(b'%PDF'))
 
@@ -107,8 +103,12 @@ def bandeja(monkeypatch):
         monkeypatch.setattr(procesar_todos, 'existing_matching_keys',
                             lambda *_a, **_k: set())
         monkeypatch.setattr(procesar_todos, 'select_all', lambda *_a, **_k: [])
+        # La caducidad del histórico corre al final de cada corrida y habla con
+        # el almacenamiento. Con el depósito encendido —que ahora es siempre—
+        # esta prueba se iría a la red y colgaría 30 s por fuente.
+        monkeypatch.setattr(procesar_todos.deposito, 'caducar', lambda *_a, **_k: 0)
         # El de verdad NO mueve nada en simulación: el freno vive en la puerta
-        # (`utils/drive.py`), no en este script. El doble tiene que hacer lo
+        # (`utils/deposito.py`), no en este script. El doble tiene que hacer lo
         # mismo, o una prueba de dry-run mediría el doble y no el código.
         monkeypatch.setattr(procesar_todos, 'mover_a_historico',
                             lambda archivo, _b: True if dry_run.activo()
