@@ -1725,11 +1725,47 @@ def main():
                 extra += _disponible_del_pago(mk, llave)
         return round(extra, 2)
 
+    def _excedente_mostrable(llave: str, asociaciones_cuota: list[dict],
+                              por_pago: dict[str, list[str]], cuota: dict) -> float:
+        """La parte del excedente que esta cuota PUEDE mostrar: todo, o nada si
+        la cuota todavía debe.
+
+        Existe para que `valor_pago` y `diferencia` respondan lo mismo. Cuando
+        no lo hacían, la fila de una cuota corta mostraba el pago entero en una
+        columna y su deuda en la de al lado, y además se reescribía en cada
+        corrida: la comprobación de idempotencia esperaba una `diferencia` que
+        la §3.3.2 nunca iba a escribir."""
+        if round(sum(float(a['monto'] or 0) for a in asociaciones_cuota)
+                  - _saldo_a_cobrar(cuota), 2) < 0:
+            return 0.0
+        return _excedente_sin_repartir(llave, asociaciones_cuota, por_pago)
+
     def _valor_pago_visible(llave: str, asociaciones_cuota: list[dict],
-                             por_pago: dict[str, list[str]]) -> float:
+                             por_pago: dict[str, list[str]], cuota: dict) -> float:
+        """Lo que la fila muestra en `Valor Pago`: lo aplicado a esta cuota más
+        la plata de esos mismos pagos que siga sin repartir.
+
+        Ese monto puede superar el valor de la cuota, y así lo necesita el área
+        (3 de agosto): es de donde salen "1 CUOTA + ABONO" y "PAGA N CUOTAS",
+        las etiquetas con las que leían la cartera antes de este pipeline.
+
+        PERO solo si la cuota está CUBIERTA. Una cuota que todavía DEBE muestra
+        únicamente lo que tiene encima — si no, la fila dice "le entró el pago
+        entero" y "FALTA DE PAGO" a la vez, sobre el mismo monto.
+
+        Caso real del 11 de septiembre (doc 1038410104): un pago de $636.380
+        repartido en cascada, $477.286 a una cuota y $159.094 de excedente a la
+        siguiente. Al descartarle el pago a la primera, esos $477.286 volvieron
+        al ledger y se pintaron sobre la segunda, que pasó a mostrar el pago
+        entero teniendo solo el excedente. Lo reportó el área.
+
+        Es la misma regla que la §3.3.2 ya aplica a `diferencia` (se niega a
+        pintar un saldo a favor sobre una deuda y lo avisa en el log); acá se
+        unifica el criterio, porque las dos columnas describen la misma plata y
+        en pantalla se leen juntas."""
         aplicado = round(sum(float(a['monto'] or 0) for a in asociaciones_cuota), 2)
         return round(
-            aplicado + _excedente_sin_repartir(llave, asociaciones_cuota, por_pago), 2)
+            aplicado + _excedente_mostrable(llave, asociaciones_cuota, por_pago, cuota), 2)
 
     log.info('Reconciliando cuotas contra sus asociaciones vigentes...')
     reconciliadas = 0
@@ -1795,8 +1831,8 @@ def main():
         # él la reabriría en cada corrida. Ahí sigue mandando la comparación
         # por plata, que es la que detecta un descarte.
         valor_pago_actual = cuota.get('valor_pago')
-        visible   = _valor_pago_visible(llave, asociaciones_cuota, por_pago_vigentes)
-        excedente = _excedente_sin_repartir(llave, asociaciones_cuota, por_pago_vigentes)
+        visible   = _valor_pago_visible(llave, asociaciones_cuota, por_pago_vigentes, cuota)
+        excedente = _excedente_mostrable(llave, asociaciones_cuota, por_pago_vigentes, cuota)
         confirmada = cuota.get('pago_confirmado') is not None
         refleja_resultado = confirmada or _mismo_monto(
             cuota.get('diferencia'), round(fila['diferencia'] + excedente, 2))
@@ -2361,9 +2397,15 @@ def main():
             if actual < 0:
                 # La cuota debe plata (faltante del pase de reconciliación).
                 # Escribirle el saldo a favor encima convertiría una deuda en
-                # un crédito a la vista. No pasa hoy (excedente y faltante son
-                # excluyentes dentro de una misma corrida), pero si llegara a
-                # pasar es preferible que se vea en el log a taparlo.
+                # un crédito a la vista.
+                #
+                # SÍ PASA, y seguido: basta con descartarle a mano el pago a
+                # una cuota de una cascada para que el excedente del mismo pago
+                # quede suelto sobre la hermana, que sigue debiendo (caso del
+                # 11 de septiembre, doc 1038410104). Esta guarda es la que
+                # mantiene la deuda a la vista; `_excedente_mostrable` aplica
+                # el mismo criterio antes, para que `valor_pago` no diga lo
+                # contrario en la columna de al lado.
                 log.warning('Saldo a favor de %s no se muestra: la cuota debe %s.',
                              llave, actual)
                 continue
@@ -2410,7 +2452,7 @@ def main():
         cuota = next((c for c in cuotas_rows if c['id'] == cuota_id), None)
         if not cuota or not _campo_final(cuota, 'fecha_cruce'):
             continue
-        visible = _valor_pago_visible(llave, asocs, llaves_vigentes_por_pago)
+        visible = _valor_pago_visible(llave, asocs, llaves_vigentes_por_pago, cuota)
         actual = _campo_final(cuota, 'valor_pago')
         if actual is not None and round(float(actual), 2) == visible:
             continue

@@ -618,6 +618,117 @@ def test_una_cuota_corta_muestra_su_deuda_aunque_tenga_saldo_a_favor_encima(mund
     )
 
 
+# ── La cuota que DEBE no muestra encima la plata suelta de su pago ─────────
+#
+# Caso real del 11 de septiembre (doc 1038410104, Maira Alejandra Cabezas).
+# Un pago de $636.380 se repartió en cascada: $477.286 llenaron la cuota de
+# agosto y el excedente de $159.094 cayó en la de septiembre. Al descartarle
+# el pago a la primera y cerrarla por Cartera (el botón de un paso), esos
+# $477.286 volvieron al ledger como plata suelta... y se pintaron sobre la
+# segunda, que pasó a mostrar `valor_pago` = el pago ENTERO teniendo solo el
+# excedente. La fila decía a la vez "le entró $636.380" y "FALTA DE PAGO por
+# $477.286", sobre una cuota que vale exactamente $636.380.
+#
+# El pase de la §3.3.2 ya se niega a hacer eso en `diferencia` y lo avisa en
+# el log ("Saldo a favor de %s no se muestra: la cuota debe %s"); lo que
+# faltaba era que `valor_pago` siguiera la misma regla.
+#
+# ⚠️ Esto NO toca la convención del área: una cuota CUBIERTA sigue mostrando
+# el pago entero, que es lo que enciende "1 CUOTA + ABONO" y "PAGA N CUOTAS"
+# y lo que les permite leer la cartera igual que antes. Son dos casos
+# distintos y la segunda prueba lo deja escrito.
+
+def _mundo_cascada(valor_segunda: float):
+    """Un pago de $636.380 repartido entre dos cuotas, al que después le
+    descartaron la parte de la primera (que quedó cerrada por Cartera).
+
+    `valor_segunda` decide el caso: con $636.380 la cuota sigue DEBIENDO
+    (caso del 11/09); con $159.094 quedó cubierta y la plata suelta es un
+    abono encima, que es como el área necesita verlo."""
+    return {
+        'cartera_cargas': [_carga(f'{_hoy_bogota()}T15:23:32+00:00')],
+        'cartera_preventiva': [
+            _cuota('4216PN46247', '4216PN', '1038410104', 477_286, '2026-08-13',
+                   fecha_pago='2026-08-09', medio_pago='Cartera',
+                   valor_pago=477_286, pago=477_286, pago_confirmado=477_286,
+                   valor_a_cobrar=0, diferencia=0, fecha_cruce=_hoy_bogota(),
+                   notificacion='CARTERA'),
+            _cuota('4216PN46279', '4216PN', '1038410104', valor_segunda, '2026-09-14',
+                   fecha_pago='2026-09-10', valor_pago=159_094,
+                   fecha_cruce=_hoy_bogota(),
+                   # La cuota ya venía marcando lo que le falta: el excedente
+                   # no la cubría ni antes del descarte.
+                   diferencia=round(159_094 - valor_segunda, 2) or None),
+        ],
+        'cartera_preventiva_overrides': [
+            {'llave': '4216PN46247', 'cerrado_manual': True,
+             'fecha_pago_manual': '2026-08-09', 'valor_cuota_manual': None,
+             'fecha_vencimiento_manual': None, 'pago_manual': None},
+        ],
+        'pago_asociaciones': [
+            {'id': 7761, 'matching_key': 'PAGO-CASCADA', 'llave': '4216PN46279',
+             'monto': 159_094, 'origen': 'automatico'},
+        ],
+        'cartera_saldos_favor': [
+            {'id': 914, 'matching_key': 'PAGO-CASCADA', 'llave_origen': '4216PN46247',
+             'monto': 477_286, 'disponible': 477_286, 'aplicado': False,
+             'origen': 'descarte', 'documento': '1038410104',
+             'correo': 'alguien@example.com', 'inscrip': '4216PN',
+             'cliente': 'PERSONA DE PRUEBA', 'fecha': '2026-09-10'},
+        ],
+        'cruce_cartera': [_pago_cruzado('PAGO-CASCADA', '1038410104', '4216PN',
+                                        636_380, fecha='2026-09-10')],
+    }
+
+
+def _fila_como_queda(tablas, capturado, llave):
+    """Cómo queda la fila que ve el área: la que había, con encima todo lo que
+    esta corrida le escribió.
+
+    Una cuota se escribe en varias pasadas y cada una manda solo sus columnas;
+    y una corrida puede no escribirle nada, que es el caso cuando la fila ya
+    estaba bien. Mirar solo lo escrito confundiría las dos cosas."""
+    fila = next(c for c in tablas['cartera_preventiva'] if c['llave'] == llave).copy()
+    for f in capturado.get('cartera_preventiva', []):
+        if f.get('id') == _id_de(llave):
+            fila.update(f)
+    return fila
+
+
+def test_una_cuota_que_debe_no_muestra_encima_la_plata_suelta(mundo):
+    tablas = _mundo_cascada(636_380)
+    capturado = mundo(ccp, tablas=tablas)
+    fila = _fila_como_queda(tablas, capturado, '4216PN46279')
+
+    assert float(fila['valor_pago']) == 159_094, (
+        f"la cuota muestra {fila['valor_pago']} y solo tiene $159.094 encima: "
+        'los otros $477.286 están sueltos, y la fila dice que le pagaron todo '
+        'mientras marca FALTA DE PAGO por ese mismo monto'
+    )
+    assert float(fila['diferencia']) == -477_286, (
+        'la deuda de la cuota tiene que seguir a la vista'
+    )
+
+
+def test_una_cuota_cubierta_SI_muestra_el_pago_entero(mundo):
+    """La convención del área, que no cambia: la cuota quedó cubierta con
+    $159.094 y del mismo pago sobran $477.286 sin repartir, así que la fila
+    muestra lo que entró por el pago y el aviso habla del abono."""
+    tablas = _mundo_cascada(159_094)
+    capturado = mundo(ccp, tablas=tablas)
+    fila = _fila_como_queda(tablas, capturado, '4216PN46279')
+
+    assert float(fila['valor_pago']) == 636_380, (
+        f"la cuota cubierta muestra {fila['valor_pago']}: el área lee ahí lo "
+        'que entró por el pago, y de eso salen "CUOTA + ABONO" y "PAGA N CUOTAS"'
+    )
+    assert 'CUOTA' in (fila.get('notificacion') or ''), (
+        f"el aviso quedó en {fila.get('notificacion')!r}: de este número salen "
+        'las etiquetas con las que el área lee la cartera'
+    )
+
+
+
 # ── El aviso de plata sin repartir (3 de agosto) ───────────────────────────
 #
 # Regla del usuario: el aviso vive mientras al pago le quede plata sin
