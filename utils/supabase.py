@@ -155,8 +155,8 @@ def upsert(supabase_url: str, service_role_key: str, rows: list[list]) -> None:
     # de pagos) re-sellaba con la fecha de hoy pagos que ya habían entrado días
     # atrás, cada vez que se procesaba.
     #
-    # Los pagos que YA existen conservan DOS datos de la base en vez de los del
-    # archivo:
+    # Los pagos que YA existen conservan TRES datos de la base en vez de los
+    # del archivo:
     #
     #   registration_date  Antes se OMITÍA, y eso rompía la tanda entera: la
     #                      columna es NOT NULL y PostgreSQL la valida antes de
@@ -173,6 +173,17 @@ def upsert(supabase_url: str, service_role_key: str, rows: list[list]) -> None:
     #                      porque el archivo la trae VACÍA. Destrabar lo de
     #                      arriba sin esta guarda les habría borrado el
     #                      documento en silencio.
+    #
+    #   email              Desde el 18/09/2026 una persona también lo edita, y
+    #                      por la misma razón el archivo no puede pisarlo. En
+    #                      Bancolombia y Prebancolombia no es un correo: es la
+    #                      REFERENCIA 1 del extracto —lo que digitó quien pagó—
+    #                      y con ella se resuelve el CORREO(2) contra la hoja
+    #                      de ingresos, que conoce esa referencia y no el
+    #                      documento real (ver `_buscar_correo_2` en cruzar.py,
+    #                      20/08/2026). Sin esta guarda la corrección duraría
+    #                      hasta la corrida siguiente en las fuentes de archivo
+    #                      acumulado, como Stripe.
     #
     # Siguen yendo en dos POST porque un array de merge exige que todos los
     # objetos tengan el mismo set de claves (PGRST102).
@@ -198,13 +209,20 @@ def upsert(supabase_url: str, service_role_key: str, rows: list[list]) -> None:
 
 #: Lo que un pago que YA existe conserva de la base en vez de tomarlo del
 #: archivo. Ver el bloque de `upsert` para el porqué de cada una.
-_COLUMNAS_QUE_MANDA_LA_BASE = ('registration_date', 'identification')
+_COLUMNAS_QUE_MANDA_LA_BASE = ('registration_date', 'identification', 'email')
 
 
 def filas_existentes(supabase_url: str, service_role_key: str,
                      keys: list[str]) -> dict[str, dict]:
     """De `keys`, las que ya están en consolidated_transactions y lo que la base
-    guarda hoy de cada una en las columnas que el archivo no puede pisar."""
+    guarda hoy de cada una en las columnas que el archivo no puede pisar.
+
+    Solo se devuelve lo que la base tiene ESCRITO: una celda vacía no es una
+    decisión de nadie, así que ahí manda el archivo. Sin ese matiz, los 35
+    pagos con el correo vacío y los 195 con el documento vacío (18/09/2026)
+    quedarían vacíos para siempre, porque el único que podía llenarlos es
+    justamente el archivo.
+    """
     if not keys:
         return {}
     encontrados: dict[str, dict] = {}
@@ -221,8 +239,11 @@ def filas_existentes(supabase_url: str, service_role_key: str,
         )
         _raise_for_status(resp)
         for r in resp.json():
+            # La llave se registra SIEMPRE —`existing_matching_keys` la usa
+            # para detectar colisiones— aunque no haya nada que conservar.
             encontrados[r['matching_key']] = {
-                c: r[c] for c in _COLUMNAS_QUE_MANDA_LA_BASE}
+                c: r[c] for c in _COLUMNAS_QUE_MANDA_LA_BASE
+                if str(r[c] or '').strip()}
     return encontrados
 
 

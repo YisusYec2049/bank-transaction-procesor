@@ -194,9 +194,9 @@ def escribir_consolidado(monkeypatch):
     `payment_time` todavía no se corrió.
 
     `ya_en_base` simula pagos que YA están en el consolidado: un diccionario
-    `matching_key -> {'registration_date': ..., 'identification': ...}` con lo
-    que la base tiene guardado hoy. Es el grupo que el export acumulado de
-    Stripe vuelve a traer todos los días.
+    `matching_key -> {'registration_date': ..., 'identification': ...,
+    'email': ...}` con lo que la base tiene guardado hoy. Es el grupo que el
+    export acumulado de Stripe vuelve a traer todos los días.
     """
     def correr(filas, con_columna=True, ya_en_base=None):
         # El test de simulación de este mismo archivo deja el modo dry-run
@@ -329,6 +329,84 @@ def test_un_pago_que_ya_existe_no_pierde_el_documento_corregido_a_mano(escribir_
 
     assert enviados[0]['identification'] == '69715127', (
         'el documento de un pago que ya existe es el que la base tiene')
+
+
+# ---------------------------------------------------------------------------
+# El correo también lo edita una persona (2026-09-18)
+#
+# En Bancolombia y Prebancolombia el campo `email` NO es un correo: es la
+# REFERENCIA 1 del extracto, lo que digitó quien pagó. Con ella se resuelve el
+# CORREO(2) contra la hoja de ingresos, que conoce esa referencia y no el
+# documento real. Desde que la plataforma deja corregirlo a mano, el archivo no
+# puede pisarlo — si no, la corrección dura hasta la corrida siguiente.
+# ---------------------------------------------------------------------------
+
+def test_un_pago_que_ya_existe_no_pierde_el_correo_corregido_a_mano(escribir_consolidado):
+    """El archivo NO puede pisar el correo que corrigió una persona.
+
+    Con Stripe muerde todos los días: su export es acumulado, así que el mismo
+    pago vuelve a entrar en cada corrida con el correo del archivo.
+    """
+    enviados = escribir_consolidado(
+        [_fila_stripe('Andy Faz_2026-08-11_169', '69715127')],
+        ya_en_base={'Andy Faz_2026-08-11_169': {
+            'registration_date': '2026-08-11',
+            'identification':    '69715127',
+            'email':             'el.corregido@example.com'}},
+    )
+
+    assert enviados[0]['email'] == 'el.corregido@example.com', (
+        'el correo de un pago que ya existe es el que la base tiene')
+
+
+def test_el_archivo_llena_el_correo_cuando_la_base_lo_tiene_vacio(escribir_consolidado):
+    """Una celda vacía no es la decisión de nadie: ahí manda el archivo.
+
+    Al 18/09/2026 hay 35 pagos con el correo vacío y 195 con el documento
+    vacío. Si la base mandara también donde no tiene nada escrito, esas celdas
+    quedarían vacías para siempre — el único que puede llenarlas es el archivo.
+    """
+    enviados = escribir_consolidado(
+        [_fila_stripe('Andy Faz_2026-08-11_169', '69715127')],
+        ya_en_base={'Andy Faz_2026-08-11_169': {
+            'registration_date': '2026-08-11',
+            'identification':    '',
+            'email':             ''}},
+    )
+
+    assert enviados[0]['email'] == 'quien.paga@example.com', (
+        'con la base vacía, el correo lo aporta el archivo')
+    assert enviados[0]['identification'] == '69715127', (
+        'con la base vacía, el documento lo aporta el archivo')
+    assert enviados[0]['registration_date'] == '2026-08-11', (
+        'la fecha de ingreso sigue viniendo de la base')
+
+
+def test_corregir_el_documento_no_arrastra_el_correo(escribir_consolidado):
+    """Documento y correo son dos datos independientes, no uno repetido.
+
+    En Bancolombia entran iguales (el parser escribe REFERENCIA 1 en los dos) y
+    dejan de serlo en cuanto alguien corrige: uno pasa a ser QUIÉN ES la
+    persona y el otro sigue siendo QUÉ ESCRIBIÓ en el banco. Este es el caso
+    real del doc 901916551-7, que digitó `74500012486`.
+
+    Guardo de regresión: pasa con y sin la guarda de `email` —aquí el archivo
+    y la base traen la misma referencia—, y está para que el día que alguien
+    haga que corregir el documento arrastre el correo, esto lo cace.
+    """
+    fila = ['x', '74500012486', '07-09-2026', 'PAGO INTERBANC', 'TOBERIN',
+            '74500012486', 'BANCOLOMBIA', '', '', 721770.0,
+            '07/09/2026_74500012486_721770']
+    enviados = escribir_consolidado(
+        [fila],
+        ya_en_base={'07/09/2026_74500012486_721770': {
+            'registration_date': '2026-09-07',
+            'identification':    '901916551-7',
+            'email':             '74500012486'}},
+    )
+
+    assert enviados[0]['identification'] == '901916551-7', 'el documento corregido'
+    assert enviados[0]['email'] == '74500012486', 'la referencia que reportó el banco'
 
 
 def test_las_dos_tandas_llevan_las_mismas_claves(escribir_consolidado):
