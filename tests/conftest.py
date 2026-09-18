@@ -158,9 +158,19 @@ def mundo(monkeypatch):
             ('insert_cartera_preventiva_lineas', 'cartera_preventiva_lineas'),
             ('upsert_pago_asociaciones', 'pago_asociaciones'),
             ('upsert_cartera_saldos_favor', 'cartera_saldos_favor'),
+            ('upsert_pago_llave_numeros', 'pago_llave_numeros'),
         ]:
             if hasattr(modulo, nombre):
                 monkeypatch.setattr(modulo, nombre, _capturar(destino))
+
+        # Los números de canal aprendidos se leen con su propio helper (que
+        # trae red propia por si la tabla no existe), no con `select_all`, así
+        # que hay que responderle aparte desde el mundo declarado.
+        if hasattr(modulo, 'cargar_pago_llave_numeros'):
+            monkeypatch.setattr(modulo, 'cargar_pago_llave_numeros', lambda *_a, **_k: {
+                str(r['numero']).strip() for r in tablas.get('pago_llave_numeros', [])
+                if str(r.get('numero') or '').strip()
+            })
 
         # El sello recibe la lista de llaves en medio, no al final: `_capturar`
         # se quedaría con la fecha y no con lo que interesa.
@@ -237,8 +247,15 @@ def mundo_filtrable(monkeypatch):
         for nombre, destino in [('upsert_cruce', 'cruce_cartera'),
                                 ('upsert_pagos_apartados', 'pagos_apartados'),
                                 ('update_cruce_valores', 'cruce_update'),
-                                ('update_consolidated_campos', 'consolidated_update')]:
+                                ('update_consolidated_campos', 'consolidated_update'),
+                                ('upsert_pago_llave_numeros', 'pago_llave_numeros')]:
             monkeypatch.setattr(modulo, nombre, _capturar(destino))
+        # Su lector no pasa por `select_all` (trae red propia), así que sin
+        # esto saldría a internet de verdad desde el test.
+        monkeypatch.setattr(modulo, 'cargar_pago_llave_numeros', lambda *_a, **_k: {
+            str(r['numero']).strip() for r in tablas.get('pago_llave_numeros', [])
+            if str(r.get('numero') or '').strip()
+        })
         monkeypatch.setattr(modulo, 'delete_by_keys', lambda *a, **k: None)
 
         def _insertar(_url, _srk, tabla, filas, **_kw):

@@ -18,7 +18,11 @@ def _pago(matching_key, identification='', email='', metodo='BANCOLOMBIA',
           monto=500_000, fecha='2026-08-01'):
     return {
         'identification': identification, 'payment_date': fecha,
-        'transaction_code_1': 'PAGO QR', 'transaction_code_2': '',
+        # Descripción de relleno NEUTRA a propósito: desde el 18 de septiembre
+        # de 2026 "PAGO QR"/"PAGO LLAVE" son señal de que el pago entró por la
+        # llave de la universidad y lo apartan del proceso, así que usarlas
+        # como texto genérico haría que todas estas pruebas midieran otra cosa.
+        'transaction_code_1': 'TRANSFERENCIA CTA SUC', 'transaction_code_2': '',
         'email': email, 'payment_method': metodo, 'program': '', 'phone': '',
         'payment_amount': monto, 'matching_key': matching_key,
         'registration_date': fecha, 'metodo_de_pago': None,
@@ -129,6 +133,166 @@ def test_pago_por_llave_sale_del_proceso(mundo):
         'el pago por llave debió apartarse del proceso'
     )
     assert 'PAGO-1' not in _filas(capturado), 'un pago apartado no va al cruce'
+
+
+@pytest.mark.parametrize('descripcion', [
+    'PAGO LLAVE MARIA ISAB',
+    'PAGO QR JULIAN DAVID',
+    'pago llave edison esp',      # el banco no siempre escribe en mayúsculas
+    '  PAGO QR  RAFAEL NIC ',     # ni con los espacios parejos
+])
+@pytest.mark.parametrize('metodo', ['BANCOLOMBIA', 'PREBANCOLOMBIA'])
+def test_la_descripcion_de_llave_o_qr_aparta_el_pago(mundo, descripcion, metodo):
+    """Lo que dice el banco basta, sin mirar el número de la referencia.
+
+    Hasta el 18 de septiembre de 2026 estos pagos se apartaban solo por
+    reconocer `90473364` en la referencia. El día que la universidad cambie de
+    llave o de QR ese número no lo conoce nadie, y el pago se colaría entero al
+    cruce con una referencia que no identifica a ninguna persona.
+    """
+    pago = _pago('PAGO-1', identification='1112223334', metodo=metodo)
+    pago['transaction_code_1'] = descripcion
+
+    capturado = mundo(cruzar, tablas={
+        'consolidated_transactions': [pago], 'cartera_inscrip': [],
+    })
+
+    apartados = {a['matching_key']: a for a in capturado.get('pagos_apartados', [])}
+    assert 'PAGO-1' in apartados, 'un pago por llave/QR debió salir del proceso'
+    assert apartados['PAGO-1']['tipo'] == 'pago_llave'
+    assert 'PAGO-1' not in _filas(capturado), 'un pago apartado no va al cruce'
+
+
+@pytest.mark.parametrize('metodo', ['WOMPI PSE', 'WOMPI CARD', 'STRIPE', 'PLACETOPAY'])
+def test_un_codigo_de_pasarela_con_qr_adentro_no_se_aparta(mundo, metodo):
+    """🔴 El caso real que sostiene todo el cambio.
+
+    Los códigos de transacción de las pasarelas son texto aleatorio y a veces
+    traen "qr" por azar. Medido el 18 de septiembre de 2026: **43 pagos por
+    $25.034.222**, y **38 ya estaban cruzados con su cuota**. Buscar la palabra
+    suelta los habría apartado a todos.
+
+    (Lo que salva este caso es el "empieza por". Que además la fuente tenga que
+    ser de Bancolombia lo mide la prueba siguiente.)
+    """
+    pago = _pago('PAGO-1', identification='1002003004', metodo=metodo)
+    pago['transaction_code_1'] = '7l5Lun_1789678510977_qrp3rridwlr'
+
+    capturado = mundo(cruzar, tablas={
+        'consolidated_transactions': [pago],
+        'cartera_inscrip': [{'numero_id': '1002003004', 'id_inscripcion': '4321PN'}],
+    })
+
+    assert not capturado.get('pagos_apartados'), 'no debió apartarse nada'
+    assert _filas(capturado)['PAGO-1']['estado_cruce'] == 'cruzado'
+
+
+@pytest.mark.parametrize('metodo', ['WOMPI PSE', 'STRIPE', 'PLACETOPAY'])
+def test_fuera_de_bancolombia_esa_descripcion_no_significa_nada(mundo, metodo):
+    """La convención "PAGO LLAVE …" / "PAGO QR …" es de las dos cuentas de
+    Bancolombia: son las únicas que describen así (medido el 18 de septiembre
+    de 2026, 65 de 65).
+
+    En las pasarelas ese campo es el código de la transacción, o sea texto que
+    nadie controla, y no puede decidir que un pago salga del proceso.
+    """
+    pago = _pago('PAGO-1', identification='1002003004', metodo=metodo)
+    pago['transaction_code_1'] = 'PAGO QR JULIAN DAVID'
+
+    capturado = mundo(cruzar, tablas={
+        'consolidated_transactions': [pago],
+        'cartera_inscrip': [{'numero_id': '1002003004', 'id_inscripcion': '4321PN'}],
+    })
+
+    assert not capturado.get('pagos_apartados'), 'esa señal no vale fuera de Bancolombia'
+    assert _filas(capturado)['PAGO-1']['estado_cruce'] == 'cruzado'
+
+
+def test_una_descripcion_que_solo_menciona_el_qr_no_aparta(mundo):
+    """La señal es cómo EMPIEZA la descripción, no que la palabra aparezca."""
+    pago = _pago('PAGO-1', identification='1002003004')
+    pago['transaction_code_1'] = 'TRANSFERENCIA CTA SUC PAGO QR TARDIO'
+
+    capturado = mundo(cruzar, tablas={
+        'consolidated_transactions': [pago],
+        'cartera_inscrip': [{'numero_id': '1002003004', 'id_inscripcion': '4321PN'}],
+    })
+
+    assert not capturado.get('pagos_apartados')
+    assert _filas(capturado)['PAGO-1']['estado_cruce'] == 'cruzado'
+
+
+def test_el_numero_de_un_canal_nuevo_se_aprende_a_los_tres_pagos(mundo):
+    """El día que cambie la llave: se aprende el número para los que vengan
+    después, aunque el banco deje de escribir "PAGO LLAVE"."""
+    pagos = []
+    for i in range(1, 4):
+        p = _pago(f'PAGO-{i}', identification='55500011122')
+        p['transaction_code_1'] = f'PAGO LLAVE PERSONA {i}'
+        pagos.append(p)
+
+    capturado = mundo(cruzar, tablas={
+        'consolidated_transactions': pagos, 'cartera_inscrip': [],
+    })
+
+    aprendidos = [r['numero'] for r in capturado.get('pago_llave_numeros', [])]
+    assert aprendidos == ['55500011122']
+
+
+def test_con_menos_de_tres_pagos_el_numero_todavia_no_se_aprende(mundo):
+    """⚠️ El umbral distingue un CANAL de una PERSONA: por un canal pagan
+    decenas de estudiantes, una cédula aparecería una sola vez.
+
+    No aprender no pierde nada — la descripción sigue apartando el pago igual.
+    """
+    pagos = []
+    for i in range(1, 3):
+        p = _pago(f'PAGO-{i}', identification='55500011122')
+        p['transaction_code_1'] = f'PAGO LLAVE PERSONA {i}'
+        pagos.append(p)
+
+    capturado = mundo(cruzar, tablas={
+        'consolidated_transactions': pagos, 'cartera_inscrip': [],
+    })
+
+    assert not capturado.get('pago_llave_numeros'), 'no debió aprenderse todavía'
+    assert len(capturado.get('pagos_apartados', [])) == 2, 'pero sí apartarse los dos'
+
+
+def test_nunca_se_aprende_la_cedula_de_alguien_de_la_cartera(mundo):
+    """🔴 La guarda cara: aprender una cédula apartaría TODOS los pagos futuros
+    de esa persona, y eso no se deshace desde ninguna pantalla."""
+    pagos = []
+    for i in range(1, 5):
+        p = _pago(f'PAGO-{i}', identification='1002003004')
+        p['transaction_code_1'] = f'PAGO LLAVE PERSONA {i}'
+        pagos.append(p)
+
+    capturado = mundo(cruzar, tablas={
+        'consolidated_transactions': pagos,
+        'cartera_inscrip': [{'numero_id': '1002003004', 'id_inscripcion': '4321PN'}],
+    })
+
+    assert not capturado.get('pago_llave_numeros'), (
+        'ese número es la cédula de un estudiante: no se aprende jamás'
+    )
+    assert len(capturado.get('pagos_apartados', [])) == 4, 'los pagos sí se apartan'
+
+
+def test_un_numero_ya_aprendido_aparta_aunque_la_descripcion_no_diga_nada(mundo):
+    """Para qué sirve aprenderlo: el pago siguiente llega con otra descripción
+    y se aparta igual."""
+    pago = _pago('PAGO-1', identification='55500011122')
+    pago['transaction_code_1'] = 'TRANSFERENCIA CTA SUC'
+
+    capturado = mundo(cruzar, tablas={
+        'consolidated_transactions': [pago],
+        'pago_llave_numeros': [{'numero': '55500011122'}],
+        'cartera_inscrip': [],
+    })
+
+    apartados = {a['matching_key']: a for a in capturado.get('pagos_apartados', [])}
+    assert apartados['PAGO-1']['tipo'] == 'pago_llave'
 
 
 @pytest.mark.parametrize('numero', [

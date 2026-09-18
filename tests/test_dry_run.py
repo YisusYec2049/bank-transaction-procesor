@@ -124,7 +124,7 @@ def test_apagado_no_intercepta(sin_red):
 
 # Funciones de `utils/supabase.py` que NO escriben, y por eso no llevan guarda.
 _SOLO_LECTURA = {'select_all', 'existing_matching_keys', 'filas_existentes',
-                 'keys_del_dia_anterior'}
+                 'keys_del_dia_anterior', 'cargar_pago_llave_numeros'}
 
 
 def test_toda_funcion_de_escritura_tiene_guarda():

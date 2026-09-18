@@ -21,7 +21,9 @@ import cruzar
 def _pago(matching_key, identification='', email='', metodo='BANCOLOMBIA', monto=500_000):
     return {
         'identification': identification, 'payment_date': '2026-08-01',
-        'transaction_code_1': 'PAGO QR', 'transaction_code_2': '',
+        # Neutra a propósito: "PAGO QR"/"PAGO LLAVE" apartan el pago del
+        # proceso desde el 18 de septiembre de 2026.
+        'transaction_code_1': 'TRANSFERENCIA CTA SUC', 'transaction_code_2': '',
         'email': email, 'payment_method': metodo, 'program': '', 'phone': '',
         'payment_amount': monto, 'matching_key': matching_key,
         'registration_date': '2026-08-01', 'metodo_de_pago': None,

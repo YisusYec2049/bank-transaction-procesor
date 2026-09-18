@@ -270,3 +270,33 @@ def test_una_funcion_sin_lista_no_se_arriesga(espia):
 
     assert not espia['post']
     assert len(espia['patch']) == 1
+
+
+def test_sin_la_tabla_de_numeros_de_canal_la_corrida_sigue(monkeypatch):
+    """Desplegar antes de correr el SQL no puede matar la corrida.
+
+    Es la guarda del 14 de agosto: pedir una columna (o acá una tabla) que
+    todavía no existe tumba el bloque entero. Sin esto, el orden de despliegue
+    —código o SQL primero— decidiría si ese día entran los pagos.
+    """
+    import requests
+
+    def _explotar(*_a, **_kw):
+        raise requests.HTTPError('404: relation "pago_llave_numeros" does not exist')
+
+    monkeypatch.setattr(supabase, 'select_all', _explotar)
+
+    assert supabase.cargar_pago_llave_numeros('https://x', 'k') == set()
+
+
+def test_si_no_se_pueden_guardar_los_numeros_los_pagos_ya_quedaron_apartados(espia, monkeypatch):
+    """Perder el aprendizaje solo cuesta volver a intentarlo mañana; tumbar la
+    corrida cuesta los pagos del día."""
+    import requests
+
+    def _explotar(*_a, **_kw):
+        raise requests.HTTPError('404')
+
+    monkeypatch.setattr(supabase.http, 'post', _explotar)
+
+    supabase.upsert_pago_llave_numeros('https://x', 'k', [{'numero': '55500011122'}])

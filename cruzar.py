@@ -72,10 +72,22 @@ reales). Ahora, al inicio de main(), cada transacción se revisa contra:
     (semilla fija, no se agregan fondos especulativos), o coincide
     exactamente (normalizado) con algo en la tabla cesantias_patrones (lista
     aprendida, crece por uso desde financial-platform).
-  - Pago por llave: identification o email es uno de los identificadores de
-    canal fijos (ID_CANAL_PAGO_LLAVE) — NO son cédulas de personas, son
-    llaves de la universidad que aparecen idénticas en pagos de decenas de
-    estudiantes distintos.
+  - Pago por llave o QR, por DOS caminos (el segundo desde el 18 de
+    septiembre de 2026):
+      · la descripción del banco empieza por "PAGO LLAVE" o "PAGO QR"
+        (PREFIJOS_PAGO_LLAVE), y la fuente es Bancolombia o Prebancolombia
+        (FUENTES_PAGO_LLAVE) — las únicas dos que describen así;
+      · identification o email es uno de los identificadores de canal
+        (ID_CANAL_PAGO_LLAVE, más los que el propio pipeline haya aprendido
+        en `pago_llave_numeros`) — NO son cédulas de personas, son llaves de
+        la universidad que aparecen idénticas en pagos de decenas de
+        estudiantes distintos.
+    El primero existe porque el número puede cambiar y la descripción no: el
+    día que la universidad cambie de llave o de QR, ese número no lo conoce
+    nadie y el pago se colaría entero al cruce con una referencia que no
+    identifica a ninguna persona. Y por eso mismo un número visto en 3+ pagos
+    así descritos se APRENDE (ver _numero_a_aprender), para seguir apartando
+    por él si algún día el banco cambia el texto.
   - Números de la UC (4 de septiembre): identification o email es el NIT de
     la universidad o una de sus cuentas (NUMEROS_UC) — quien paga los
     escribió en la referencia en vez de su cédula. Mismo problema que el
@@ -209,6 +221,7 @@ estos nombres lleguen aquí.
 """
 
 import argparse
+import collections
 import logging
 import os
 import re
@@ -233,12 +246,14 @@ from utils.origen import (
 from utils.parser import normalizar_nit as _normalizar_nit
 from utils.parser import normalizar_sufijo as _normalizar_sufijo
 from utils.supabase import (
+    cargar_pago_llave_numeros,
     delete_by_keys,
     insert_rows,
     select_all,
     update_consolidated_campos,
     update_cruce_valores,
     upsert_cruce,
+    upsert_pago_llave_numeros,
     upsert_pagos_apartados,
 )
 
@@ -264,6 +279,40 @@ COINCIDENCIA_DIAS = 3
 # Ninguno de los dos identifica a una persona, así que nunca deben cruzarse
 # ni sugerirse por cadencia — se apartan del proceso por completo.
 ID_CANAL_PAGO_LLAVE = {'90473364', '800138188'}
+
+# Cómo describe Bancolombia un pago que entró por la llave o el QR de la
+# universidad: la descripción EMPIEZA por uno de estos dos textos, seguida del
+# nombre (cortado) de quien pagó — "PAGO LLAVE MARIA ISAB", "PAGO QR JULIAN
+# DAVID". Hasta el 18 de septiembre de 2026 estos pagos se apartaban solo por
+# reconocer el número de arriba en la referencia; hoy la descripción vale por
+# sí sola, que es la señal que NO cambia el día que la universidad cambie de
+# llave o de QR (ahí el número nuevo no lo conoce nadie y el pago se colaría
+# entero al cruce). Medido ese día: los 65 pagos así descritos traen los dos
+# criterios a la vez, así que el cambio no mueve ninguno hoy — es un seguro.
+PREFIJOS_PAGO_LLAVE = ('PAGO LLAVE', 'PAGO QR')
+
+# 🔴 Solo estas dos fuentes describen así, y acotarlo es lo que hace seguro
+# buscar "QR": hay 43 pagos de WOMPI ($25.034.222, 38 ya cruzados con su
+# cuota) cuyo CÓDIGO de transacción trae "qr" por puro azar
+# ("7l5Lun_1789678510977_qrp3rridwlr"). Sin este filtro se apartarían todos.
+FUENTES_PAGO_LLAVE = frozenset({'BANCOLOMBIA', 'PREBANCOLOMBIA'})
+
+# Un número de referencia visto en 3+ pagos descritos como llave/QR se guarda
+# en `pago_llave_numeros` para apartar por él a los que lleguen después,
+# aunque el banco cambie la descripción.
+#
+# ⚠️ El umbral es la guarda que distingue un CANAL de una PERSONA: por un
+# canal pagan decenas de estudiantes distintos, mientras que la cédula de
+# alguien aparecería una sola vez. Aprender una cédula sería grave — todos los
+# pagos futuros de esa persona se apartarían solos — y por eso además nunca se
+# aprende un número que exista en las inscripciones. Ser conservador no cuesta
+# nada: mientras tanto la descripción los sigue apartando igual.
+MIN_PAGOS_PARA_APRENDER_NUMERO = 3
+
+# Un número de canal es largo. Descarta restos de parseo que se cuelan donde
+# va la referencia (ver el hallazgo del 2 de septiembre: "19.", "OSCAR MEZA
+# 1012"), que no identifican nada y no vale la pena recordar.
+MIN_DIGITOS_NUMERO_CANAL = 6
 
 # Números de la UNIVERSIDAD que quien paga escribe en la referencia en vez de
 # su cédula: el NIT (con y sin dígito de verificación) y las dos cuentas de
@@ -311,8 +360,47 @@ def _es_cesantias(transaction_code_1: str, patrones_aprendidos: set[str]) -> boo
     return desc in patrones_aprendidos
 
 
-def _es_pago_llave(identification: str, email: str) -> bool:
-    return identification in ID_CANAL_PAGO_LLAVE or email in ID_CANAL_PAGO_LLAVE
+def _es_pago_llave(identification: str, email: str,
+                    numeros_aprendidos: frozenset[str] = frozenset()) -> bool:
+    """¿La referencia del pago es un número de canal, y no de una persona?
+
+    `numeros_aprendidos` son los que el propio pipeline guardó al ver 3+ pagos
+    descritos como llave/QR con ese número (ver `_numero_a_aprender`)."""
+    canal = ID_CANAL_PAGO_LLAVE | set(numeros_aprendidos)
+    return identification in canal or email in canal
+
+
+def _es_pago_llave_por_descripcion(transaction_code_1: str, payment_method: str) -> bool:
+    """¿El banco dice que este pago entró por la llave o el QR?
+
+    Se exige que la descripción EMPIECE por el texto y que la fuente sea una de
+    las dos cuentas de Bancolombia — las dos condiciones son la guarda contra
+    los códigos de pasarela que contienen "qr" por azar (ver
+    FUENTES_PAGO_LLAVE)."""
+    if str(payment_method or '').strip().upper() not in FUENTES_PAGO_LLAVE:
+        return False
+    return _normalizar_descripcion(transaction_code_1).startswith(PREFIJOS_PAGO_LLAVE)
+
+
+def _numero_a_aprender(identification: str, email: str,
+                        ya_conocidos: set[str], lookup_inscrip: dict) -> str | None:
+    """El número de referencia que vale la pena recordar de un pago apartado
+    por su descripción, o None si no hay ninguno que califique.
+
+    🔴 La guarda que importa: un número que existe en las inscripciones es la
+    cédula de alguien, y aprenderla apartaría todos sus pagos futuros. Ante la
+    duda no se aprende — la descripción sigue apartando el pago igual, así que
+    no aprender no pierde nada."""
+    for valor in (identification, email):
+        numero = str(valor or '').strip()
+        if not numero or numero in ya_conocidos or numero in ID_CANAL_PAGO_LLAVE:
+            continue
+        if len(_solo_digitos(numero)) < MIN_DIGITOS_NUMERO_CANAL:
+            continue
+        if numero in lookup_inscrip or _normalizar_nit(numero) in lookup_inscrip:
+            continue
+        return numero
+    return None
 
 
 def _solo_digitos(valor: str) -> str:
@@ -1513,22 +1601,42 @@ def main():
 
     log.info('Cargando pagos_apartados y patrones de cesantías...')
     apartados_rows = select_all(supabase_url, srk, 'pagos_apartados',
-                                 select='matching_key,tipo,incp_resuelto')
+                                 select='matching_key,tipo,incp_resuelto,identification')
     apartados_map = {r['matching_key']: r for r in apartados_rows}
     patrones_cesantias = {
         r['descripcion'] for r in select_all(supabase_url, srk, 'cesantias_patrones', select='descripcion')
         if r.get('descripcion')
     }
+    numeros_llave = cargar_pago_llave_numeros(supabase_url, srk)
 
-    nuevas_apartadas = []
+    # Cuántos pagos de llave/QR se han visto ya con cada número. El acumulado
+    # sale de los que YA están apartados (no de esta corrida sola): si no, un
+    # número nuevo tardaría en llegar al umbral solo porque los pagos entran de
+    # a pocos por día.
+    vistos_por_numero: collections.Counter = collections.Counter(
+        str(r.get('identification') or '').strip()
+        for r in apartados_rows
+        if r.get('tipo') == 'pago_llave' and str(r.get('identification') or '').strip()
+    )
+
+    nuevas_apartadas, candidatos_numero = [], {}
     for t in transacciones:
         mk = t.get('matching_key')
         if mk in apartados_map:
             continue
         identification = str(t.get('identification') or '').strip()
         email          = str(t.get('email') or '').strip()
-        if _es_pago_llave(identification, email):
+        por_descripcion = _es_pago_llave_por_descripcion(
+            t.get('transaction_code_1'), t.get('payment_method'))
+        if por_descripcion or _es_pago_llave(identification, email, numeros_llave):
             tipo = 'pago_llave'
+            if por_descripcion:
+                # Solo la descripción enseña un número nuevo: si el pago se
+                # apartó por reconocer el número, ese número ya se conoce.
+                nuevo = _numero_a_aprender(identification, email, numeros_llave, lookup_inscrip)
+                if nuevo:
+                    vistos_por_numero[nuevo] += 1
+                    candidatos_numero[nuevo] = t.get('transaction_code_1')
         elif _es_cesantias(t.get('transaction_code_1'), patrones_cesantias):
             # Cesantías va ANTES que los números de la UC a propósito: la
             # descripción dice de qué es el pago y el número solo dice que la
@@ -1566,6 +1674,25 @@ def main():
         n_uc        = sum(1 for a in nuevas_apartadas if a['tipo'] == 'numeros_uc')
         log.info('%d pago(s) apartados automáticamente (cesantias=%d, pago_llave=%d, numeros_uc=%d).',
                   len(nuevas_apartadas), n_cesantias, n_llave, n_uc)
+
+    # Los números que llegaron al umbral se guardan para apartar por ellos a
+    # los pagos que vengan después, aunque el banco cambie la descripción.
+    aprendidos = sorted(
+        numero for numero in candidatos_numero
+        if vistos_por_numero[numero] >= MIN_PAGOS_PARA_APRENDER_NUMERO
+    )
+    if aprendidos:
+        upsert_pago_llave_numeros(supabase_url, srk, [
+            {'numero': numero, 'visto_en': candidatos_numero[numero]} for numero in aprendidos
+        ])
+        numeros_llave |= set(aprendidos)
+        log.info('%d número(s) de canal aprendidos de pagos llave/QR: %s.',
+                  len(aprendidos), ', '.join(aprendidos))
+    en_espera = {n: vistos_por_numero[n] for n in candidatos_numero if n not in set(aprendidos)}
+    if en_espera:
+        log.info('%d número(s) vistos en pagos llave/QR todavía bajo el umbral de %d: %s.',
+                  len(en_espera), MIN_PAGOS_PARA_APRENDER_NUMERO,
+                  ', '.join(f'{n} ({v})' for n, v in sorted(en_espera.items())))
 
     excluir_sin_incp    = {mk for mk, info in apartados_map.items() if not info.get('incp_resuelto')}
     reintegrar_con_incp = {mk: info['incp_resuelto'] for mk, info in apartados_map.items()

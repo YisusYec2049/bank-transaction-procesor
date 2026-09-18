@@ -758,6 +758,50 @@ def upsert_pagos_apartados(supabase_url: str, service_role_key: str, rows: list[
     log.info('Upsert pagos_apartados OK: %d registros, HTTP %s.', len(rows), resp.status_code)
 
 
+def cargar_pago_llave_numeros(supabase_url: str, service_role_key: str) -> set[str]:
+    """Los números de canal que el pipeline aprendió de pagos descritos como
+    llave/QR (ver `_numero_a_aprender` en cruzar.py).
+
+    ⚠️ Se lee CON RED: si la tabla todavía no existe, avisa en el log y la
+    corrida sigue con la lista fija. Es la guarda del 14 de agosto — pedir algo
+    que aún no está creado tumba la corrida entera, y así el orden de
+    despliegue (código o SQL primero) deja de importar."""
+    try:
+        rows = select_all(supabase_url, service_role_key, 'pago_llave_numeros', select='numero')
+    except requests.HTTPError:
+        log.warning('La tabla pago_llave_numeros no existe todavía: se sigue solo con los '
+                    'números fijos. Correr el SQL para activar el aprendizaje.')
+        return set()
+    return {str(r['numero']).strip() for r in rows if str(r.get('numero') or '').strip()}
+
+
+def upsert_pago_llave_numeros(supabase_url: str, service_role_key: str, rows: list[dict]) -> None:
+    """Guarda números de canal aprendidos. Upsert por `numero`, así que volver a
+    ver el mismo no falla ni pisa cuándo se aprendió.
+
+    Igual que al leerlos, un fallo NO tumba la corrida: los pagos de esta
+    tanda ya quedaron apartados por su descripción, que es lo que importa —
+    perder el aprendizaje solo significa volver a intentarlo mañana."""
+    if dry_run.registrar('pago_llave_numeros', 'upsert', rows):
+        return
+    if not rows:
+        return
+    hdrs = _headers(service_role_key, prefer='return=minimal,resolution=merge-duplicates')
+    try:
+        resp = http.post(
+            f'{supabase_url}/rest/v1/pago_llave_numeros?on_conflict=numero',
+            json=rows,
+            headers=hdrs,
+            timeout=30,
+        )
+        _raise_for_status(resp)
+    except requests.HTTPError:
+        log.warning('No se pudieron guardar %d número(s) de canal en pago_llave_numeros '
+                    '(¿falta correr el SQL?). Los pagos quedaron apartados igual.', len(rows))
+        return
+    log.info('Upsert pago_llave_numeros OK: %d registro(s), HTTP %s.', len(rows), resp.status_code)
+
+
 def upsert_cartera_saldos_favor(supabase_url: str, service_role_key: str, rows: list[dict]) -> None:
     """Upsert por (matching_key, llave_origen) a cartera_saldos_favor: el
     ledger de saldo a favor asociable por cliente (modelo "Saldo a Favor
