@@ -36,6 +36,12 @@ log = logging.getLogger(__name__)
 ENTRADA = 'entrada'
 HISTORICO = 'historico'
 
+# El apartado donde la pantalla deja un archivo recién soltado para que se lo
+# revise ANTES de que entre a la bandeja. 🔴 El pipeline NO lo lista nunca: un
+# archivo acá no existe para la corrida — todavía no lo subieron, solo lo
+# soltaron. Pasa a `entrada/` cuando la persona aprieta "Subir".
+REVISION = 'revision'
+
 # Supabase deja un objeto vacío para que una "carpeta" exista aunque no tenga
 # archivos. No es un archivo del área y no se debe intentar procesar.
 _PLACEHOLDER = '.emptyFolderPlaceholder'
@@ -128,8 +134,16 @@ def listar(fuente: str) -> list[dict]:
         offset += _POR_PAGINA
 
 
-def caducar(fuentes: list[str], dias: int = 90) -> int:
-    """Borra del histórico lo que tenga más de `dias`. Devuelve cuántos borró.
+def caducar(fuentes: list[str], dias: int = 90, zona: str = HISTORICO) -> int:
+    """Borra de `zona` lo que tenga más de `dias`. Devuelve cuántos borró.
+
+    Se usa con dos zonas y dos plazos muy distintos:
+
+    - `historico/` a los **90 días** — archivos ya procesados, ver abajo.
+    - `revision/` a los **2 días** — archivos que alguien soltó en la pantalla y
+      nunca subió. Ahí el plazo es corto a propósito: no son documentos, son
+      intentos abandonados, y el único motivo para conservarlos un par de días
+      es que nadie pierda su trabajo por cerrar la pestaña.
 
     Decisión del usuario (2026-09-06): **tres meses**. Los archivos de algunas
     fuentes son acumulativos —cada export de Stripe trae casi todo el anterior
@@ -158,7 +172,7 @@ def caducar(fuentes: list[str], dias: int = 90) -> int:
                 resp = http.post(
                     f'{url}/storage/v1/object/list/{bucket}',
                     headers={**_headers(srk), 'Content-Type': 'application/json'},
-                    json={'prefix': f'{HISTORICO}/{fuente}/', 'limit': _POR_PAGINA,
+                    json={'prefix': f'{zona}/{fuente}/', 'limit': _POR_PAGINA,
                           'offset': offset,
                           'sortBy': {'column': 'created_at', 'order': 'asc'}},
                     timeout=30,
@@ -166,7 +180,7 @@ def caducar(fuentes: list[str], dias: int = 90) -> int:
                 resp.raise_for_status()
                 pagina = resp.json() or []
             except Exception:
-                log.warning('DEPÓSITO [%s]: no se pudo revisar el histórico para caducar.', fuente)
+                log.warning('DEPÓSITO [%s]: no se pudo revisar %s para caducar.', fuente, zona)
                 break
 
             for obj in pagina:
@@ -174,7 +188,7 @@ def caducar(fuentes: list[str], dias: int = 90) -> int:
                 if not obj.get('id') or not nombre or nombre == _PLACEHOLDER:
                     continue
                 if _es_viejo(obj.get('created_at'), corte):
-                    viejos.append(ruta(HISTORICO, fuente, nombre))
+                    viejos.append(ruta(zona, fuente, nombre))
 
             if len(pagina) < _POR_PAGINA:
                 break
@@ -182,7 +196,7 @@ def caducar(fuentes: list[str], dias: int = 90) -> int:
 
         if not viejos:
             continue
-        if dry_run.registrar(f'deposito:{HISTORICO}/{fuente}', 'delete', viejos):
+        if dry_run.registrar(f'deposito:{zona}/{fuente}', 'delete', viejos):
             continue
         try:
             resp = http.delete(f'{url}/storage/v1/object/{bucket}',
@@ -190,8 +204,8 @@ def caducar(fuentes: list[str], dias: int = 90) -> int:
                                json={'prefixes': viejos}, timeout=60)
             resp.raise_for_status()
             borrados += len(viejos)
-            log.info('DEPÓSITO [%s]: %d archivo(s) de más de %d días borrados del histórico.',
-                     fuente, len(viejos), dias)
+            log.info('DEPÓSITO [%s]: %d archivo(s) de más de %d días borrados de %s.',
+                     fuente, len(viejos), dias, zona)
         except Exception:
             log.warning('DEPÓSITO [%s]: no se pudieron borrar %d archivo(s) viejo(s).',
                         fuente, len(viejos))

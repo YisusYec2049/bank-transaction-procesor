@@ -682,6 +682,11 @@ def main():
     try:
         if deposito.activo():
             deposito.caducar(FUENTES_DEL_DEPOSITO)
+            # Y los archivos que alguien soltó en la pantalla y nunca subió: son
+            # intentos abandonados, no documentos, así que duran 2 días. Sin
+            # esto el apartado de revisión crece para siempre — nadie lo mira y
+            # nada lo vacía, porque el pipeline no lo lista nunca.
+            deposito.caducar(FUENTES_DEL_DEPOSITO, dias=2, zona=deposito.REVISION)
     except Exception:
         log.exception('No se pudo caducar el histórico del depósito (la corrida ya terminó bien).')
 

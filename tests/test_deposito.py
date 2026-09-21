@@ -314,3 +314,25 @@ def test_la_caducidad_solo_mira_el_historico(monkeypatch):
     deposito.caducar(['wompi', 'stripe'], dias=90)
 
     assert prefijos == ['historico/wompi/', 'historico/stripe/']
+
+
+def test_la_caducidad_del_apartado_de_revision_solo_mira_revision(monkeypatch):
+    """Un archivo soltado en la pantalla y nunca subido vive en `revision/`, y
+    de ahí se limpia con su propio plazo (2 días).
+
+    ⚠️ Es el único sitio del depósito que **nadie vacía solo**: el pipeline no lo
+    lista nunca —a propósito, un archivo ahí todavía no fue subido— así que sin
+    esta limpieza crecería para siempre. Y la entrada NO se toca ni por
+    equivocación: ahí está lo que el área sí subió."""
+    prefijos = []
+    borrados = []
+    monkeypatch.setattr(deposito.http, 'post',
+                        lambda _u, **kw: prefijos.append(kw['json']['prefix'])
+                        or _Resp([_obj_con_fecha('abandonado.xlsx', 5)]))
+    monkeypatch.setattr(deposito.http, 'delete',
+                        lambda _u, **kw: borrados.extend(kw['json']['prefixes']) or _Resp())
+
+    assert deposito.caducar(['payu_uc'], dias=2, zona=deposito.REVISION) == 1
+
+    assert prefijos == ['revision/payu_uc/']
+    assert borrados == ['revision/payu_uc/abandonado.xlsx']
