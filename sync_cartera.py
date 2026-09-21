@@ -43,7 +43,7 @@ from datetime import datetime
 import pytz
 from dotenv import load_dotenv
 
-from utils import deposito, dry_run
+from utils import deposito, dry_run, registro
 from utils.excel_cartera import (
     read_bancolombia_2576,
     read_bancolombia_2833,
@@ -73,6 +73,12 @@ PAYU_UC_FILENAME     = 'Payu UC.xlsx'
 INGRESOS_FILENAME    = 'Ingresos PSE y PAYU.xlsx'
 CARTERA_PREV_PATTERN = 'CARTERA PREVENTIVA'
 
+# Código de salida cuando un archivo de cruce se subió y NO se pudo leer.
+# Se distingue del fallo genérico (1) a propósito: la corrida no se rompió, se
+# FRENÓ, y son dos mensajes distintos en la pantalla — "no se procesó nada
+# porque un archivo de cruce está mal" contra "la corrida falló".
+SALIDA_CRUCE_ILEGIBLE = 3
+
 
 def _registrar_carga_staged(supabase_url: str, srk: str, filas: int) -> str:
     """Marca en `cartera_cargas` que hay una versión nueva de Cartera
@@ -95,24 +101,53 @@ def _registrar_carga_staged(supabase_url: str, srk: str, filas: int) -> str:
     return carga_id
 
 
-def _procesar_opcional(nombre: str, bandeja: Bandeja, cargar) -> None:
+def _procesar_opcional(nombre: str, bandeja: Bandeja, cargar) -> dict | None:
     """Patrón común a los 3 archivos de referencia: buscar en su bandeja →
     si está, descargar + cargar (`cargar` hace el replace_table y devuelve
-    True/False según si tocó la tabla) + mover a Histórico; si no está,
-    loguear y seguir SIN error — los 3 son opcionales.
+    CUÁNTAS filas cargó, 0 si no tocó la tabla) + mover a Histórico; si no
+    está, loguear y seguir SIN error — los 3 son opcionales.
 
     Cada bandeja está dedicada a un solo tipo de archivo, así que se toma el
-    más reciente que haya sin importar cómo se llame."""
+    más reciente que haya sin importar cómo se llame. **El nombre no decide
+    nada**: lo que hace que un archivo sea el de esta bandeja es su estructura,
+    que es justamente lo que `cargar` comprueba al leerlo.
+
+    Devuelve `None` si todo fue bien, o el registro del fallo si el archivo se
+    subió y no se pudo leer — ver la explicación del freno en `main()`.
+
+    🔴 **"No lo subieron" y "lo subieron mal" son dos cosas distintas**, y esa
+    es toda la regla de este archivo. Que falte es normal (Ingresos se sube
+    unos días sí y otros no) y la corrida sigue con lo que ya estaba cargado.
+    Que esté y no se pueda leer NO es normal: significa que el área cree que
+    actualizó esa referencia y no es cierto, así que repartir pagos contra la
+    versión vieja es aplicar plata de hoy sobre información de antes — y un
+    pago se reparte UNA SOLA VEZ en su vida, así que deshacerlo después es
+    descartar y asociar a mano, cuota por cuota."""
     archivo = mas_reciente(bandeja)
     if not archivo:
         log.info('%s: nadie lo subió esta corrida (bandeja "%s"), se omite.',
                  nombre, bandeja.fuente)
-        return
+        return None
 
     log.info('Descargando %s ...', nombre)
-    ok = cargar(archivo)
-    if not ok:
-        return  # `cargar` ya logueó por qué no se movió (ej. lectura vacía)
+    try:
+        filas = cargar(archivo)
+    except Exception as exc:
+        # El archivo se queda en su bandeja a propósito: es lo que deja
+        # reemplazarlo desde la pantalla y volver a procesar sin que nadie
+        # toque el servidor.
+        log.exception('%s: se subió a la bandeja "%s" y NO se pudo leer.', nombre, bandeja.fuente)
+        motivo = f'{type(exc).__name__}: {exc}'
+        # Queda anotado en el registro que ya mira la pantalla, así el área ve
+        # el archivo en rojo con su motivo sin que nadie lea un log del
+        # servidor — que es lo que dejó pasar el atasco de Stripe un mes.
+        registro.anotar(archivo, resultado='error', detalle=f'No se pudo leer. {motivo}')
+        return {'nombre': nombre, 'archivo': archivo, 'motivo': motivo}
+
+    if not filas:
+        return None  # `cargar` ya logueó por qué no se movió (ej. lectura vacía)
+
+    registro.anotar(archivo, filas_leidas=filas, resultado='ok')
 
     # ⚠️ Archivar es el ÚLTIMO paso y el menos importante: la tabla de
     # referencia ya quedó cargada arriba. Si falla, se avisa fuerte y la corrida
@@ -134,8 +169,10 @@ def _procesar_opcional(nombre: str, bandeja: Bandeja, cargar) -> None:
                       'la corrida SIGUE; hay que sacarlo a mano o se va a releer cada corrida.',
                       nombre)
 
+    return None
 
-def main():
+
+def main() -> int:
     parser = argparse.ArgumentParser(description='Refresca las tablas de referencia desde la plataforma.')
     dry_run.agregar_flags(parser)
     args = parser.parse_args()
@@ -159,15 +196,15 @@ def main():
         log.error('DEPOSITO_BUCKET no está configurada: no hay de dónde leer los archivos de '
                   'referencia. Las tablas de referencia se quedan como estaban.')
 
-    def _cargar_payu_uc(archivo) -> bool:
+    def _cargar_payu_uc(archivo) -> int:
         rows = read_inscrip(descargar(archivo))
         if not rows:
             log.warning('Payu UC: 0 filas leídas, se omite la carga (no se toca cartera_inscrip).')
-            return False
+            return 0
         replace_table(supabase_url, srk, 'cartera_inscrip', rows)
-        return True
+        return len(rows)
 
-    def _cargar_ingresos(archivo) -> bool:
+    def _cargar_ingresos(archivo) -> int:
         ingresos_bytes = descargar(archivo).read()
         bc2576_rows = read_bancolombia_2576(io.BytesIO(ingresos_bytes))
         bc2833_rows = read_bancolombia_2833(io.BytesIO(ingresos_bytes))
@@ -176,41 +213,78 @@ def main():
         if not (bc2576_rows or bc2833_rows or wompi_rows or stripe_rows):
             log.warning('Ingresos PSE y PAYU: 0 filas leídas en las 4 hojas, se omite la carga '
                         '(no se tocan las tablas cartera_ingresos_*).')
-            return False
+            return 0
         replace_table(supabase_url, srk, 'cartera_ingresos_bancolombia_2576', bc2576_rows)
         replace_table(supabase_url, srk, 'cartera_ingresos_wompi', wompi_rows)
         replace_table(supabase_url, srk, 'cartera_ingresos_stripe_usa', stripe_rows)
-        # 2833 aparte: read_bancolombia_2833 devuelve vacío (sin lanzar) si su
-        # hoja cambió de forma, y un replace_table con [] borraría el mirror
-        # entero. Se conserva lo cargado la vez anterior — para los pagos de
-        # 2833 una hoja vieja sigue siendo mejor señal que ninguna.
+        # 2833 aparte: si su hoja no se puede leer, `read_bancolombia_2833`
+        # lanza y la corrida se frena arriba. Acá se cubre el otro caso —la
+        # hoja se leyó y vino vacía—, donde un replace_table con [] borraría el
+        # mirror entero: se conserva lo cargado la vez anterior, que para los
+        # pagos de 2833 sigue siendo mejor señal que ninguna.
         if bc2833_rows:
             replace_table(supabase_url, srk, 'cartera_ingresos_bancolombia_2833', bc2833_rows)
         else:
             log.error('BANCOL 2833: 0 filas, no se reemplaza cartera_ingresos_bancolombia_2833 '
                       '(se conserva la carga anterior).')
-        return True
+        return len(bc2576_rows) + len(bc2833_rows) + len(wompi_rows) + len(stripe_rows)
 
-    def _cargar_cartera_prev(archivo) -> bool:
+    def _cargar_cartera_prev(archivo) -> int:
         rows = read_cartera_preventiva(descargar(archivo))
         ok = replace_cartera_preventiva_staging(supabase_url, srk, rows)
-        if ok:
-            carga_id = _registrar_carga_staged(supabase_url, srk, len(rows))
-            log.info('Cartera Preventiva: %d fila(s) a staging, carga %s marcada "staged".',
-                      len(rows), carga_id)
-        return ok
+        if not ok:
+            return 0
+        carga_id = _registrar_carga_staged(supabase_url, srk, len(rows))
+        log.info('Cartera Preventiva: %d fila(s) a staging, carga %s marcada "staged".',
+                  len(rows), carga_id)
+        return len(rows)
 
     # El `nombre` que se pasa es solo la etiqueta para los logs; la bandeja es
     # la que sabe de dónde sale el archivo y a dónde se archiva.
-    _procesar_opcional(PAYU_UC_FILENAME, Bandeja(fuente='payu_uc'), _cargar_payu_uc)
-    _procesar_opcional(INGRESOS_FILENAME, Bandeja(fuente='ingresos'), _cargar_ingresos)
-    _procesar_opcional(CARTERA_PREV_PATTERN, Bandeja(fuente='cartera_prev'),
-                       _cargar_cartera_prev)
+    #
+    # Se intentan los 3 aunque uno falle, a propósito: así una corrida reporta
+    # TODOS los archivos que hay que corregir en vez de destapar uno por día.
+    fallos = [f for f in (
+        _procesar_opcional(PAYU_UC_FILENAME, Bandeja(fuente='payu_uc'), _cargar_payu_uc),
+        _procesar_opcional(INGRESOS_FILENAME, Bandeja(fuente='ingresos'), _cargar_ingresos),
+        _procesar_opcional(CARTERA_PREV_PATTERN, Bandeja(fuente='cartera_prev'),
+                           _cargar_cartera_prev),
+    ) if f]
+
+    if fallos:
+        # 🔴 EL FRENO. Este script es el primero de la cadena
+        # (`sync_cartera && procesar_todos && cruzar && preventiva`), así que
+        # salir distinto de 0 acá es lo que impide que se procese un solo pago.
+        #
+        # Es DELIBERADO, no el efecto de que se escape una excepción. Hasta el
+        # 2026-09-21 pasaba lo segundo: el 21 subieron a la bandeja de Payu UC
+        # un Excel que no era (sin la hoja `Inscrip`), el lector reventó, la
+        # cadena murió y la pantalla dijo "no entró ningún archivo nuevo" —
+        # porque un fallo y una corrida sin trabajo se veían igual. El área
+        # estuvo dos horas sin saber que sus 9 archivos seguían sin entrar.
+        #
+        # Lo que cambia es que ahora se frena DICIENDO qué pasó, y con el
+        # archivo culpable anotado en el registro que ya mira la pantalla.
+        log.error('%s', '─' * 70)
+        log.error('CORRIDA FRENADA: %d archivo(s) de cruce se subieron y no se pudieron leer.',
+                  len(fallos))
+        for f in fallos:
+            log.error('  · %s (bandeja "%s") → %s',
+                      f['archivo'].get('name'), f['archivo'].get('fuente'), f['motivo'])
+        log.error('NO se procesó ningún pago. Los archivos se quedan en su bandeja: al '
+                  'reemplazarlos por los correctos y volver a procesar, la corrida sigue sola.')
+        log.error('%s', '─' * 70)
+        return SALIDA_CRUCE_ILEGIBLE
 
     log.info('sync_cartera.py completado.')
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    codigo = main()
+    # El resumen de la simulación se imprime SIEMPRE, también cuando la corrida
+    # se frena: si no, probar el freno con `--dry-run` no mostraría nada.
     if dry_run.activo():
         log.warning('%s', dry_run.resumen())
+    if codigo:
+        sys.exit(codigo)

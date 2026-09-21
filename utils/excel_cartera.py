@@ -185,12 +185,22 @@ def read_bancolombia_2833(path: str | BinaryIO) -> list[dict]:
     (ej. "SANTIAGO MORA 0058"), que jamás van a cruzar por documento. Para
     esos pagos esta hoja es la ÚNICA señal de identidad.
 
-    A diferencia de las otras 3 hojas, una falla de lectura aquí NO tumba la
-    corrida: se loguea como error y se devuelve vacío. Es una hoja añadida
-    después, con un encabezado menos estándar que el resto, y su peor caso
-    (los pagos de 2833 se quedan en Excepciones, como estaban antes) es
-    visible en la plataforma; en cambio un ValueError aquí corta la cadena
-    del cron con `&&` y deja el pipeline entero sin correr ese día.
+    🔴 **Una falla de lectura aquí FRENA la corrida** (2026-09-21). Hasta esa
+    fecha se tragaba el problema: se logueaba y se devolvía vacío, para que un
+    error en la hoja menos estándar del archivo no dejara al pipeline sin
+    correr. Lo que mostró que el remedio era peor: el 2026-09-18 el área
+    renombró esta hoja a `PREBANCOLOMBIA 2833` y el pipeline dejó de leerla
+    **cuatro días sin que nadie se enterara**, conservando la copia del 14 de
+    septiembre mientras el área seguía anotando ahí a quién pertenece cada pago
+    — o sea, trabajo que el sistema ya no estaba recibiendo.
+
+    La regla de hoy es la del resto de los archivos de cruce: si se subió y no
+    se puede leer, no se reparte nada (ver `_procesar_opcional` en
+    `sync_cartera.py`). Vale la pena el freno porque para los pagos de la 2833
+    esta hoja es la única señal de identidad que existe.
+
+    ⚠️ Una hoja que SÍ se lee y viene vacía no frena nada: eso no es un problema
+    de formato, y se conserva la carga anterior (ver `sync_cartera.py`).
     """
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
     try:
@@ -198,9 +208,7 @@ def read_bancolombia_2833(path: str | BinaryIO) -> list[dict]:
             ws = wb['BANCOL 2833']
             header_row, cols = _find_header_row(ws, ['REFERENCIA 1', 'N° de Inscripción', 'FECHA'])
         except (KeyError, ValueError) as e:
-            log.error('BANCOL 2833 (Ingresos): no se pudo leer la hoja (%s). Los pagos de la '
-                      '2833 se quedan sin CORREO(2) esta corrida; la tabla mirror no se toca.', e)
-            return []
+            raise ValueError(f'hoja "BANCOL 2833": {e}') from e
 
         rows = []
         for row in ws.iter_rows(min_row=header_row + 1, values_only=True):
