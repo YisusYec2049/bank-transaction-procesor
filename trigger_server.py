@@ -36,6 +36,7 @@ Funnel delante y sin el token configurado.
 import contextlib
 import fcntl
 import hmac
+import logging
 import os
 import subprocess
 import threading
@@ -44,6 +45,10 @@ from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
+
+from utils import deposito, revision
+
+log = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -382,6 +387,45 @@ def trigger_sync():
     if not _autorizado():
         return jsonify(error="unauthorized"), 401
     return _disparar(sync=True, solo_sync=True)
+
+
+@app.post("/archivo/revisar")
+def archivo_revisar():
+    """¿El archivo que acaban de subir sirve para la caja donde lo pusieron?
+
+    Lo pregunta la pantalla de carga apenas termina de subir un archivo, y con
+    la respuesta pinta la tarjeta en verde o en rojo. Es la única forma de que
+    el área se entere **mientras todavía está ahí, con el archivo bueno a mano**:
+    el 2026-09-21 subieron a la caja de Payu UC un Excel que no era y lo supieron
+    dos horas después, con los 188 pagos del día sin entrar.
+
+    Recibe `{"fuente": "payu_uc", "ruta": "entrada/payu_uc/Payu UC.xlsx"}` —
+    **la ruta, nunca el archivo**: ya está en el depósito, así que se baja de
+    ahí y no viaja dos veces (y de paso esquiva el límite de tamaño de peticiones
+    de Vercel, que los archivos de referencia superan con holgura).
+
+    🔴 **No toca nada.** No procesa, no archiva, no escribe: solo abre el archivo
+    y contesta. Por eso NO pide el carril del pipeline y se puede llamar mientras
+    hay una corrida en curso — si tomara el candado, subir un archivo quedaría
+    bloqueado los 3 minutos que dura la corrida, justo cuando el área está
+    subiendo el resto.
+    """
+    if not _autorizado():
+        return jsonify(error="unauthorized"), 401
+
+    cuerpo = request.get_json(silent=True) or {}
+    fuente = str(cuerpo.get("fuente") or "").strip()
+    ruta   = str(cuerpo.get("ruta") or "").strip()
+    if not fuente or not ruta:
+        return jsonify(error="faltan 'fuente' y/o 'ruta'"), 400
+
+    try:
+        contenido = deposito.descargar(ruta)
+    except Exception:
+        log.exception("No se pudo bajar %s del depósito para revisarlo.", ruta)
+        return jsonify(error="no se encontró el archivo en el depósito"), 404
+
+    return jsonify(**revision.revisar(fuente, contenido))
 
 
 @app.get("/trigger/reproceso/status")
