@@ -1836,9 +1836,31 @@ def main():
         confirmada = cuota.get('pago_confirmado') is not None
         refleja_resultado = confirmada or _mismo_monto(
             cuota.get('diferencia'), round(fila['diferencia'] + excedente, 2))
+        # Y el resultado incluye algo que NO es plata: la etiqueta de WOMPI link
+        # (28 de septiembre). El ReportePagosWompi es lo único que dice si un
+        # pago vino por link automático, y el área lo sube cuando lo tiene. Si
+        # llega DESPUÉS de la corrida que aplicó el pago, `cruzar.py` corrige la
+        # fila del cruce (Fase 9.4, re-evalúa filas ya cruzadas) y la cuota se
+        # quedaba con la etiqueta del día en que se aplicó —para siempre—,
+        # porque mirando solo plata no había nada que hacer. El filtro "WOMPI
+        # automático/manual" de Cartera y su descarga las contaban del lado
+        # equivocado: 14 cuotas medidas el 28/09, todas del mismo día.
+        #
+        # `correo_elec` no se compara aparte: cuando la etiqueta cambia, la fila
+        # se reescribe entera y `_fila_cierre` ya lo deja en WOMPI_LINK_LABEL.
+        # Comparar el correo además abriría la puerta a oscilar contra cualquier
+        # otra mano que escriba esa columna.
+        #
+        # Y va con la misma guarda de arriba —solo cuotas SIN confirmar—: en una
+        # confirmada `_fila_cierre` deshace el cierre a propósito (23 de julio,
+        # punto #1), y corregir una etiqueta no puede costarle eso a una cuota
+        # que una persona ya dio por cobrada. Medido el 28/09: las 14 estaban
+        # sin confirmar, así que la guarda no deja ninguna afuera.
+        etiqueta_ok = confirmada or (
+            bool(cuota.get('es_wompi_automatico')) == fila['es_wompi_automatico'])
         if (cuota.get('fecha_cruce') and valor_pago_actual is not None
                 and round(float(valor_pago_actual), 2) in (suma, visible)
-                and refleja_resultado):
+                and refleja_resultado and etiqueta_ok):
             continue  # ya refleja este resultado, nada que hacer (idempotencia)
 
         actualizaciones_cierre.append(fila)

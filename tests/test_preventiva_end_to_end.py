@@ -2080,3 +2080,67 @@ def test_la_linea_se_queda_cuando_su_cuota_cerro_debiendo_con_pago_encima(mundo)
         'se borró la deuda de $131.361 que la cuota cerrada arrastra al mes '
         'siguiente'
     )
+
+
+# ── La etiqueta de WOMPI link cuando el reporte llega tarde (28 de septiembre) ─
+# El ReportePagosWompi es lo único que dice si un pago vino por link automático,
+# y el área lo sube cuando lo tiene. Si llega DESPUÉS de la corrida que aplicó el
+# pago, `cruzar.py` corrige la fila del cruce (Fase 9.4) pero la cuota se quedaba
+# con la etiqueta de cuando se aplicó: la pasada de reconciliación solo comparaba
+# PLATA, y acá la plata no cambia. Medido el 28/09: 14 cuotas del día con el
+# cruce diciendo "Genera Link" y la cartera diciendo "manual".
+
+def _mundo_etiqueta_wompi_tardia(confirmada: bool = False):
+    """La cuota ya recibió su pago y está cuadrada; lo único que cambió desde
+    entonces es que el reporte llegó y el pago resultó ser WOMPI link."""
+    pago = _pago_cruzado('PAGO-WOMPI-LINK', '1002003060', 'INS60', 460_000,
+                         fecha='2026-09-25')
+    pago['payment_method']  = 'WOMPI BANCOLOMBIA_TRANSFER'
+    pago['metodo_de_pago']  = 'WOMPI (Genera Link)'   # lo escribió la Fase 9.4
+    cuota = _cuota('INS60-A', 'INS60', '1002003060', 460_000, '2026-09-14',
+                   valor_pago=460_000, fecha_pago='2026-09-25',
+                   fecha_cruce=_hoy_bogota(), diferencia=0,
+                   medio_pago='WOMPI BANCOLOMBIA_TRANSFER',
+                   # lo que quedó escrito el día que se aplicó el pago, cuando
+                   # el reporte todavía no conocía esta transacción
+                   es_wompi_automatico=False,
+                   correo_elec='alguien@example.com')
+    if confirmada:
+        cuota.update(pago='460000', pago_confirmado=460_000, valor_a_cobrar=0)
+    return {
+        'cartera_preventiva': [cuota],
+        'cruce_cartera': [pago],
+        'pago_asociaciones': [
+            {'id': 9601, 'matching_key': 'PAGO-WOMPI-LINK', 'llave': 'INS60-A',
+             'monto': 460_000, 'origen': 'automatico'},
+        ],
+    }
+
+
+def test_la_etiqueta_wompi_link_se_corrige_cuando_el_reporte_llega_tarde(mundo):
+    capturado = mundo(ccp, tablas=_mundo_etiqueta_wompi_tardia())
+
+    fila = _fila_final(capturado, 'INS60-A')
+    assert fila, (
+        'la cuota no se tocó: el cruce dice "WOMPI (Genera Link)" y la cartera '
+        'la sigue contando como pago manual, y ninguna corrida la va a volver a '
+        'mirar porque la plata no cambió'
+    )
+    assert fila.get('es_wompi_automatico') is True, (
+        f'la cuota sigue marcada como manual: {fila.get("es_wompi_automatico")}'
+    )
+    assert fila.get('correo_elec') == 'WOMPI (Automático Genera Link)', (
+        f'el correo de la cuota no quedó con la etiqueta: {fila.get("correo_elec")}'
+    )
+
+
+def test_la_etiqueta_no_reabre_una_cuota_cerrada_a_mano(mundo):
+    """La trampa: `_fila_cierre` deshace el cierre a propósito (23 de julio,
+    punto #1). Corregir una etiqueta no puede costarle el cierre a una cuota que
+    una persona ya dio por cobrada."""
+    capturado = mundo(ccp, tablas=_mundo_etiqueta_wompi_tardia(confirmada=True))
+
+    fila = _fila_final(capturado, 'INS60-A')
+    assert not fila or fila.get('pago_confirmado') is not None, (
+        'la corrida reabrió un cierre manual solo para corregir una etiqueta'
+    )
