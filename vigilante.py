@@ -63,11 +63,12 @@ en vez de la cadena completa (~3 min). Y no se pierde nada por esperar:
 `sync_cartera.py` solo deja la cartera nueva EN ESPERA — el cambio de verdad
 lo hace "Cargar Cartera", que dispara su propio reproceso.
 
-El ReportePagosWompi se cuenta distinto que las demás: su carpeta conserva a
-propósito el archivo más reciente (ver `_archivar_reportes_wompi` en
-cruzar.py), así que "tener un archivo" es el estado normal y no puede ser la
-señal. La señal es tener DOS O MÁS: llegó una entrega nueva y la anterior
-todavía no se ha archivado.
+El ReportePagosWompi se contaba distinto hasta el 2026-09-30, porque su carpeta
+conservaba a propósito el archivo más reciente y "tener un archivo" era el
+estado normal: hacían falta DOS para que fuera señal. Desde que se archiva como
+todos los demás (se relee del histórico, ver `_cargar_lookup_wompi_reporte` en
+cruzar.py) es una referencia más, y un reporte recién subido SÍ despierta la
+cadena — antes había que esperar a la corrida del día siguiente.
 """
 
 import argparse
@@ -78,7 +79,7 @@ from dotenv import load_dotenv
 
 from procesar_todos import BANCOS, BANCOS_BANCOLOMBIA
 from utils import deposito
-from utils.origen import Bandeja, hay_de_donde_leer, listar, todos_los_que_contienen
+from utils.origen import Bandeja, hay_de_donde_leer, listar
 
 # force=True porque importar procesar_todos ya configuró el logger raíz, y la
 # primera llamada gana: sin esto el prefijo [vigilante] se perdía y en
@@ -91,8 +92,6 @@ logging.basicConfig(
     force=True,
 )
 log = logging.getLogger(__name__)
-
-WOMPI_REPORTE_PATTERN = 'ReportePagosWompi'
 
 # Los archivos de REFERENCIA contra los que se cruza, con el MISMO par de
 # variables que lee sync_cartera.py: (etiqueta, variable de la carpeta,
@@ -108,8 +107,9 @@ WOMPI_REPORTE_PATTERN = 'ReportePagosWompi'
 # del depósito — tiene que coincidir con `FUENTES_DEL_DEPOSITO` en
 # `procesar_todos.py` y con lo que escribe la pantalla de carga.
 CARPETAS_REFERENCIA = [
-    ('payu_uc',  'Payu UC.xlsx'),
-    ('ingresos', 'Ingresos PSE y PAYU.xlsx'),
+    ('payu_uc',       'Payu UC.xlsx'),
+    ('ingresos',      'Ingresos PSE y PAYU.xlsx'),
+    ('wompi_reporte', 'Reporte Pagos WOMPI'),
 ]
 
 
@@ -158,18 +158,6 @@ def hay_trabajo() -> bool:
         if archivos:
             log.info('%s: %d archivo(s) esperando -> %s',
                      etiqueta, len(archivos), ', '.join(f['name'] for f in archivos[:5]))
-            encontrado = True
-
-    # El reporte de WOMPI también es referencia, pero se cuenta distinto:
-    # 1 archivo es el estado normal (su carpeta conserva a propósito el más
-    # reciente, ver `_archivar_reportes_wompi` en cruzar.py), así que "tener
-    # un archivo" no puede ser la señal. La señal es tener DOS O MÁS.
-    bandeja_reporte = Bandeja(fuente='wompi_reporte')
-    if hay_de_donde_leer(bandeja_reporte):
-        reportes = todos_los_que_contienen(bandeja_reporte, WOMPI_REPORTE_PATTERN)
-        if len(reportes) >= 2:
-            log.info('ReportePagosWompi: %d entregas sin archivar -> %s',
-                     len(reportes), ', '.join(f['name'] for f in reportes))
             encontrado = True
 
     # 2. Las bandejas de los bancos y pasarelas, después.

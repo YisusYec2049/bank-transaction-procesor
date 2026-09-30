@@ -78,12 +78,17 @@ def ruta(zona: str, fuente: str, nombre: str) -> str:
     return f'{zona}/{fuente}/{nombre}'
 
 
-def listar(fuente: str) -> list[dict]:
-    """Los archivos sin procesar de esa fuente, del más viejo al más reciente.
+def listar(fuente: str, zona: str = ENTRADA) -> list[dict]:
+    """Los archivos de esa fuente en esa zona, del más viejo al más reciente.
 
     Devuelve `{'id': ruta completa, 'name': nombre del archivo}` — la ruta hace
     de identificador porque es con lo que se descarga y se mueve, igual que el
     id de Drive.
+
+    `zona` es `ENTRADA` salvo para el ReportePagosWompi, que se lee del
+    HISTORICO cuando ya se archivó: es el único archivo que hace falta en cada
+    corrida después de haberse procesado (ver `_cargar_lookup_wompi_reporte` en
+    `cruzar.py`).
 
     ⚠️ Ante un fallo del almacenamiento devuelve vacío y lo grita en el log.
     Cortar la corrida entera sería peor: dejaría fuera también los archivos que
@@ -96,7 +101,7 @@ def listar(fuente: str) -> list[dict]:
     if not (bucket and url and srk):
         return []
 
-    prefijo = f'{ENTRADA}/{fuente}'
+    prefijo = f'{zona}/{fuente}'
     encontrados: list[dict] = []
     offset = 0
 
@@ -116,9 +121,9 @@ def listar(fuente: str) -> list[dict]:
             resp.raise_for_status()
             pagina = resp.json() or []
         except Exception:
-            log.exception('DEPÓSITO [%s]: no se pudo listar la entrada. Los archivos que el '
+            log.exception('DEPÓSITO [%s]: no se pudo listar %s/. Los archivos que el '
                           'área haya subido a esa fuente NO se van a procesar en esta corrida.',
-                          fuente)
+                          fuente, zona)
             return []
 
         for obj in pagina:
@@ -126,7 +131,7 @@ def listar(fuente: str) -> list[dict]:
             # Sin `id` es una carpeta, no un archivo.
             if not obj.get('id') or not nombre or nombre == _PLACEHOLDER:
                 continue
-            encontrados.append({'id': ruta(ENTRADA, fuente, nombre), 'name': nombre,
+            encontrados.append({'id': ruta(zona, fuente, nombre), 'name': nombre,
                                 'created_at': obj.get('created_at')})
 
         if len(pagina) < _POR_PAGINA:

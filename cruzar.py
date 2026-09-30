@@ -242,6 +242,7 @@ from utils.origen import (
     hay_de_donde_leer,
     mover_a_historico,
     todos_los_que_contienen,
+    ultimo_archivado_que_contiene,
 )
 from utils.parser import normalizar_nit as _normalizar_nit
 from utils.parser import normalizar_sufijo as _normalizar_sufijo
@@ -921,12 +922,21 @@ def _cargar_lookup_wompi_reporte() -> tuple[dict[str, dict], bool, list[dict]]:
 
     archivos = todos_los_que_contienen(bandeja, WOMPI_REPORTE_PATTERN)
     if not archivos:
-        log.warning('No se encontró ningún archivo "%s*" en su bandeja de la plataforma, '
-                    'se omite el cruce NOMBRE/CI/MÉTODO DE PAGO de WOMPI esta corrida.',
-                    WOMPI_REPORTE_PATTERN)
+        # La bandeja vacía es el estado NORMAL: el reporte se archiva al
+        # terminar cada corrida, y desde la siguiente se relee del histórico.
+        ultimo = ultimo_archivado_que_contiene(bandeja, WOMPI_REPORTE_PATTERN)
+        if ultimo:
+            log.info('ReportePagosWompi: bandeja vacía, se relee el último archivado (%s).',
+                     ultimo['name'])
+            archivos = [ultimo]
+
+    if not archivos:
+        log.warning('No se encontró ningún archivo "%s*" ni en la bandeja de la plataforma '
+                    'ni en su histórico, se omite el cruce NOMBRE/CI/MÉTODO DE PAGO de '
+                    'WOMPI esta corrida.', WOMPI_REPORTE_PATTERN)
         return {}, False, []
 
-    log.info('ReportePagosWompi: %d archivo(s) en la carpeta.', len(archivos))
+    log.info('ReportePagosWompi: %d archivo(s) a leer.', len(archivos))
     lookup, total_filas = {}, 0
     # Del más viejo al más reciente: el .update() deja ganar al último leído,
     # o sea a la entrega más nueva.
@@ -951,23 +961,28 @@ def _cargar_lookup_wompi_reporte() -> tuple[dict[str, dict], bool, list[dict]]:
 
 
 def _archivar_reportes_wompi(archivos: list[dict]) -> None:
-    """Mueve a Histórico los ReportePagosWompi ya leídos, dejando SOLO el más
-    reciente en la carpeta.
+    """Mueve a Histórico TODOS los ReportePagosWompi ya leídos.
 
-    El más nuevo se queda a propósito: durante el día puede correr el pipeline
-    varias veces (cron + reprocesos disparados desde la plataforma), y si la
-    primera corrida se lo llevara todo, las siguientes se quedarían sin
-    reporte y los pagos que entren después no se alcanzarían a clasificar
-    hasta el día siguiente. Dejando uno, la carpeta no crece y el archivo del
-    día sigue disponible; cuando llega la entrega siguiente, esta misma
-    función archiva la anterior.
+    Hasta el 2026-09-30 el más reciente se dejaba en la bandeja a propósito:
+    durante el día el pipeline corre varias veces (cron + reprocesos disparados
+    desde la plataforma) y, si la primera corrida se lo llevaba, las siguientes
+    se quedaban sin reporte y los pagos que entraran después no se alcanzaban a
+    clasificar hasta el día siguiente.
+
+    Ese motivo sigue siendo cierto y ahora se resuelve del otro lado: la
+    lectura relee el último archivado cuando la bandeja está vacía (ver
+    `_cargar_lookup_wompi_reporte`). Lo que se gana es que el área deje de ver
+    el archivo "esperando a procesarse" para siempre — el reporte no se archiva
+    nunca Y tampoco deja fila en "Últimos archivos procesados", así que en
+    pantalla parecía que no se había leído y se volvía a subir.
+
+    Los que salieron del histórico se saltan solos: `mover_a_historico`
+    devuelve False para ellos en vez de volver a moverlos con un nombre nuevo.
 
     Se llama al FINAL de la corrida, cuando ya se escribió todo: si algo falla
     antes, los archivos siguen en su sitio y la corrida siguiente los reintenta."""
-    if len(archivos) < 2:
-        return
     bandeja = _bandeja_reporte_wompi()
-    for f in archivos[:-1]:
+    for f in archivos:
         try:
             if mover_a_historico(f, bandeja):
                 log.info('ReportePagosWompi movido a Histórico: %s', f['name'])

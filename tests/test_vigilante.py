@@ -27,8 +27,6 @@ def deposito(monkeypatch):
         monkeypatch.setattr(vigilante.deposito, 'activo', lambda: True)
         monkeypatch.setattr(vigilante, 'listar',
                             lambda b: archivos_por_fuente.get(b.fuente, []))
-        monkeypatch.setattr(vigilante, 'todos_los_que_contienen',
-                            lambda b, _t: archivos_por_fuente.get(b.fuente, []))
     return _con
 
 
@@ -75,18 +73,14 @@ def test_cartera_preventiva_sigue_FUERA_del_vigilante(deposito):
     assert vigilante.hay_trabajo() is False
 
 
-def test_UN_solo_reporte_de_wompi_no_es_trabajo(deposito):
-    """Su bandeja conserva a propósito el más reciente (ver
-    `_archivar_reportes_wompi` en cruzar.py), así que "tener un archivo" es el
-    estado normal y no puede ser la señal. La señal es tener DOS O MÁS."""
+def test_UN_solo_reporte_de_wompi_YA_es_trabajo(deposito):
+    """Cambió el 2026-09-30. Antes su bandeja conservaba a propósito el más
+    reciente, así que "tener un archivo" era el estado normal y hacían falta
+    DOS para que fuera señal — con el costo de que un reporte recién subido no
+    despertaba la cadena y había que esperar a la corrida del día siguiente.
+    Hoy el reporte se archiva como todos (se relee del histórico), así que su
+    bandeja vacía es el estado normal y un archivo ahí es trabajo."""
     deposito({'wompi_reporte': [{'name': 'ReportePagosWompi_20260908.xlsx'}]})
-
-    assert vigilante.hay_trabajo() is False
-
-
-def test_DOS_reportes_de_wompi_si_lo_son(deposito):
-    deposito({'wompi_reporte': [{'name': 'ReportePagosWompi_20260907.xlsx'},
-                                {'name': 'ReportePagosWompi_20260908.xlsx'}]})
 
     assert vigilante.hay_trabajo() is True
 

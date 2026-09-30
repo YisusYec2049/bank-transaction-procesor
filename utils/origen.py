@@ -44,6 +44,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from utils import deposito as _deposito
+from utils.deposito import ENTRADA, HISTORICO
 
 log = logging.getLogger(__name__)
 
@@ -68,14 +69,20 @@ class Bandeja:
     fuente: str
 
 
-def _como_archivos(items: list[dict], bandeja: Bandeja) -> list[dict]:
+def _como_archivos(items: list[dict], bandeja: Bandeja,
+                   zona: str = ENTRADA) -> list[dict]:
     """Normaliza lo que devuelve el depósito al diccionario que ven los módulos.
 
     Se conservan las claves `id` y `name` con el mismo significado de siempre
-    —hay código que las lee directo— y se agregan `origen`, `fuente` y `fecha`.
+    —hay código que las lee directo— y se agregan `origen`, `fuente`, `fecha` y
+    `zona`.
+
+    `zona` dice de qué carpeta salió el archivo, y existe para que
+    `mover_a_historico` no intente archivar algo que ya está archivado: el
+    ReportePagosWompi se relee del histórico en cada corrida.
     """
     return [{'id': f['id'], 'name': f['name'], 'origen': DEPOSITO,
-             'fuente': bandeja.fuente, 'fecha': f.get('created_at')}
+             'fuente': bandeja.fuente, 'fecha': f.get('created_at'), 'zona': zona}
             for f in items]
 
 
@@ -113,8 +120,8 @@ def _cuando(archivo: dict) -> datetime:
         return datetime.min.replace(tzinfo=timezone.utc)
 
 
-def listar(bandeja: Bandeja) -> list[dict]:
-    """Los archivos de la bandeja sin procesar, del más viejo al más reciente.
+def listar(bandeja: Bandeja, zona: str = ENTRADA) -> list[dict]:
+    """Los archivos de la bandeja en esa zona, del más viejo al más reciente.
 
     ⚠️ El orden se ordena acá por FECHA y no se hereda del almacenamiento. Hay
     dos sitios que leen el último de la lista como si fuera el más nuevo
@@ -124,7 +131,7 @@ def listar(bandeja: Bandeja) -> list[dict]:
     """
     if not _deposito.activo():
         return []
-    archivos = _como_archivos(_deposito.listar(bandeja.fuente), bandeja)
+    archivos = _como_archivos(_deposito.listar(bandeja.fuente, zona), bandeja, zona)
     archivos.sort(key=_cuando)
     return archivos
 
@@ -151,6 +158,28 @@ def todos_los_que_contienen(bandeja: Bandeja, texto: str) -> list[dict]:
     return [a for a in listar(bandeja) if buscado in a['name'].strip().lower()]
 
 
+def ultimo_archivado_que_contiene(bandeja: Bandeja, texto: str) -> dict | None:
+    """El más reciente de los YA ARCHIVADOS cuyo nombre contiene `texto`.
+
+    Existe para el ReportePagosWompi, que es el único archivo que hace falta en
+    CADA corrida aunque ya se haya procesado: se lee en vivo y no se guarda en
+    ninguna tabla, así que sin él los pagos de WOMPI del día se quedan sin
+    nombre, sin CI, sin método, sin programa y sin la corrección de documento.
+
+    Hasta el 2026-09-30 eso se resolvía dejándolo en la bandeja a propósito, y
+    el costo lo pagaba el área: en la pantalla de carga el archivo se veía
+    "esperando a procesarse" para siempre —nunca se archiva y nunca aparece en
+    "Últimos archivos procesados"—, así que parecía que no se había leído y se
+    volvía a subir. Leerlo del histórico deja la bandeja vacía sin que la
+    corrida pierda nada: es el mismo archivo, del mismo depósito, en otra
+    carpeta.
+    """
+    buscado = texto.strip().lower()
+    archivados = [a for a in listar(bandeja, HISTORICO)
+                  if buscado in a['name'].strip().lower()]
+    return archivados[-1] if archivados else None
+
+
 def descargar(archivo: dict) -> io.BytesIO:
     """Baja el contenido del archivo."""
     if archivo['origen'] == DEPOSITO:
@@ -170,6 +199,12 @@ def mover_a_historico(archivo: dict, bandeja: Bandeja) -> bool:
     un archivo al Histórico es de las que más duelen, porque si la corrida no lo
     procesó bien, moverlo lo esconde.
     """
+    if archivo.get('zona') == HISTORICO:
+        # Ya está archivado: lo devuelve `ultimo_archivado_que_contiene`, que
+        # relee el ReportePagosWompi de corridas anteriores. Moverlo otra vez
+        # lo duplicaría con un nombre nuevo en cada corrida.
+        return False
+
     if archivo['origen'] == DEPOSITO:
         _deposito.mover_a_historico(archivo['id'], archivo['fuente'], archivo['name'])
         return True

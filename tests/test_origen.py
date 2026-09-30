@@ -23,8 +23,9 @@ class _DepositoFalso:
     Cada archivo se declara como nombre suelto o como `(nombre, fecha)`.
     """
 
-    def __init__(self, archivos=None, encendido=True):
+    def __init__(self, archivos=None, encendido=True, historico=None):
         self.archivos = archivos if archivos is not None else []
+        self.historico = historico if historico is not None else []
         self.encendido = encendido
         self.descargados: list[str] = []
         self.archivados: list[tuple[str, str, str]] = []
@@ -32,11 +33,11 @@ class _DepositoFalso:
     def activo(self):
         return self.encendido
 
-    def listar(self, fuente):
+    def listar(self, fuente, zona='entrada'):
         salida = []
-        for a in self.archivos:
+        for a in (self.historico if zona == 'historico' else self.archivos):
             nombre, fecha = a if isinstance(a, tuple) else (a, None)
-            salida.append({'id': f'entrada/{fuente}/{nombre}', 'name': nombre,
+            salida.append({'id': f'{zona}/{fuente}/{nombre}', 'name': nombre,
                            'created_at': fecha})
         return salida
 
@@ -53,8 +54,8 @@ BANDEJA = origen.Bandeja(fuente='wompi')
 
 @pytest.fixture
 def deposito(monkeypatch):
-    def _con(archivos):
-        falso = _DepositoFalso(archivos)
+    def _con(archivos, historico=None):
+        falso = _DepositoFalso(archivos, historico=historico)
         monkeypatch.setattr(origen, '_deposito', falso)
         return falso
     return _con
@@ -170,3 +171,50 @@ def test_una_fecha_ilegible_tampoco(deposito):
     deposito([('roto.xlsx', 'no es una fecha'), ('del dia.xlsx', '2026-09-08T14:56:49.653Z')])
 
     assert origen.mas_reciente(BANDEJA)['name'] == 'del dia.xlsx'
+
+
+# ── Releer el ReportePagosWompi ya archivado (2026-09-30) ────────────────────
+#
+# El reporte es el único archivo que hace falta en CADA corrida aunque ya se
+# haya procesado: se lee en vivo y no se guarda en ninguna tabla. Antes eso se
+# resolvía dejándolo en la bandeja para siempre, y el área lo veía "esperando a
+# procesarse" sin que nada lo sacara de ahí. Hoy se archiva como todos y se
+# relee del histórico.
+
+def test_el_reporte_ya_archivado_se_puede_releer(deposito):
+    deposito([], historico=[('ReportePagosWompi_20260928.xlsx', '2026-09-28T10:00:00Z'),
+                            ('ReportePagosWompi_20260929.xlsx', '2026-09-29T10:00:00Z')])
+
+    ultimo = origen.ultimo_archivado_que_contiene(BANDEJA, 'ReportePagosWompi')
+
+    assert ultimo['name'] == 'ReportePagosWompi_20260929.xlsx'
+    assert ultimo['id'] == 'historico/wompi/ReportePagosWompi_20260929.xlsx'
+
+
+def test_releer_el_archivado_manda_el_MAS_RECIENTE_no_el_ultimo_de_la_lista(deposito):
+    """Misma regla que en `listar`: el orden lo pone la FECHA, no cómo venga el
+    almacenamiento. Un reporte vencido tomado como vigente deja los pagos del
+    día rotulados 'PAGOS MANUALES' — pasó el 2026-09-08 con uno de 4 días
+    antes."""
+    deposito([], historico=[('ReportePagosWompi_20260929.xlsx', '2026-09-29T10:00:00Z'),
+                            ('ReportePagosWompi_20260925.xlsx', '2026-09-25T10:00:00Z')])
+
+    ultimo = origen.ultimo_archivado_que_contiene(BANDEJA, 'ReportePagosWompi')
+
+    assert ultimo['name'] == 'ReportePagosWompi_20260929.xlsx'
+
+
+def test_sin_nada_archivado_no_hay_reporte_que_releer(deposito):
+    deposito([], historico=['otra-cosa.xlsx'])
+
+    assert origen.ultimo_archivado_que_contiene(BANDEJA, 'ReportePagosWompi') is None
+
+
+def test_un_archivo_del_historico_NO_se_vuelve_a_archivar(deposito):
+    """Si se archivara otra vez, cada corrida dejaría una copia con un nombre
+    nuevo: el reporte se relee del histórico en todas."""
+    dep = deposito([], historico=['ReportePagosWompi_20260929.xlsx'])
+    archivo = origen.ultimo_archivado_que_contiene(BANDEJA, 'ReportePagosWompi')
+
+    assert origen.mover_a_historico(archivo, BANDEJA) is False
+    assert dep.archivados == []
