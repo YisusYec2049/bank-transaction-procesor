@@ -2090,7 +2090,7 @@ def test_la_linea_se_queda_cuando_su_cuota_cerro_debiendo_con_pago_encima(mundo)
 # PLATA, y acá la plata no cambia. Medido el 28/09: 14 cuotas del día con el
 # cruce diciendo "Genera Link" y la cartera diciendo "manual".
 
-def _mundo_etiqueta_wompi_tardia(confirmada: bool = False):
+def _mundo_etiqueta_wompi_tardia(confirmada: bool = False, fecha_cruce=None):
     """La cuota ya recibió su pago y está cuadrada; lo único que cambió desde
     entonces es que el reporte llegó y el pago resultó ser WOMPI link."""
     pago = _pago_cruzado('PAGO-WOMPI-LINK', '1002003060', 'INS60', 460_000,
@@ -2099,7 +2099,7 @@ def _mundo_etiqueta_wompi_tardia(confirmada: bool = False):
     pago['metodo_de_pago']  = 'WOMPI (Genera Link)'   # lo escribió la Fase 9.4
     cuota = _cuota('INS60-A', 'INS60', '1002003060', 460_000, '2026-09-14',
                    valor_pago=460_000, fecha_pago='2026-09-25',
-                   fecha_cruce=_hoy_bogota(), diferencia=0,
+                   fecha_cruce=fecha_cruce or _hoy_bogota(), diferencia=0,
                    medio_pago='WOMPI BANCOLOMBIA_TRANSFER',
                    # lo que quedó escrito el día que se aplicó el pago, cuando
                    # el reporte todavía no conocía esta transacción
@@ -2132,6 +2132,57 @@ def test_la_etiqueta_wompi_link_se_corrige_cuando_el_reporte_llega_tarde(mundo):
     assert fila.get('correo_elec') == 'WOMPI (Automático Genera Link)', (
         f'el correo de la cuota no quedó con la etiqueta: {fila.get("correo_elec")}'
     )
+
+
+def test_corregir_la_etiqueta_no_mueve_el_dia_del_cruce(mundo):
+    """El reporte de WOMPI llega uno o dos días después del pago, así que la
+    corrida que por fin pone la etiqueta se llevaba la fila al día de hoy:
+    `_fila_cierre` escribe siempre `hoy`. Medido el 30/09: de las 36 cuotas que
+    figuraban como link, 22 se habían cruzado el 28 (16) y el 29 (6), y esos dos
+    días quedaron mostrando CERO pagos por link — que es el número que el área
+    sigue por Día del Cruce, y también el que usa "Cerrar Cartera"."""
+    capturado = mundo(ccp, tablas=_mundo_etiqueta_wompi_tardia(
+        fecha_cruce='2026-09-28'))
+
+    fila = _fila_final(capturado, 'INS60-A')
+    assert fila, 'la cuota no se tocó: la etiqueta quedó sin corregir'
+    assert fila.get('es_wompi_automatico') is True
+    assert fila.get('fecha_cruce') == '2026-09-28', (
+        f'corregir la etiqueta movió el Día del Cruce del 28 a '
+        f'{fila.get("fecha_cruce")}: la cuota desaparece del día que el área '
+        f'cuenta y se sale del día que "Cerrar Cartera" alcanza'
+    )
+
+
+def test_el_select_de_cuotas_trae_lo_que_la_guarda_compara():
+    """La guarda de idempotencia decide si una cuota se reescribe COMPARANDO la
+    fila guardada contra el resultado recién calculado. Si una de esas columnas
+    no se lee de la base, la comparación es `None` contra un valor y **nunca
+    coincide**: la cuota se reescribe en cada corrida, y como `_fila_cierre`
+    pone siempre `fecha_cruce = hoy`, se arrastra un día más cada vez.
+
+    Pasó con `es_wompi_automatico` (28/09 → 30/09): el área vio CERO pagos por
+    link en el 28 y el 29 porque las 22 cuotas de esos días se habían corrido
+    solas hasta hoy. Y como "Cerrar Cartera" trabaja por Día del Cruce y el
+    área cierra un día exacto cada mañana, ninguna alcanzaba a ser cerrada.
+
+    Las pruebas de arriba no lo cazan: arman la cuota como diccionario, así que
+    el `select` no participa. Esta mira el `select` real.
+    """
+    from pathlib import Path
+
+    fuente = Path(ccp.__file__).read_text()
+    inicio = fuente.index('cuotas_rows = select_all(')
+    # hasta el cierre de la llamada, que es la primera línea que es solo `    )`
+    select = fuente[inicio:fuente.index('\n    )', inicio)]
+
+    for columna in ('valor_pago', 'diferencia', 'fecha_cruce', 'pago_confirmado',
+                    'es_wompi_automatico'):
+        assert f"'{columna}" in select or f',{columna}' in select, (
+            f'la guarda compara `{columna}` pero el select de cartera_preventiva '
+            f'no la trae: la comparación sería contra None y la cuota se '
+            f'reescribiría en cada corrida, moviéndose de Día del Cruce'
+        )
 
 
 def test_la_etiqueta_no_reabre_una_cuota_cerrada_a_mano(mundo):

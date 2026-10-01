@@ -1349,7 +1349,14 @@ def main():
         supabase_url, srk, 'cartera_preventiva',
         select='id,llave,cruce_access,correo,fecha_vencimiento,valor_cuota,valor_a_cobrar,inscrip,'
                'cliente,sistema_financiero,moneda,programa,fecha_pago,valor_pago,fecha_cruce,'
-               'diferencia,notificacion,codigo_transaccion_1,pago,pago_confirmado',
+               'diferencia,notificacion,codigo_transaccion_1,pago,pago_confirmado,'
+               # La etiqueta de WOMPI link se COMPARA más abajo para decidir si la
+               # cuota hay que reescribirla (28/09). Sin leerla, esa comparación es
+               # `None` contra el valor del pago: para una cuota de link nunca
+               # coincide, así que se reescribía en CADA corrida —y cada reescritura
+               # le ponía el Día del Cruce de hoy, arrastrando la cuota un día más.
+               # Medido el 30/09: 36 cuotas reescritas, 35 idénticas a lo guardado.
+               'es_wompi_automatico',
     )
     # Códigos de pago de las carteras ANTERIORES, ya archivadas (30 de julio).
     # `codigo_transaccion_1` es la memoria de lo que el proceso manual ya
@@ -1858,17 +1865,43 @@ def main():
         # sin confirmar, así que la guarda no deja ninguna afuera.
         etiqueta_ok = confirmada or (
             bool(cuota.get('es_wompi_automatico')) == fila['es_wompi_automatico'])
-        if (cuota.get('fecha_cruce') and valor_pago_actual is not None
-                and round(float(valor_pago_actual), 2) in (suma, visible)
-                and refleja_resultado and etiqueta_ok):
+        misma_plata = bool(
+            cuota.get('fecha_cruce') and valor_pago_actual is not None
+            and round(float(valor_pago_actual), 2) in (suma, visible)
+            and refleja_resultado)
+        if misma_plata and etiqueta_ok:
             continue  # ya refleja este resultado, nada que hacer (idempotencia)
+
+        if misma_plata:
+            # La plata de la cuota es la misma de antes: lo único que cambió es
+            # la etiqueta de WOMPI link, así que esto NO es un cruce nuevo y el
+            # Día del Cruce se conserva (30 de septiembre).
+            #
+            # `_fila_cierre` pone siempre `hoy`, y con el arreglo del 28/09 esa
+            # reescritura empezó a alcanzar a cuotas cruzadas días atrás: el
+            # reporte de WOMPI llega uno o dos días después del pago, así que la
+            # corrida que por fin pone la etiqueta se llevaba la fila al día de
+            # hoy. Medido el 30/09: de las 36 cuotas que aparecían como link
+            # hoy, 22 se habían cruzado el 28 (16) y el 29 (6) — los dos días
+            # quedaron mostrando CERO pagos por link, que es justo el número que
+            # el área sigue por Día del Cruce.
+            #
+            # Y no es solo cómo se ve: "Cerrar Cartera" trabaja por Día del
+            # Cruce y el área cierra un día exacto cada mañana (el anterior), así
+            # que una cuota que se re-fecha se sale del día que se está cerrando
+            # y no hay forma de alcanzarla. Las 22 estaban con diferencia $0
+            # —cerrables— y ninguna cerrada.
+            fila['fecha_cruce'] = cuota['fecha_cruce']
 
         actualizaciones_cierre.append(fila)
         if linea:
             lineas_nuevas.append(linea)
         cuota['valor_pago']      = suma
         cuota['fecha_pago']      = fila.get('fecha_pago')
-        cuota['fecha_cruce']     = hoy
+        # Lo que se escribió, no `hoy`: puede ser el día que la cuota ya tenía
+        # si esta reescritura solo corrige la etiqueta (ver arriba). Las pasadas
+        # siguientes de esta misma corrida leen esta copia en memoria.
+        cuota['fecha_cruce']     = fila['fecha_cruce']
         # El cierre reescribe `notificacion`; sin reflejarlo en memoria, la
         # pasada de avisos compara contra el valor viejo, cree que ya está
         # puesto y no lo vuelve a escribir — la fila queda sin aviso hasta la
