@@ -2154,20 +2154,23 @@ def test_corregir_la_etiqueta_no_mueve_el_dia_del_cruce(mundo):
     )
 
 
-def test_el_select_de_cuotas_trae_lo_que_la_guarda_compara():
-    """La guarda de idempotencia decide si una cuota se reescribe COMPARANDO la
-    fila guardada contra el resultado recién calculado. Si una de esas columnas
-    no se lee de la base, la comparación es `None` contra un valor y **nunca
-    coincide**: la cuota se reescribe en cada corrida, y como `_fila_cierre`
-    pone siempre `fecha_cruce = hoy`, se arrastra un día más cada vez.
+def test_el_select_de_cuotas_trae_TODO_lo_que_se_escribe():
+    """El pipeline tiene que LEER todo lo que escribe, o no puede saber si su
+    escritura cambia algo. Y si no lo sabe, reescribe la cuota en cada corrida —
+    y `_fila_cierre` pone siempre `fecha_cruce = hoy`, así que la cuota se
+    arrastra un día más cada vez.
 
     Pasó con `es_wompi_automatico` (28/09 → 30/09): el área vio CERO pagos por
     link en el 28 y el 29 porque las 22 cuotas de esos días se habían corrido
-    solas hasta hoy. Y como "Cerrar Cartera" trabaja por Día del Cruce y el
+    solas hasta hoy, y como "Cerrar Cartera" trabaja por Día del Cruce y el
     área cierra un día exacto cada mañana, ninguna alcanzaba a ser cerrada.
+    Al medirlo aparecieron 3 columnas más en la misma situación: `medio_pago`,
+    `codigo_transaccion_2` y `correo_elec`.
 
-    Las pruebas de arriba no lo cazan: arman la cuota como diccionario, así que
-    el `select` no participa. Esta mira el `select` real.
+    Las demás pruebas no lo cazan: arman la cuota como diccionario, así que el
+    `select` no participa. Esta compara el `select` real contra las claves que
+    `_fila_cierre` produce de verdad — **no contra una lista escrita a mano**,
+    que es exactamente cómo nació el bug.
     """
     from pathlib import Path
 
@@ -2176,13 +2179,97 @@ def test_el_select_de_cuotas_trae_lo_que_la_guarda_compara():
     # hasta el cierre de la llamada, que es la primera línea que es solo `    )`
     select = fuente[inicio:fuente.index('\n    )', inicio)]
 
-    for columna in ('valor_pago', 'diferencia', 'fecha_cruce', 'pago_confirmado',
-                    'es_wompi_automatico'):
-        assert f"'{columna}" in select or f',{columna}' in select, (
-            f'la guarda compara `{columna}` pero el select de cartera_preventiva '
-            f'no la trae: la comparación sería contra None y la cuota se '
-            f'reescribiría en cada corrida, moviéndose de Día del Cruce'
+    cuota = _cuota('INS99-A', 'INS99', '1002003099', 100_000, '2026-09-01')
+    pago = _pago_cruzado('MK-99', '1002003099', 'INS99', 100_000, '2026-09-01')
+    escritas = ccp._fila_cierre({'cuota': cuota, 'ultimo_pago': pago,
+                                 'monto_aplicado': 100_000}, '2026-09-30')
+
+    for columna in sorted(escritas):
+        if columna == 'id':
+            continue  # es la llave del upsert, no un dato que se compare
+        assert f"{columna}," in select or f"{columna}'" in select, (
+            f'`{columna}` se ESCRIBE en cartera_preventiva pero el select no la '
+            f'trae: la comparación sería contra None, nunca coincidiría, y la '
+            f'cuota se reescribiría en cada corrida moviéndose de Día del Cruce'
         )
+
+
+def test_una_fila_identica_salvo_la_fecha_no_se_escribe():
+    """La compuerta de fondo. Si lo único que cambiaría es el Día del Cruce, no
+    hay nada que escribir: ese campo dice el día en que la cuota recibió o
+    perdió plata, y si la plata hubiera cambiado habría otra columna distinta.
+
+    Sin esta compuerta, cualquier comparación que no coincida nunca —hoy o la
+    que alguien agregue mañana— vuelve a arrastrar la fecha un día por corrida.
+    """
+    cuota = _cuota('INS98-A', 'INS98', '1002003098', 100_000, '2026-09-01')
+    pago = _pago_cruzado('MK-98', '1002003098', 'INS98', 100_000, '2026-09-01')
+    info = {'cuota': cuota, 'ultimo_pago': pago, 'monto_aplicado': 100_000}
+
+    fila = ccp._fila_cierre(info, '2026-09-28')
+    # la cuota ya quedó como esa fila la dejó, con su día: el 28
+    cuota.update({k: v for k, v in fila.items() if k != 'id'})
+
+    hoy = ccp._fila_cierre(info, '2026-09-30')
+    assert hoy['fecha_cruce'] == '2026-09-30', 'el armado sigue poniendo hoy'
+    assert not ccp._aporta_algo(hoy, cuota, set()), (
+        'la fila no cambia nada y la compuerta la deja pasar: se escribiría solo '
+        'para moverle el Día del Cruce del 28 al 30'
+    )
+
+
+def test_una_columna_que_no_se_lee_no_mueve_el_dia_del_cruce():
+    """El caso que casi se escapa. Si el `select` no trae una columna que se
+    escribe, la fila guardada **parece distinta** (no hay nada contra qué
+    comparar), así que la compuerta la dejaría pasar y la cuota se re-fecharía
+    igual: exactamente el bug del 28 al 30 de septiembre, intacto.
+
+    Lo cazó la simulación contra producción, no el razonamiento: con la columna
+    sacada a propósito, la primera versión de la compuerta siguió escribiendo
+    las 36 cuotas.
+
+    Regla: una columna que el pipeline **no puede ver** no es motivo para mover
+    el Día del Cruce. Se ignora en la comparación y se grita aparte.
+    """
+    cuota = _cuota('INS96-A', 'INS96', '1002003096', 100_000, '2026-09-01')
+    pago = _pago_cruzado('MK-96', '1002003096', 'INS96', 100_000, '2026-09-01')
+    info = {'cuota': cuota, 'ultimo_pago': pago, 'monto_aplicado': 100_000}
+
+    fila = ccp._fila_cierre(info, '2026-09-28')
+    cuota.update({k: v for k, v in fila.items() if k != 'id'})
+    # el select no la trajo: la clave no existe en la fila guardada
+    del cuota['es_wompi_automatico']
+
+    sin_leer: set = set()
+    hoy = ccp._fila_cierre(info, '2026-09-30')
+    assert not ccp._aporta_algo(hoy, cuota, sin_leer), (
+        'una columna que no se lee hizo que la fila pareciera distinta: la cuota '
+        'se reescribe y se lleva el Día del Cruce del 28 al 30'
+    )
+    assert sin_leer == {'es_wompi_automatico'}, (
+        'la columna que falta en el select tiene que quedar registrada para que '
+        'la corrida lo grite: si se ignora en silencio, nadie la agrega nunca'
+    )
+
+
+def test_una_fila_con_plata_distinta_si_se_escribe():
+    """El otro lado: la compuerta no puede frenar el trabajo real. Si entró más
+    plata, la cuota se reescribe y se re-fecha a hoy, como siempre.
+    """
+    cuota = _cuota('INS97-A', 'INS97', '1002003097', 200_000, '2026-09-01')
+    pago = _pago_cruzado('MK-97', '1002003097', 'INS97', 200_000, '2026-09-01')
+
+    anterior = ccp._fila_cierre(
+        {'cuota': cuota, 'ultimo_pago': pago, 'monto_aplicado': 100_000}, '2026-09-28')
+    cuota.update({k: v for k, v in anterior.items() if k != 'id'})
+
+    # hoy se le aplica el resto
+    ahora = ccp._fila_cierre(
+        {'cuota': cuota, 'ultimo_pago': pago, 'monto_aplicado': 200_000}, '2026-09-30')
+    assert ccp._aporta_algo(ahora, cuota, set()), (
+        'entró más plata y la compuerta frenó la fila: la cuota quedaría con el '
+        'valor viejo'
+    )
 
 
 def test_la_etiqueta_no_reabre_una_cuota_cerrada_a_mano(mundo):

@@ -827,6 +827,63 @@ def _fila_cierre(info: dict, hoy: str, cerrar_al_monto_recibido: bool = False) -
     return fila
 
 
+def _aporta_algo(fila: dict, cuota: dict, columnas_sin_leer: set) -> bool:
+    """¿Esta reescritura cambia algo de lo que la cuota ya tiene guardado?
+
+    Una fila que escribe exactamente lo mismo no se manda. No es solo ahorro de
+    escrituras: `_fila_cierre` pone siempre `fecha_cruce = hoy`, así que una
+    reescritura vacía **mueve el Día del Cruce** — la cuota desaparece del día
+    que el área cuenta y se sale del día que "Cerrar Cartera" alcanza, que
+    trabaja por ese campo y cierra un día exacto cada mañana.
+
+    Fue el bug del 28 al 30 de septiembre: `es_wompi_automatico` no se leía de
+    la base, así que la comparación que decide si la cuota se reescribe nunca
+    coincidía para una cuota de WOMPI link, y la cuota se arrastraba un día en
+    cada corrida. 22 cuotas acabaron fechadas hoy; el 28 y el 29 mostraron CERO
+    pagos por link, y ninguna alcanzó a ser cerrada.
+
+    Esta función es la red de fondo: con ella, un error así ya no produce
+    arrastre sino **cero escrituras**, sin importar qué comparación de arriba
+    falle.
+
+    Dos decisiones que hay que respetar si se toca:
+
+    1. **`fecha_cruce` se ignora.** Es la única columna que cambia sola en cada
+       corrida, así que compararla haría que esto nunca devolviera False. Y es
+       correcto por el negocio: el Día del Cruce dice el día en que la cuota
+       recibió o perdió plata, y si la plata cambió hay otra columna distinta
+       (`valor_pago`, `diferencia`, `pago`). Que solo difiera la fecha significa
+       que no pasó nada.
+    2. **Las claves se derivan de `fila`, no se escriben a mano.** Enumerarlas
+       es exactamente cómo nació el bug; así una columna nueva entra sola a la
+       comparación. Lo que esto exige a cambio es que el `select` de
+       `cartera_preventiva` traiga todo lo que se escribe — hay una prueba que
+       lo verifica.
+    """
+    for clave, valor in fila.items():
+        if clave in ('id', 'fecha_cruce'):
+            continue
+        if clave not in cuota:
+            # El `select` no trae esta columna, así que NO SE PUEDE saber si la
+            # escritura la cambia. Y una columna que no se puede ver no es
+            # motivo para mover el Día del Cruce: ignorarla acá es lo que
+            # convierte el error en "cero escrituras" en vez de arrastre diario.
+            # Es un bug del `select`, no un estado normal — por eso se grita
+            # aparte (`columnas_sin_leer`) y hay una prueba que lo exige.
+            columnas_sin_leer.add(clave)
+            continue
+        actual = cuota.get(clave)
+        # Los montos llegan de la base como float y se calculan redondeados a 2
+        # decimales; comparar en crudo haría que 0.0 != 0 o que un centavo de
+        # redondeo cuente como cambio.
+        if isinstance(valor, (int, float)) and isinstance(actual, (int, float)):
+            if round(float(valor), 2) != round(float(actual), 2):
+                return True
+        elif valor != actual:
+            return True
+    return False
+
+
 def _fila_de_linea(linea: dict) -> dict:
     """Fila de escritura de una cuota de deuda, a partir de la cuota que armó
     `_cuota_de_deuda`.
@@ -1356,7 +1413,12 @@ def main():
                # coincide, así que se reescribía en CADA corrida —y cada reescritura
                # le ponía el Día del Cruce de hoy, arrastrando la cuota un día más.
                # Medido el 30/09: 36 cuotas reescritas, 35 idénticas a lo guardado.
-               'es_wompi_automatico',
+               # `medio_pago`, `codigo_transaccion_2` y `correo_elec` se leen solo
+               # para poder COMPARAR: `_aporta_algo` necesita ver lo guardado para
+               # decidir si la reescritura cambia algo. Sin ellas la comparación es
+               # `None` contra un valor y nunca coincide, que es el error de arriba
+               # tres veces más. Regla: se lee todo lo que se escribe.
+               'es_wompi_automatico,medio_pago,codigo_transaccion_2,correo_elec',
     )
     # Códigos de pago de las carteras ANTERIORES, ya archivadas (30 de julio).
     # `codigo_transaccion_1` es la memoria de lo que el proceso manual ya
@@ -1776,6 +1838,12 @@ def main():
 
     log.info('Reconciliando cuotas contra sus asociaciones vigentes...')
     reconciliadas = 0
+    # Filas que la compuerta frenó por no aportar nada. Si esta lista no queda
+    # vacía, alguna comparación de arriba está rota — ver el aviso al final.
+    reescrituras_vacias: list[str] = []
+    # Columnas que se escriben y el `select` no trae: no se pueden comparar, así
+    # que no cuentan como cambio. Es un bug, y se avisa al final.
+    columnas_sin_leer: set = set()
     # Lo que ESTA pasada calculó como `diferencia` de cada cuota que reescribió.
     # La §3.3.2 lo necesita para no pisarlo: las dos escriben la misma columna y
     # el valor correcto es la suma (lo que la cuota deba o le sobre, más la
@@ -1892,6 +1960,16 @@ def main():
             # y no hay forma de alcanzarla. Las 22 estaban con diferencia $0
             # —cerrables— y ninguna cerrada.
             fila['fecha_cruce'] = cuota['fecha_cruce']
+
+        # Red de fondo: una fila que escribe lo mismo que ya está guardada no se
+        # manda. Las comparaciones de arriba son el camino normal —cada una sabe
+        # qué mirar—; esta no sabe nada del negocio y justamente por eso atrapa
+        # lo que a ellas se les escape. Sin ella, una comparación que nunca
+        # coincida reescribe la cuota en cada corrida y le mueve el Día del
+        # Cruce, que es el bug del 28 al 30 de septiembre (ver `_aporta_algo`).
+        if not _aporta_algo(fila, cuota, columnas_sin_leer):
+            reescrituras_vacias.append(llave)
+            continue
 
         actualizaciones_cierre.append(fila)
         if linea:
@@ -2316,6 +2394,33 @@ def main():
         # `_fila_reset`) — SIEMPRE en su propio POST, nunca mezclado con
         # `actualizaciones_cierre`.
         upsert_cartera_preventiva(supabase_url, srk, resets_varios)
+
+    # La compuerta no debería frenar nada: si una cuota llegó hasta ahí sin
+    # aportar un solo cambio, es que alguna comparación de arriba no coincide
+    # nunca —típicamente porque compara contra una columna que el `select` no
+    # trae, y entonces mira `None`—. No se corta la corrida (el trabajo ya está
+    # hecho y tumbarla no desharía nada, mismo criterio que `verificar_cuadre`),
+    # pero se grita, porque el síntoma que esto evita es invisible: la cuota se
+    # re-fecha, sale del día que el área cuenta y "Cerrar Cartera" ya no la
+    # alcanza. El 28 de septiembre esto habría dicho 36 en la primera corrida.
+    if columnas_sin_leer:
+        log.error('*** El select de cartera_preventiva NO trae %d columna(s) que se '
+                  'escriben: %s. No se pueden comparar, así que no cuentan como cambio '
+                  '(si contaran, la cuota se reescribiría en cada corrida y se movería '
+                  'de Día del Cruce). AGREGARLAS AL SELECT ***',
+                  len(columnas_sin_leer), ', '.join(sorted(columnas_sin_leer)))
+
+    if reescrituras_vacias:
+        log.error('*** %d cuota(s) se iban a reescribir sin cambiar NADA — frenadas. '
+                  'Alguna comparación de la reconciliación no coincide nunca: revisar '
+                  'que el select de cartera_preventiva traiga todo lo que se escribe ***',
+                  len(reescrituras_vacias))
+        for llave_vacia in reescrituras_vacias[:20]:
+            log.error('  %s', llave_vacia)
+        if len(reescrituras_vacias) > 20:
+            log.error('  ... y %d más.', len(reescrituras_vacias) - 20)
+    else:
+        log.info('Reescrituras vacías: ninguna (cada cuota escrita cambia algo).')
 
     log.info('cruzar_cartera_preventiva.py: %d cuota(s) actualizadas, %d reseteada(s), '
               '%d línea(s) nueva(s), %d asociación(es) nueva(s), %d saldo(s) a favor nuevo(s).',
