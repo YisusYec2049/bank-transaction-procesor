@@ -186,18 +186,20 @@ fila nueva (el resto de bancos/pasarelas quedan fuera de alcance, diseño sin
 cerrar todavía). El excepcion_motivo 'sin_identificar_pagador' de la
 migración del CHECK constraint sigue sin uso (ver cierre del 14 de julio).
 
-Stripe: cierre por doble señal correo+nombre, respaldo por nombre, excepción
-pendiente_asignar_incp (16 de julio, Fase 3.1-3.3 del rediseño):
+Stripe: respaldo por nombre y excepción pendiente_asignar_incp (16 de julio,
+Fase 3.1-3.3 del rediseño):
 
 Stripe nunca trae `identification` (Stripe no manda documento), así que
-`incp` siempre da vacío — con la asimetría INCP/CORREO(2) del 14 de julio
-(CORREO(2) solo → cruce_unico), Stripe quedaba pendiente para siempre.
+`incp` siempre da vacío y todo lo que resuelva es CORREO(2).
 
-  1. Si el correo cruza contra STRIPE_USA (sin ambigüedad) y el nombre del
-     pagador (transaction_code_1 = Card Name) coincide con NOMBRE CLIENTE de
-     esa fila → cierra 'cruzado' directo, sin esperar confirmación manual.
-     Si el correo cruza pero el nombre NO coincide, sigue 'cruce_unico' (caso
-     legítimo: un tercero pagando por otro).
+  1. Un pago de Stripe identificado SOLO por el correo va a excepciones como
+     'cruce_unico', igual que el resto de bancos. Hasta el 9 de octubre de
+     2026 cerraba 'cruzado' directo cuando además el nombre del pagador
+     (transaction_code_1 = Card Name) coincidía con NOMBRE CLIENTE de la
+     fila; el área pidió quitarlo (eran ~28 pagos al mes) porque esos pagos
+     salían de Excepciones sin que nadie los mirara y había que cambiar de
+     vista para encontrarlos. El nombre se sigue usando para BUSCAR (punto
+     2), no para cerrar.
   2. Si el correo NO cruza, se busca por nombre entre TODAS las filas de
      STRIPE_USA (mismo criterio de comparación). Es señal débil (homónimos):
      si resuelve a un único INCP, cierra como CORREO(2) solo → cruce_unico,
@@ -739,38 +741,37 @@ def _nombres_coinciden(a: str, b: str) -> bool:
 
 
 def _cruzar_stripe(card_name: str, email_lower: str, lookup_stripe: dict,
-                    ambiguos_stripe: set, nombre_por_email: dict, emails_hoja: set,
-                    candidatos_nombre: list[tuple[str, str]]) -> tuple[str, bool, bool, bool]:
-    """Cruce de Stripe con doble señal correo+nombre (Fase 3.1-3.3, ver
-    docstring del módulo). Devuelve (correo_2, ambiguo, pendiente_incp,
-    confirmado_por_nombre):
-      - Si el correo cruza sin ambigüedad: correo_2 = valor encontrado,
-        confirmado_por_nombre = True si el Card Name coincide con NOMBRE
-        CLIENTE de esa fila (ver _nombres_coinciden).
+                    ambiguos_stripe: set, emails_hoja: set,
+                    candidatos_nombre: list[tuple[str, str]]) -> tuple[str, bool, bool]:
+    """Cruce de Stripe por correo, con respaldo por nombre (Fase 3.1-3.3, ver
+    docstring del módulo). Devuelve (correo_2, ambiguo, pendiente_incp).
+
+    Lo que devuelve es siempre un CORREO(2), nunca un cierre: desde el 9 de
+    octubre de 2026 un pago de Stripe identificado solo por el correo va a
+    excepciones como 'cruce_unico' igual que el resto de bancos, así que el
+    nombre sirve para buscar y ya no para confirmar.
+
+      - Si el correo cruza sin ambigüedad: correo_2 = valor encontrado.
       - Si el correo cruza pero esa fila no tiene INCP: pendiente_incp=True.
       - Si el correo no cruza en absoluto: respaldo por nombre, comparando
-        contra TODAS las filas de la hoja (candidatos_nombre). Nunca marca
-        confirmado_por_nombre (es señal débil por sí sola, ver 3.2)."""
+        contra TODAS las filas de la hoja (candidatos_nombre)."""
     if email_lower and email_lower in ambiguos_stripe:
-        return '', True, False, False
+        return '', True, False
 
     if email_lower and lookup_stripe.get(email_lower):
-        # .get(...) en vez de "in": _build_lookup guarda la llave igual
-        # aunque el INCP de esa fila venga vacío (_es_valor_relleno('') es
-        # False — una cadena vacía no cuenta como "relleno"), así que
-        # lookup_stripe puede tener email_lower -> '' — eso es justo el
-        # caso "fila existe, INCP vacío" que cae más abajo, no un cruce real.
-        valor = lookup_stripe[email_lower]
-        nombre_fila = nombre_por_email.get(email_lower, '')
-        confirmado = _nombres_coinciden(card_name, nombre_fila)
-        return valor, False, False, confirmado
+        # .get(...) en vez de "in": _build_lookup guarda la llave igual cuando
+        # TODAS las filas de ese correo traen el INCP en blanco (una cadena
+        # vacía no cuenta como "relleno"), así que lookup_stripe puede tener
+        # email_lower -> '' — ese es justo el caso "fila existe, INCP vacío"
+        # que cae más abajo, no un cruce real.
+        return lookup_stripe[email_lower], False, False
 
     if email_lower and email_lower in emails_hoja:
         # la(s) fila(s) de este correo existen pero su INCP está vacío
-        return '', False, True, False
+        return '', False, True
 
     if not card_name:
-        return '', False, False, False
+        return '', False, False
 
     incps_match, fila_con_incp_vacio = set(), False
     for nombre_fila, incp in candidatos_nombre:
@@ -782,12 +783,12 @@ def _cruzar_stripe(card_name: str, email_lower: str, lookup_stripe: dict,
             incps_match.add(incp)
 
     if len(incps_match) == 1:
-        return next(iter(incps_match)), False, False, False
+        return next(iter(incps_match)), False, False
     if len(incps_match) > 1:
-        return '', True, False, False
+        return '', True, False
     if fila_con_incp_vacio:
-        return '', False, True, False
-    return '', False, False, False
+        return '', False, True
+    return '', False, False
 
 
 WOMPI_REPORTE_PATTERN = 'ReportePagosWompi'
@@ -1148,7 +1149,8 @@ def _build_lookup(rows: list[dict], key_field: str, value_field: str,
                    lower: bool = False, fecha_field: str | None = None,
                    preferir_sufijo_financiero: bool = False,
                    ) -> tuple[dict, set, dict, dict]:
-    """Primera coincidencia gana (replica BUSCARV de Excel).
+    """Primera coincidencia CON VALOR gana (BUSCARV de Excel, saltando los
+    renglones en blanco — ver el comentario del bucle).
 
     Devuelve además el conjunto de llaves ambiguas: aquellas donde la hoja de
     referencia trae 2+ valores distintos no vacíos para la misma llave (ej. un
@@ -1206,7 +1208,23 @@ def _build_lookup(rows: list[dict], key_field: str, value_field: str,
         value = str(row.get(value_field) or '').strip()
         if _es_valor_relleno(value):
             continue
-        if key not in lookup:
+        if key not in lookup or (not lookup[key] and value):
+            # Gana la primera fila CON valor, no la primera a secas: una fila
+            # con el INCP en blanco no es una coincidencia, igual que las de
+            # relleno de arriba. Si gana el blanco, tapa el valor real que
+            # viene más abajo y el pago sale a excepciones como si la hoja no
+            # supiera nada de él — y el orden en que llegan las filas no está
+            # garantizado, así que el resultado dependía del azar.
+            #
+            # Medido el 2026-10-09: 31 correos de Stripe, 21 referencias de
+            # BC2576, 9 de WOMPI y 1 de 2833 tenían su valor tapado así. Caso
+            # que lo destapó: ing.jorge.natividad@gmail.com, con el renglón de
+            # su pago del día (todavía sin INCP) delante de tres renglones que
+            # decían 5117PN.
+            #
+            # La llave se sigue guardando aunque TODAS sus filas vengan en
+            # blanco (lookup[key] = ''), que es justo lo que distingue "la hoja
+            # no lo conoce" de "lo conoce y nadie le asignó inscripción".
             lookup[key] = value
         if value:
             valores_no_vacios.setdefault(key, set()).add(value)
@@ -1352,10 +1370,11 @@ def main():
               len(lookup_inscrip), len(lookup_bc2576), len(lookup_bc2833),
               len(lookup_wompi), len(lookup_stripe))
 
-    # Fase 3.1-3.3: estructuras auxiliares para el cruce de Stripe por doble
-    # señal correo+nombre (ver _cruzar_stripe). nombre_cliente ya viene
+    # Fase 3.1-3.3: estructuras auxiliares para el cruce de Stripe (ver
+    # _cruzar_stripe). `emails_stripe` distingue "la hoja no conoce este
+    # correo" de "lo conoce y nadie le asignó inscripción"; los nombres son el
+    # respaldo de búsqueda cuando el correo no está. nombre_cliente ya viene
     # reparado de mojibake desde utils/excel_cartera.py (_cell_str).
-    nombre_cliente_por_email_stripe: dict[str, str] = {}
     emails_stripe: set[str] = set()
     candidatos_nombre_stripe: list[tuple[str, str]] = []
     for row in stripe_rows:
@@ -1363,8 +1382,6 @@ def main():
         nombre_cliente = row.get('nombre_cliente') or ''
         if email:
             emails_stripe.add(email)
-            if email not in nombre_cliente_por_email_stripe:
-                nombre_cliente_por_email_stripe[email] = nombre_cliente
         if nombre_cliente:
             candidatos_nombre_stripe.append((nombre_cliente, str(row.get('incp') or '').strip()))
 
@@ -1769,7 +1786,6 @@ def main():
         correo_2_ambiguo    = False
         correo_2_historial  = {}
         stripe_pendiente_incp    = False
-        stripe_confirmado_nombre = False
         if payment_method == 'BANCOLOMBIA':
             correo_2, correo_2_ambiguo, correo_2_historial = _buscar_correo_2(
                 t, email, lookup_bc2576, ambiguos_bc2576, historial_bc2576)
@@ -1786,9 +1802,9 @@ def main():
             correo_2_historial = historial_wompi.get(email_lower, {})
         elif payment_method == 'STRIPE_USA':
             card_name = str(t.get('transaction_code_1') or '')
-            correo_2, correo_2_ambiguo, stripe_pendiente_incp, stripe_confirmado_nombre = _cruzar_stripe(
+            correo_2, correo_2_ambiguo, stripe_pendiente_incp = _cruzar_stripe(
                 card_name, email_lower, lookup_stripe, ambiguos_stripe,
-                nombre_cliente_por_email_stripe, emails_stripe, candidatos_nombre_stripe)
+                emails_stripe, candidatos_nombre_stripe)
             correo_2_historial = historial_stripe.get(email_lower, {})
 
         # Pago compartido: si CORREO(2) trae 2+ inscripciones en una sola celda
@@ -1971,13 +1987,13 @@ def main():
             # Solo CORREO(2) identificó, sin confirmación de INCP — señal más
             # débil (regla del 14 de julio: INCP solo SÍ cierra 'cruzado' sin
             # problema, CORREO(2) solo NO, queda para revisión manual).
-            # Excepción (3.1): Stripe con doble señal correo+nombre confirmada
-            # SÍ cierra 'cruzado' directo — el nombre del pagador coincide con
-            # NOMBRE CLIENTE de la fila que encontró el correo.
-            if stripe_confirmado_nombre:
-                excepcion_motivo, estado_cruce = None, 'cruzado'
-            else:
-                excepcion_motivo, estado_cruce = 'cruce_unico', 'pendiente'
+            #
+            # Sin excepciones por banco desde el 9 de octubre de 2026: hasta
+            # entonces Stripe cerraba 'cruzado' cuando el nombre del pagador
+            # confirmaba al del correo (Fase 3.1). Pedido del área: esos pagos
+            # salían de Excepciones sin que nadie los revisara, y había que
+            # cambiar de vista para no saltárselos. Eran ~28 al mes.
+            excepcion_motivo, estado_cruce = 'cruce_unico', 'pendiente'
         else:
             excepcion_motivo, estado_cruce = None, 'cruzado'
 

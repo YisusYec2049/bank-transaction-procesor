@@ -873,3 +873,144 @@ def test_el_documento_corregido_manda_sobre_la_referencia_vieja(mundo):
     })
 
     assert _filas(capturado)['PAGO-1']['correo_2'] == '222PN'
+
+
+# ── Un renglón sin INCP no tapa al que sí lo trae (9 de octubre de 2026) ─────
+
+
+def _pago_stripe(matching_key, correo, card_name='Jorge Natividad'):
+    pago = _pago(matching_key, email=correo, metodo='STRIPE_USA', monto=151)
+    pago['transaction_code_1'] = card_name
+    return pago
+
+
+def test_un_renglon_sin_incp_no_tapa_al_que_si_lo_trae(mundo):
+    """La hoja de ingresos trae el pago del día SIN inscripción todavía, y
+    debajo los pagos anteriores del mismo correo con la suya.
+
+    El renglón en blanco llegaba primero y ganaba el BUSCARV, así que el pago
+    salía como "Pendiente de asignar INCP" aunque la respuesta estuviera tres
+    renglones más abajo. Caso real del 9 de octubre de 2026
+    (ing.jorge.natividad@gmail.com → 5117PN); eran 31 correos de Stripe, 21
+    referencias de Bancolombia 2576, 9 de WOMPI y 1 de 2833.
+    """
+    correo = 'ing.jorge.natividad@gmail.com'
+    capturado = mundo(cruzar, tablas={
+        'consolidated_transactions': [_pago_stripe('PAGO-1', correo)],
+        'cartera_ingresos_stripe_usa': [
+            {'email_cliente': correo, 'incp': '',
+             'nombre_cliente': 'Jorge Natividad Maguiña', 'fecha': '2026-10-08'},
+            {'email_cliente': correo, 'incp': '5117PN',
+             'nombre_cliente': 'Jorge Natividad Maguiña', 'fecha': '2026-07-15'},
+            {'email_cliente': correo, 'incp': '5117PN',
+             'nombre_cliente': 'Jorge Natividad Maguiña', 'fecha': '2026-08-17'},
+        ],
+    })
+
+    fila = _filas(capturado)['PAGO-1']
+    assert fila['correo_2'] == '5117PN', (
+        'el renglón en blanco del pago del día tapó el INCP de los anteriores'
+    )
+    assert fila['excepcion_motivo'] != 'pendiente_asignar_incp'
+
+
+def test_el_renglon_en_blanco_tampoco_tapa_en_bancolombia(mundo):
+    """Mismo defecto y mismo arreglo en la hoja de Bancolombia 2576: la llave
+    es la referencia del extracto en vez del correo, y el lookup es el mismo."""
+    capturado = mundo(cruzar, tablas={
+        'consolidated_transactions': [_pago('PAGO-1', email='54866319238')],
+        'cartera_ingresos_bancolombia_2576': [
+            {'referencia_1': '54866319238', 'incp': '', 'fecha': '2026-09-20'},
+            {'referencia_1': '54866319238', 'incp': '38642', 'fecha': '2026-08-20'},
+        ],
+    })
+
+    assert _filas(capturado)['PAGO-1']['correo_2'] == '38642'
+
+
+def test_si_todos_los_renglones_vienen_en_blanco_sigue_pendiente_de_asignar(mundo):
+    """La contracara, que es lo que distingue "la hoja no lo conoce" de "lo
+    conoce y nadie le asignó inscripción": si NINGÚN renglón del correo trae
+    INCP, el pago sigue saliendo como 'pendiente_asignar_incp' y no como
+    'sin_cruce' — se resuelve solo cuando el área llene el Excel.
+    """
+    correo = 'nadie.asignado@gmail.com'
+    capturado = mundo(cruzar, tablas={
+        'consolidated_transactions': [_pago_stripe('PAGO-1', correo,
+                                                    card_name='Sin Inscripcion')],
+        'cartera_ingresos_stripe_usa': [
+            {'email_cliente': correo, 'incp': '',
+             'nombre_cliente': 'Otro Nombre Distinto', 'fecha': '2026-10-08'},
+            {'email_cliente': correo, 'incp': '',
+             'nombre_cliente': 'Otro Nombre Distinto', 'fecha': '2026-09-08'},
+        ],
+    })
+
+    fila = _filas(capturado)['PAGO-1']
+    assert fila['estado_cruce'] == 'pendiente'
+    assert fila['excepcion_motivo'] == 'pendiente_asignar_incp'
+
+
+def test_dos_incp_distintos_para_el_mismo_correo_siguen_siendo_ambiguos(mundo):
+    """El arreglo no decide por nadie: si los renglones del correo apuntan a
+    dos inscripciones distintas, sigue yendo a que una persona elija."""
+    correo = 'dos.inscripciones@gmail.com'
+    capturado = mundo(cruzar, tablas={
+        'consolidated_transactions': [_pago_stripe('PAGO-1', correo)],
+        'cartera_ingresos_stripe_usa': [
+            {'email_cliente': correo, 'incp': '',
+             'nombre_cliente': 'Jorge Natividad Maguiña', 'fecha': '2026-10-08'},
+            {'email_cliente': correo, 'incp': '5117PN',
+             'nombre_cliente': 'Jorge Natividad Maguiña', 'fecha': '2026-08-17'},
+            {'email_cliente': correo, 'incp': '6200PN',
+             'nombre_cliente': 'Jorge Natividad Maguiña', 'fecha': '2026-09-17'},
+        ],
+    })
+
+    fila = _filas(capturado)['PAGO-1']
+    assert fila['estado_cruce'] == 'pendiente'
+    assert fila['excepcion_motivo'] == 'cruce_ambiguo'
+
+
+def test_stripe_identificado_solo_por_correo_va_a_excepciones(mundo):
+    """Pedido del área (9 de octubre de 2026): Stripe deja de cerrarse solo
+    cuando el nombre del pagador confirma al del correo.
+
+    Esos pagos salían de Excepciones sin que nadie los mirara, y había que
+    cambiar de vista para no saltárselos. Eran ~28 al mes. El nombre se sigue
+    usando para BUSCAR, no para cerrar.
+    """
+    correo = 'gabriela.valdivia@gmail.com'
+    capturado = mundo(cruzar, tablas={
+        'consolidated_transactions': [_pago_stripe('PAGO-1', correo,
+                                                    card_name='GABRIELA VALDIVIA')],
+        'cartera_ingresos_stripe_usa': [
+            {'email_cliente': correo, 'incp': '5254PN',
+             'nombre_cliente': 'GABRIELA VALDIVIA PARODI', 'fecha': '2026-10-08'},
+        ],
+    })
+
+    fila = _filas(capturado)['PAGO-1']
+    assert fila['correo_2'] == '5254PN', 'el correo sí identifica la inscripción'
+    assert fila['estado_cruce'] == 'pendiente', (
+        'el nombre coincidente volvió a cerrar el pago: el área no lo ve en Excepciones'
+    )
+    assert fila['excepcion_motivo'] == 'cruce_unico'
+
+
+def test_el_nombre_sigue_sirviendo_para_buscar_cuando_el_correo_no_esta(mundo):
+    """Quitar el cierre por nombre no quita la BÚSQUEDA por nombre: un correo
+    que la hoja no conoce se sigue resolviendo contra los nombres, y el
+    resultado va a Excepciones como cualquier CORREO(2) solo."""
+    capturado = mundo(cruzar, tablas={
+        'consolidated_transactions': [_pago_stripe('PAGO-1', 'correo.nuevo@gmail.com',
+                                                    card_name='GABRIELA VALDIVIA')],
+        'cartera_ingresos_stripe_usa': [
+            {'email_cliente': 'otro.correo@gmail.com', 'incp': '5254PN',
+             'nombre_cliente': 'GABRIELA VALDIVIA PARODI', 'fecha': '2026-10-08'},
+        ],
+    })
+
+    fila = _filas(capturado)['PAGO-1']
+    assert fila['correo_2'] == '5254PN'
+    assert fila['excepcion_motivo'] == 'cruce_unico'
